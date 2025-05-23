@@ -94,7 +94,7 @@ class PathsGenerator:
         # Built-in ignore patterns (in addition to .gitignore)
         self.always_ignore = {
             '__pycache__', '.pytest_cache', '.mypy_cache', '.tox',
-            'htmlcov', '.coverage', '.DS_Store', 'Thumbs.db'
+            'htmlcov', '.coverage', '.DS_Store', 'Thumbs.db', '.git'
         }
         self.ignore_patterns = [
             re.compile(r'.*\.pyc$'),  # Python compiled files
@@ -110,6 +110,14 @@ class PathsGenerator:
     def should_ignore(self, path: Path) -> bool:
         """Check if path should be ignored."""
         name = path.name
+        
+        # Check if path is inside .git directory
+        try:
+            parts = path.parts
+            if '.git' in parts:
+                return True
+        except:
+            pass
         
         # Check built-in ignore list
         if name in self.always_ignore:
@@ -128,7 +136,18 @@ class PathsGenerator:
     
     def determine_output_location(self) -> Path:
         """Determine the best location for paths.py file."""
-        # Look for common Python project structures
+        # First, check if paths.py already exists somewhere in the project
+        for root, dirs, files in os.walk(self.project_root):
+            # Skip ignored directories
+            root_path = Path(root)
+            if self.should_ignore(root_path):
+                continue
+                
+            if 'paths.py' in files:
+                # Found existing paths.py, use its location
+                return root_path
+        
+        # No existing paths.py found, determine best location
         possible_locations = []
         
         # Check for src directory
@@ -462,17 +481,21 @@ def ensure_path_exists(directory: str) -> Path:
         if output_file is None:
             output_dir = self.determine_output_location()
             
-            # Create the directory if it doesn't exist and it's a config/utils directory
-            if not output_dir.exists() and ('config' in output_dir.name or 'utils' in output_dir.name):
-                output_dir.mkdir(parents=True, exist_ok=True)
-                print(f"Created directory: {output_dir}")
+            # If output_dir already contains paths.py, use it directly
+            if (output_dir / 'paths.py').exists():
+                output_path = output_dir / 'paths.py'
+            else:
+                # Create the directory if it doesn't exist and it's a config/utils directory
+                if not output_dir.exists() and ('config' in output_dir.name or 'utils' in output_dir.name):
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    print(f"Created directory: {output_dir}")
+                    
+                    # Create __init__.py if it doesn't exist
+                    init_file = output_dir / '__init__.py'
+                    if not init_file.exists():
+                        init_file.write_text('"""Configuration module."""\n')
                 
-                # Create __init__.py if it doesn't exist
-                init_file = output_dir / '__init__.py'
-                if not init_file.exists():
-                    init_file.write_text('"""Configuration module."""\n')
-            
-            output_path = output_dir / 'paths.py'
+                output_path = output_dir / 'paths.py'
         else:
             output_path = self.project_root / output_file
         
@@ -529,7 +552,12 @@ def main():
     # Show where the file will be created
     if args.output is None:
         output_location = generator.determine_output_location()
-        print(f"\nDetermined output location: {output_location.relative_to(generator.project_root)}/paths.py")
+        existing_paths = output_location / 'paths.py'
+        if existing_paths.exists():
+            print(f"\nFound existing paths.py at: {existing_paths.relative_to(generator.project_root)}")
+            print("Will update this file.")
+        else:
+            print(f"\nDetermined output location: {output_location.relative_to(generator.project_root)}/paths.py")
     
     # Generate file
     print(f"\nGenerating paths.py...")
