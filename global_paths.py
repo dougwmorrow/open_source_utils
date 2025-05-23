@@ -1,44 +1,182 @@
 import os
 from pathlib import Path
 import re
-from typing import Set, Dict, List, Tuple
+from typing import Set, Dict, List, Tuple, Optional
 from datetime import datetime
+import fnmatch
+
+class GitignoreParser:
+    """Parse and apply .gitignore rules."""
+    
+    def __init__(self, root_path: Path):
+        self.root_path = root_path
+        self.ignore_patterns = self._load_gitignore_patterns()
+        
+    def _load_gitignore_patterns(self) -> Dict[Path, List[str]]:
+        """Load all .gitignore files in the project."""
+        patterns = {}
+        
+        for root, dirs, files in os.walk(self.root_path):
+            if '.gitignore' in files:
+                gitignore_path = Path(root) / '.gitignore'
+                patterns[Path(root)] = self._parse_gitignore(gitignore_path)
+                
+        return patterns
+    
+    def _parse_gitignore(self, gitignore_path: Path) -> List[str]:
+        """Parse a single .gitignore file."""
+        patterns = []
+        
+        try:
+            with open(gitignore_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip comments and empty lines
+                    if line and not line.startswith('#'):
+                        patterns.append(line)
+        except Exception:
+            pass
+            
+        return patterns
+    
+    def should_ignore(self, path: Path) -> bool:
+        """Check if a path should be ignored based on .gitignore rules."""
+        # Check each .gitignore file's rules
+        for gitignore_dir, patterns in self.ignore_patterns.items():
+            # Only apply rules if the path is within the gitignore's directory
+            try:
+                relative_to_gitignore = path.relative_to(gitignore_dir)
+                
+                for pattern in patterns:
+                    # Handle directory patterns (ending with /)
+                    if pattern.endswith('/'):
+                        if path.is_dir() and self._matches_pattern(path.name, pattern[:-1]):
+                            return True
+                    # Handle negation patterns (starting with !)
+                    elif pattern.startswith('!'):
+                        if self._matches_pattern(str(relative_to_gitignore), pattern[1:]):
+                            return False
+                    # Regular patterns
+                    else:
+                        if self._matches_pattern(str(relative_to_gitignore), pattern):
+                            return True
+                        # Also check just the filename
+                        if self._matches_pattern(path.name, pattern):
+                            return True
+                            
+            except ValueError:
+                # Path is not relative to this gitignore directory
+                continue
+                
+        return False
+    
+    def _matches_pattern(self, path_str: str, pattern: str) -> bool:
+        """Check if a path matches a gitignore pattern."""
+        # Convert gitignore pattern to fnmatch pattern
+        if pattern.startswith('/'):
+            # Absolute path from gitignore location
+            pattern = pattern[1:]
+            
+        # Handle ** wildcards
+        pattern = pattern.replace('**/', '*')
+        pattern = pattern.replace('/**', '*')
+        
+        return fnmatch.fnmatch(path_str, pattern)
+
 
 class PathsGenerator:
     """Automatically generate paths.py based on project structure."""
     
     def __init__(self, project_root: Path = None):
         self.project_root = Path(project_root) if project_root else Path(__file__).parent
-        self.ignore_dirs = {
-            '.git', '.vscode', '__pycache__', '.pytest_cache', 
-            'venv', '.venv', 'env', '.env', 'node_modules',
-            '.idea', '.mypy_cache', 'dist', 'build', '*.egg-info',
-            '.tox', 'htmlcov', '.coverage', '.DS_Store'
+        self.gitignore_parser = GitignoreParser(self.project_root)
+        
+        # Built-in ignore patterns (in addition to .gitignore)
+        self.always_ignore = {
+            '__pycache__', '.pytest_cache', '.mypy_cache', '.tox',
+            'htmlcov', '.coverage', '.DS_Store', 'Thumbs.db'
         }
         self.ignore_patterns = [
-            re.compile(r'\..*'),  # Hidden files/folders
             re.compile(r'.*\.pyc$'),  # Python compiled files
+            re.compile(r'.*\.pyo$'),  # Python optimized files
             re.compile(r'.*\.egg-info$'),  # Egg info directories
+            re.compile(r'.*\.dist-info$'),  # Distribution info
         ]
         self.tracked_extensions = {
             '.json', '.yaml', '.yml', '.ini', '.cfg', '.conf',
-            '.txt', '.csv', '.xlsx', '.db', '.sqlite'
+            '.txt', '.csv', '.xlsx', '.db', '.sqlite', '.toml'
         }
         
     def should_ignore(self, path: Path) -> bool:
         """Check if path should be ignored."""
         name = path.name
         
-        # Check exact matches
-        if name in self.ignore_dirs:
+        # Check built-in ignore list
+        if name in self.always_ignore:
             return True
             
-        # Check patterns
+        # Check built-in patterns
         for pattern in self.ignore_patterns:
             if pattern.match(name):
                 return True
+        
+        # Check gitignore rules
+        if self.gitignore_parser.should_ignore(path):
+            return True
                 
         return False
+    
+    def determine_output_location(self) -> Path:
+        """Determine the best location for paths.py file."""
+        # Look for common Python project structures
+        possible_locations = []
+        
+        # Check for src directory
+        src_dir = self.project_root / 'src'
+        if src_dir.exists() and src_dir.is_dir():
+            # Look for main package in src
+            for item in src_dir.iterdir():
+                if item.is_dir() and not item.name.startswith('.') and not item.name.startswith('_'):
+                    config_dir = item / 'config'
+                    utils_dir = item / 'utils'
+                    possible_locations.extend([
+                        (config_dir, 90),  # Highest priority
+                        (utils_dir, 80),
+                        (item, 70)  # Package root
+                    ])
+        
+        # Check for package in root (common structure)
+        for item in self.project_root.iterdir():
+            if item.is_dir() and not item.name.startswith('.'):
+                # Check if it's likely a package (has __init__.py or looks like one)
+                if (item / '__init__.py').exists() or item.name.lower() == self.project_root.name.lower():
+                    config_dir = item / 'config'
+                    utils_dir = item / 'utils' 
+                    common_dir = item / 'common'
+                    possible_locations.extend([
+                        (config_dir, 85),
+                        (utils_dir, 75),
+                        (common_dir, 70),
+                        (item, 65)
+                    ])
+        
+        # Fallback locations
+        possible_locations.extend([
+            (self.project_root / 'config', 60),
+            (self.project_root / 'utils', 55),
+            (self.project_root, 50)  # Last resort
+        ])
+        
+        # Sort by priority and return the first existing or creatable location
+        possible_locations.sort(key=lambda x: x[1], reverse=True)
+        
+        for location, priority in possible_locations:
+            # If location exists or we can create it (for config/utils dirs)
+            if location.exists() or 'config' in location.name or 'utils' in location.name:
+                return location
+        
+        # Default to project root
+        return self.project_root
     
     def to_property_name(self, path_str: str) -> str:
         """Convert path to valid Python property name."""
@@ -52,7 +190,8 @@ class PathsGenerator:
             name = f"dir_{name}"
             
         # Avoid Python keywords
-        keywords = {'class', 'def', 'import', 'from', 'as', 'is', 'in', 'for', 'if', 'else'}
+        keywords = {'class', 'def', 'import', 'from', 'as', 'is', 'in', 'for', 'if', 'else',
+                   'return', 'yield', 'lambda', 'with', 'try', 'except', 'finally', 'raise'}
         if name in keywords:
             name = f"{name}_dir"
             
@@ -63,14 +202,25 @@ class PathsGenerator:
         directories = {}
         
         for root, dirs, files in os.walk(self.project_root):
-            # Filter out ignored directories
-            dirs[:] = [d for d in dirs if not self.should_ignore(Path(root) / d)]
-            
             root_path = Path(root)
+            
+            # Filter out ignored directories before recursion
+            original_dirs = dirs[:]
+            dirs[:] = []
+            
+            for d in original_dirs:
+                dir_path = root_path / d
+                if not self.should_ignore(dir_path):
+                    dirs.append(d)
+            
             relative_path = root_path.relative_to(self.project_root)
             
             # Skip if it's the root directory
             if relative_path == Path('.'):
+                continue
+                
+            # Skip if this directory should be ignored
+            if self.should_ignore(root_path):
                 continue
                 
             # Create property name based on relative path
@@ -87,13 +237,23 @@ class PathsGenerator:
         important_files = {}
         
         for root, dirs, files in os.walk(self.project_root):
-            # Filter out ignored directories
-            dirs[:] = [d for d in dirs if not self.should_ignore(Path(root) / d)]
-            
             root_path = Path(root)
+            
+            # Filter out ignored directories
+            original_dirs = dirs[:]
+            dirs[:] = []
+            
+            for d in original_dirs:
+                dir_path = root_path / d
+                if not self.should_ignore(dir_path):
+                    dirs.append(d)
             
             for file in files:
                 file_path = root_path / file
+                
+                # Skip if file should be ignored
+                if self.should_ignore(file_path):
+                    continue
                 
                 # Check if file has tracked extension
                 if any(file.endswith(ext) for ext in self.tracked_extensions):
@@ -143,10 +303,22 @@ class ProjectPaths:
         Initialize project paths.
         
         Args:
-            base_path: Custom base path. If None, uses the directory containing this file.
+            base_path: Custom base path. If None, uses the project root directory.
         """
         if base_path is None:
-            self._base = Path(__file__).parent.absolute()
+            # Navigate up from this file's location to find project root
+            current = Path(__file__).parent.absolute()
+            
+            # Look for common project root indicators
+            while current != current.parent:
+                if any((current / indicator).exists() for indicator in 
+                       ['.git', 'setup.py', 'pyproject.toml', 'requirements.txt']):
+                    self._base = current
+                    break
+                current = current.parent
+            else:
+                # Fallback to file's parent directory
+                self._base = Path(__file__).parent.absolute()
         else:
             self._base = Path(base_path).absolute()
     
@@ -214,13 +386,32 @@ class ProjectPaths:
         else:
             raise AttributeError(f"Directory '{directory}' not found")
     
+    def ensure_dir_exists(self, directory: str) -> Path:
+        """
+        Ensure a directory exists, creating it if necessary.
+        
+        Args:
+            directory: Name of the directory property
+            
+        Returns:
+            Path to the directory
+        """
+        if hasattr(self, directory):
+            dir_path = getattr(self, directory)
+            dir_path.mkdir(parents=True, exist_ok=True)
+            return dir_path
+        else:
+            raise AttributeError(f"Directory '{directory}' not found")
+    
     def __str__(self) -> str:
         """String representation of all paths."""
         paths_info = [f"Project Base: {self._base}"]
         
         # Add all directory paths
         for attr_name in sorted(dir(self)):
-            if not attr_name.startswith('_') and attr_name not in ['base', 'create_all_directories', 'get_file_in']:
+            if not attr_name.startswith('_') and attr_name not in [
+                'base', 'create_all_directories', 'get_file_in', 'ensure_dir_exists'
+            ]:
                 attr = getattr(self, attr_name)
                 if isinstance(attr, Path):
                     paths_info.append(f"{attr_name}: {attr}")
@@ -249,15 +440,43 @@ def get_path(directory: str, filename: str = None) -> Path:
         return dir_path / filename if filename else dir_path
     else:
         raise AttributeError(f"Path '{directory}' not found")
+
+def ensure_path_exists(directory: str) -> Path:
+    """
+    Ensure a directory path exists.
+    
+    Args:
+        directory: Directory property name
+        
+    Returns:
+        Path object
+    """
+    return paths.ensure_dir_exists(directory)
 '''
         
         return content
     
-    def update_paths_file(self, output_file: str = "paths.py", include_files: bool = True):
+    def update_paths_file(self, output_file: str = None, include_files: bool = True):
         """Generate and write the paths.py file."""
-        content = self.generate_paths_py(include_files)
+        # Determine output location if not specified
+        if output_file is None:
+            output_dir = self.determine_output_location()
+            
+            # Create the directory if it doesn't exist and it's a config/utils directory
+            if not output_dir.exists() and ('config' in output_dir.name or 'utils' in output_dir.name):
+                output_dir.mkdir(parents=True, exist_ok=True)
+                print(f"Created directory: {output_dir}")
+                
+                # Create __init__.py if it doesn't exist
+                init_file = output_dir / '__init__.py'
+                if not init_file.exists():
+                    init_file.write_text('"""Configuration module."""\n')
+            
+            output_path = output_dir / 'paths.py'
+        else:
+            output_path = self.project_root / output_file
         
-        output_path = self.project_root / output_file
+        content = self.generate_paths_py(include_files)
         
         # Backup existing file if it exists
         if output_path.exists():
@@ -267,7 +486,7 @@ def get_path(directory: str, filename: str = None) -> Path:
         
         # Write new content
         output_path.write_text(content)
-        print(f"Generated paths.py with {len(self.scan_directories())} directories")
+        print(f"Generated {output_path.relative_to(self.project_root)} with {len(self.scan_directories())} directories")
         if include_files:
             print(f"and {len(self.scan_important_files())} tracked files")
         
@@ -281,7 +500,7 @@ def main():
     parser = argparse.ArgumentParser(description='Generate paths.py from project structure')
     parser.add_argument('--root', type=str, help='Project root directory (default: current directory)')
     parser.add_argument('--no-files', action='store_true', help='Exclude file paths, only include directories')
-    parser.add_argument('--output', type=str, default='paths.py', help='Output filename (default: paths.py)')
+    parser.add_argument('--output', type=str, help='Output file path (default: auto-determined based on project structure)')
     
     args = parser.parse_args()
     
@@ -307,8 +526,13 @@ def main():
             if len(files) > 10:
                 print(f"  ... and {len(files) - 10} more")
     
+    # Show where the file will be created
+    if args.output is None:
+        output_location = generator.determine_output_location()
+        print(f"\nDetermined output location: {output_location.relative_to(generator.project_root)}/paths.py")
+    
     # Generate file
-    print(f"\nGenerating {args.output}...")
+    print(f"\nGenerating paths.py...")
     output_path = generator.update_paths_file(args.output, not args.no_files)
     print(f"Successfully generated: {output_path}")
 
