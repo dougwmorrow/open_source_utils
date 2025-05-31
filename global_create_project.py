@@ -780,10 +780,10 @@ class ProjectSetup:
             f.write(oracle_connector_updated)
             
     def _create_sample_files(self):
-        """Create sample Python files to get started."""
-        
-        # Create a sample connector
-        oracle_connector = '''"""Oracle Database Connector"""
+    """Create sample Python files to get started."""
+    
+    # Create Oracle connector (existing)
+    oracle_connector = '''"""Oracle Database Connector"""
 import oracledb
 import pandas as pd
 from typing import Optional, Dict, Any
@@ -822,9 +822,393 @@ class OracleConnector:
         """Execute SQL query and return results as DataFrame."""
         try:
             df = pd.read_sql(query, self.connection)
+            logger.info(f"Query executed successfully, returned {len(df)} rows")
             return df
         except Exception as e:
             logger.error(f"Query execution failed: {str(e)}")
+            raise
+            
+    def execute_many(self, query: str, data: list):
+        """Execute bulk insert/update operations."""
+        cursor = self.connection.cursor()
+        try:
+            cursor.executemany(query, data)
+            self.connection.commit()
+            logger.info(f"Bulk operation completed: {cursor.rowcount} rows affected")
+        except Exception as e:
+            self.connection.rollback()
+            logger.error(f"Bulk operation failed: {str(e)}")
+            raise
+        finally:
+            cursor.close()
+            
+    def __enter__(self):
+        self.connect()
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.disconnect()
+'''
+    
+    oracle_file = self.project_root / "src" / "connectors" / "oracle" / "oracle_connector.py"
+    with open(oracle_file, 'w') as f:
+        f.write(oracle_connector)
+    
+    # Create SQL Server connector
+    sqlserver_connector = '''"""SQL Server Database Connector"""
+import pyodbc
+import pandas as pd
+from typing import Optional, Dict, Any, List
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class SQLServerConnector:
+    """Connector for SQL Server Database operations."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.connection = None
+        
+    def connect(self):
+        """Establish connection to SQL Server database."""
+        try:
+            # Build connection string
+            conn_str = (
+                f"DRIVER={self.config.get('driver', '{ODBC Driver 17 for SQL Server}')};"
+                f"SERVER={self.config['server']};"
+                f"DATABASE={self.config['database']};"
+                f"UID={self.config['username']};"
+                f"PWD={self.config['password']}"
+            )
+            
+            # Add optional parameters
+            if self.config.get('trusted_connection'):
+                conn_str += ";Trusted_Connection=yes"
+            if self.config.get('encrypt'):
+                conn_str += ";Encrypt=yes"
+            if self.config.get('trust_server_certificate'):
+                conn_str += ";TrustServerCertificate=yes"
+                
+            self.connection = pyodbc.connect(conn_str)
+            logger.info(f"Successfully connected to SQL Server: {self.config['server']}/{self.config['database']}")
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to SQL Server: {str(e)}")
+            raise
+            
+    def disconnect(self):
+        """Close database connection."""
+        if self.connection:
+            self.connection.close()
+            logger.info("Disconnected from SQL Server database")
+            
+    def execute_query(self, query: str, params: Optional[List] = None) -> pd.DataFrame:
+        """Execute SQL query and return results as DataFrame."""
+        try:
+            if params:
+                df = pd.read_sql(query, self.connection, params=params)
+            else:
+                df = pd.read_sql(query, self.connection)
+                
+            logger.info(f"Query executed successfully, returned {len(df)} rows")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Query execution failed: {str(e)}")
+            raise
+            
+    def execute_command(self, command: str, params: Optional[List] = None):
+        """Execute SQL command (INSERT, UPDATE, DELETE, etc.)."""
+        cursor = self.connection.cursor()
+        try:
+            if params:
+                cursor.execute(command, params)
+            else:
+                cursor.execute(command)
+                
+            self.connection.commit()
+            logger.info(f"Command executed successfully: {cursor.rowcount} rows affected")
+            return cursor.rowcount
+            
+        except Exception as e:
+            self.connection.rollback()
+            logger.error(f"Command execution failed: {str(e)}")
+            raise
+        finally:
+            cursor.close()
+            
+    def execute_many(self, query: str, data: List[tuple]):
+        """Execute bulk insert/update operations."""
+        cursor = self.connection.cursor()
+        try:
+            cursor.fast_executemany = True  # Enable fast bulk inserts
+            cursor.executemany(query, data)
+            self.connection.commit()
+            logger.info(f"Bulk operation completed: {cursor.rowcount} rows affected")
+            
+        except Exception as e:
+            self.connection.rollback()
+            logger.error(f"Bulk operation failed: {str(e)}")
+            raise
+        finally:
+            cursor.close()
+            
+    def execute_stored_procedure(self, proc_name: str, params: Optional[List] = None):
+        """Execute a stored procedure."""
+        cursor = self.connection.cursor()
+        try:
+            if params:
+                cursor.execute(f"EXEC {proc_name} {','.join(['?'] * len(params))}", params)
+            else:
+                cursor.execute(f"EXEC {proc_name}")
+                
+            # Fetch results if any
+            if cursor.description:
+                columns = [column[0] for column in cursor.description]
+                results = cursor.fetchall()
+                return pd.DataFrame.from_records(results, columns=columns)
+            else:
+                self.connection.commit()
+                return None
+                
+        except Exception as e:
+            self.connection.rollback()
+            logger.error(f"Stored procedure execution failed: {str(e)}")
+            raise
+        finally:
+            cursor.close()
+            
+    def get_table_schema(self, table_name: str) -> pd.DataFrame:
+        """Get schema information for a table."""
+        query = """
+        SELECT 
+            COLUMN_NAME,
+            DATA_TYPE,
+            CHARACTER_MAXIMUM_LENGTH,
+            IS_NULLABLE,
+            COLUMN_DEFAULT
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = ?
+        ORDER BY ORDINAL_POSITION
+        """
+        return self.execute_query(query, [table_name])
+        
+    def __enter__(self):
+        self.connect()
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.disconnect()
+'''
+    
+    sqlserver_file = self.project_root / "src" / "connectors" / "sqlserver" / "sqlserver_connector.py"
+    with open(sqlserver_file, 'w') as f:
+        f.write(sqlserver_connector)
+    
+    # Create MongoDB connector
+    mongodb_connector = '''"""MongoDB Connector"""
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, OperationFailure
+import pandas as pd
+from typing import Optional, Dict, Any, List
+import logging
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+
+class MongoDBConnector:
+    """Connector for MongoDB operations."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.client = None
+        self.database = None
+        
+    def connect(self):
+        """Establish connection to MongoDB."""
+        try:
+            # Build connection string
+            if self.config.get('username') and self.config.get('password'):
+                # With authentication
+                conn_str = (
+                    f"mongodb://{self.config['username']}:{self.config['password']}@"
+                    f"{self.config.get('connection_string', 'localhost:27017/').replace('mongodb://', '')}"
+                )
+            else:
+                # Without authentication
+                conn_str = self.config.get('connection_string', 'mongodb://localhost:27017/')
+                
+            # Connection options
+            options = {
+                'serverSelectionTimeoutMS': 5000,
+                'connectTimeoutMS': 10000,
+                'retryWrites': True,
+                'w': 'majority'
+            }
+            
+            self.client = MongoClient(conn_str, **options)
+            
+            # Test connection
+            self.client.admin.command('ping')
+            
+            # Select database
+            db_name = self.config.get('database', 'test')
+            self.database = self.client[db_name]
+            
+            logger.info(f"Successfully connected to MongoDB: {db_name}")
+            
+        except ConnectionFailure as e:
+            logger.error(f"Failed to connect to MongoDB: {str(e)}")
+            raise
+            
+    def disconnect(self):
+        """Close MongoDB connection."""
+        if self.client:
+            self.client.close()
+            logger.info("Disconnected from MongoDB")
+            
+    def find(self, collection_name: str, query: Dict = None, 
+             projection: Dict = None, limit: int = None) -> pd.DataFrame:
+        """Query documents from a collection and return as DataFrame."""
+        try:
+            collection = self.database[collection_name]
+            
+            cursor = collection.find(query or {}, projection)
+            
+            if limit:
+                cursor = cursor.limit(limit)
+                
+            # Convert to list of dictionaries
+            documents = list(cursor)
+            
+            if documents:
+                # Convert to DataFrame
+                df = pd.DataFrame(documents)
+                
+                # Convert ObjectId to string
+                if '_id' in df.columns:
+                    df['_id'] = df['_id'].astype(str)
+                    
+                logger.info(f"Retrieved {len(df)} documents from {collection_name}")
+                return df
+            else:
+                logger.info(f"No documents found in {collection_name}")
+                return pd.DataFrame()
+                
+        except Exception as e:
+            logger.error(f"Failed to query {collection_name}: {str(e)}")
+            raise
+            
+    def find_one(self, collection_name: str, query: Dict) -> Optional[Dict]:
+        """Find a single document."""
+        try:
+            collection = self.database[collection_name]
+            document = collection.find_one(query)
+            
+            if document and '_id' in document:
+                document['_id'] = str(document['_id'])
+                
+            return document
+            
+        except Exception as e:
+            logger.error(f"Failed to find document in {collection_name}: {str(e)}")
+            raise
+            
+    def insert_many(self, collection_name: str, documents: List[Dict]):
+        """Insert multiple documents into a collection."""
+        try:
+            collection = self.database[collection_name]
+            
+            # Add metadata to documents
+            for doc in documents:
+                doc['_inserted_at'] = datetime.utcnow()
+                
+            result = collection.insert_many(documents)
+            logger.info(f"Inserted {len(result.inserted_ids)} documents into {collection_name}")
+            
+            return result.inserted_ids
+            
+        except Exception as e:
+            logger.error(f"Failed to insert documents into {collection_name}: {str(e)}")
+            raise
+            
+    def update_many(self, collection_name: str, filter_query: Dict, update: Dict):
+        """Update multiple documents."""
+        try:
+            collection = self.database[collection_name]
+            
+            # Add update timestamp
+            if '$set' in update:
+                update['$set']['_updated_at'] = datetime.utcnow()
+            else:
+                update['$set'] = {'_updated_at': datetime.utcnow()}
+                
+            result = collection.update_many(filter_query, update)
+            
+            logger.info(f"Updated {result.modified_count} documents in {collection_name}")
+            return result.modified_count
+            
+        except Exception as e:
+            logger.error(f"Failed to update documents in {collection_name}: {str(e)}")
+            raise
+            
+    def aggregate(self, collection_name: str, pipeline: List[Dict]) -> pd.DataFrame:
+        """Execute an aggregation pipeline."""
+        try:
+            collection = self.database[collection_name]
+            
+            cursor = collection.aggregate(pipeline)
+            documents = list(cursor)
+            
+            if documents:
+                df = pd.DataFrame(documents)
+                
+                # Convert ObjectId to string if present
+                if '_id' in df.columns:
+                    df['_id'] = df['_id'].astype(str)
+                    
+                logger.info(f"Aggregation returned {len(df)} results from {collection_name}")
+                return df
+            else:
+                return pd.DataFrame()
+                
+        except Exception as e:
+            logger.error(f"Aggregation failed on {collection_name}: {str(e)}")
+            raise
+            
+    def get_collection_stats(self, collection_name: str) -> Dict[str, Any]:
+        """Get statistics for a collection."""
+        try:
+            stats = self.database.command("collStats", collection_name)
+            
+            return {
+                'count': stats.get('count', 0),
+                'size': stats.get('size', 0),
+                'average_object_size': stats.get('avgObjSize', 0),
+                'storage_size': stats.get('storageSize', 0),
+                'indexes': stats.get('nindexes', 0)
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get stats for {collection_name}: {str(e)}")
+            raise
+            
+    def list_collections(self) -> List[str]:
+        """List all collections in the database."""
+        return self.database.list_collection_names()
+        
+    def create_index(self, collection_name: str, keys: List[tuple], unique: bool = False):
+        """Create an index on a collection."""
+        try:
+            collection = self.database[collection_name]
+            collection.create_index(keys, unique=unique)
+            logger.info(f"Created index on {collection_name}: {keys}")
+            
+        except Exception as e:
+            logger.error(f"Failed to create index on {collection_name}: {str(e)}")
             raise
             
     def __enter__(self):
@@ -834,13 +1218,252 @@ class OracleConnector:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.disconnect()
 '''
+    
+    mongodb_file = self.project_root / "src" / "connectors" / "mongodb" / "mongodb_connector.py"
+    with open(mongodb_file, 'w') as f:
+        f.write(mongodb_connector)
+    
+    # Create Databricks connector
+    databricks_connector = '''"""Databricks Connector"""
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service import sql
+import pandas as pd
+from typing import Optional, Dict, Any, List
+import logging
+import time
+
+logger = logging.getLogger(__name__)
+
+
+class DatabricksConnector:
+    """Connector for Databricks operations."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.client = None
+        self.sql_client = None
         
-        oracle_file = self.project_root / "src" / "connectors" / "oracle" / "oracle_connector.py"
-        with open(oracle_file, 'w') as f:
-            f.write(oracle_connector)
+    def connect(self):
+        """Establish connection to Databricks workspace."""
+        try:
+            # Initialize Databricks SDK client
+            self.client = WorkspaceClient(
+                host=self.config['host'],
+                token=self.config['token']
+            )
             
-        # Create a sample pipeline
-        bronze_pipeline = '''"""Bronze Layer Pipeline - Raw Data Ingestion"""
+            # Test connection by listing clusters
+            clusters = list(self.client.clusters.list())
+            logger.info(f"Successfully connected to Databricks. Found {len(clusters)} clusters.")
+            
+            # Get SQL warehouses/endpoints
+            self.sql_endpoints = list(self.client.warehouses.list())
+            if self.sql_endpoints:
+                logger.info(f"Found {len(self.sql_endpoints)} SQL warehouses")
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to Databricks: {str(e)}")
+            raise
+            
+    def disconnect(self):
+        """Close Databricks connection."""
+        # SDK handles connection lifecycle
+        logger.info("Databricks connection closed")
+        
+    def execute_query(self, query: str, warehouse_id: Optional[str] = None, 
+                     catalog: str = "main", schema: str = "default") -> pd.DataFrame:
+        """Execute SQL query on Databricks SQL warehouse."""
+        try:
+            # Use provided warehouse_id or get the first available
+            if not warehouse_id and self.sql_endpoints:
+                warehouse_id = self.sql_endpoints[0].id
+                
+            if not warehouse_id:
+                raise ValueError("No SQL warehouse available")
+                
+            logger.info(f"Executing query on warehouse: {warehouse_id}")
+            
+            # Execute statement
+            response = self.client.statement_execution.execute_statement(
+                warehouse_id=warehouse_id,
+                statement=query,
+                catalog=catalog,
+                schema=schema,
+                wait_timeout="30s"
+            )
+            
+            # Wait for completion
+            while response.status.state in [sql.StatementState.PENDING, sql.StatementState.RUNNING]:
+                time.sleep(1)
+                response = self.client.statement_execution.get_statement(
+                    statement_id=response.statement_id
+                )
+                
+            if response.status.state == sql.StatementState.FAILED:
+                raise Exception(f"Query failed: {response.status.error}")
+                
+            # Convert result to DataFrame
+            if response.result and response.result.data_array:
+                columns = [col.name for col in response.manifest.schema.columns]
+                data = [row.as_dict() for row in response.result.data_array]
+                df = pd.DataFrame(data, columns=columns)
+                
+                logger.info(f"Query returned {len(df)} rows")
+                return df
+            else:
+                return pd.DataFrame()
+                
+        except Exception as e:
+            logger.error(f"Query execution failed: {str(e)}")
+            raise
+            
+    def read_table(self, table_name: str, catalog: str = "main", 
+                   schema: str = "default", limit: Optional[int] = None) -> pd.DataFrame:
+        """Read a complete table from Databricks."""
+        query = f"SELECT * FROM {catalog}.{schema}.{table_name}"
+        if limit:
+            query += f" LIMIT {limit}"
+            
+        return self.execute_query(query, catalog=catalog, schema=schema)
+        
+    def write_table(self, df: pd.DataFrame, table_name: str, 
+                    catalog: str = "main", schema: str = "default",
+                    mode: str = "overwrite"):
+        """Write DataFrame to Databricks table."""
+        try:
+            # For large DataFrames, consider using Databricks' file upload APIs
+            # This is a simplified version using SQL INSERT
+            
+            if mode == "overwrite":
+                # Drop table if exists
+                drop_query = f"DROP TABLE IF EXISTS {catalog}.{schema}.{table_name}"
+                self.execute_query(drop_query, catalog=catalog, schema=schema)
+                
+            # Create table with schema inference
+            # In production, define schema explicitly
+            create_query = self._generate_create_table(df, table_name, catalog, schema)
+            self.execute_query(create_query, catalog=catalog, schema=schema)
+            
+            # Insert data in batches
+            batch_size = 1000
+            for i in range(0, len(df), batch_size):
+                batch = df.iloc[i:i+batch_size]
+                insert_query = self._generate_insert_query(batch, table_name, catalog, schema)
+                self.execute_query(insert_query, catalog=catalog, schema=schema)
+                
+            logger.info(f"Successfully wrote {len(df)} rows to {catalog}.{schema}.{table_name}")
+            
+        except Exception as e:
+            logger.error(f"Failed to write table: {str(e)}")
+            raise
+            
+    def list_tables(self, catalog: str = "main", schema: str = "default") -> List[str]:
+        """List all tables in a schema."""
+        query = f"SHOW TABLES IN {catalog}.{schema}"
+        result = self.execute_query(query, catalog=catalog, schema=schema)
+        return result['tableName'].tolist() if not result.empty else []
+        
+    def get_table_info(self, table_name: str, catalog: str = "main", 
+                       schema: str = "default") -> pd.DataFrame:
+        """Get table schema information."""
+        query = f"DESCRIBE TABLE {catalog}.{schema}.{table_name}"
+        return self.execute_query(query, catalog=catalog, schema=schema)
+        
+    def execute_notebook(self, notebook_path: str, cluster_id: str, 
+                        parameters: Optional[Dict[str, Any]] = None) -> str:
+        """Execute a Databricks notebook."""
+        try:
+            # Submit notebook run
+            run = self.client.jobs.submit(
+                run_name=f"Notebook run: {notebook_path}",
+                tasks=[
+                    {
+                        "task_key": "notebook_task",
+                        "notebook_task": {
+                            "notebook_path": notebook_path,
+                            "base_parameters": parameters or {}
+                        },
+                        "existing_cluster_id": cluster_id
+                    }
+                ]
+            )
+            
+            logger.info(f"Submitted notebook run: {run.run_id}")
+            
+            # Wait for completion
+            while True:
+                run_info = self.client.jobs.get_run(run_id=run.run_id)
+                if run_info.state.life_cycle_state in ['TERMINATED', 'SKIPPED', 'INTERNAL_ERROR']:
+                    break
+                time.sleep(5)
+                
+            if run_info.state.result_state == 'SUCCESS':
+                logger.info(f"Notebook execution completed successfully")
+                return run.run_id
+            else:
+                raise Exception(f"Notebook execution failed: {run_info.state.state_message}")
+                
+        except Exception as e:
+            logger.error(f"Notebook execution failed: {str(e)}")
+            raise
+            
+    def _generate_create_table(self, df: pd.DataFrame, table_name: str, 
+                              catalog: str, schema: str) -> str:
+        """Generate CREATE TABLE statement based on DataFrame."""
+        # Map pandas dtypes to SQL types
+        type_mapping = {
+            'int64': 'BIGINT',
+            'int32': 'INT',
+            'float64': 'DOUBLE',
+            'float32': 'FLOAT',
+            'object': 'STRING',
+            'datetime64[ns]': 'TIMESTAMP',
+            'bool': 'BOOLEAN'
+        }
+        
+        columns = []
+        for col, dtype in df.dtypes.items():
+            sql_type = type_mapping.get(str(dtype), 'STRING')
+            columns.append(f"`{col}` {sql_type}")
+            
+        columns_str = ", ".join(columns)
+        return f"CREATE TABLE IF NOT EXISTS {catalog}.{schema}.{table_name} ({columns_str})"
+        
+    def _generate_insert_query(self, df: pd.DataFrame, table_name: str, 
+                              catalog: str, schema: str) -> str:
+        """Generate INSERT statement for DataFrame."""
+        # Convert DataFrame to SQL values
+        values = []
+        for _, row in df.iterrows():
+            row_values = []
+            for val in row.values:
+                if pd.isna(val):
+                    row_values.append("NULL")
+                elif isinstance(val, str):
+                    row_values.append(f"'{val.replace("'", "''")}'")
+                else:
+                    row_values.append(str(val))
+            values.append(f"({', '.join(row_values)})")
+            
+        values_str = ", ".join(values)
+        columns_str = ", ".join([f"`{col}`" for col in df.columns])
+        
+        return f"INSERT INTO {catalog}.{schema}.{table_name} ({columns_str}) VALUES {values_str}"
+        
+    def __enter__(self):
+        self.connect()
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.disconnect()
+'''
+    
+    databricks_file = self.project_root / "src" / "connectors" / "databricks" / "databricks_connector.py"
+    with open(databricks_file, 'w') as f:
+        f.write(databricks_connector)
+    
+    # Also create the bronze pipeline sample
+    bronze_pipeline = '''"""Bronze Layer Pipeline - Raw Data Ingestion"""
 import logging
 from datetime import datetime
 from typing import Dict, Any
@@ -912,10 +1535,128 @@ class BronzePipeline:
                 'end_time': datetime.now()
             }
 '''
+    
+    bronze_file = self.project_root / "src" / "pipelines" / "bronze" / "bronze_pipeline.py"
+    with open(bronze_file, 'w') as f:
+        f.write(bronze_pipeline)
+
+    # Create connection testing script
+    connection_tester = '''"""Test all database connections defined in configuration"""
+import sys
+from typing import Dict, List, Tuple
+from datetime import datetime
+import logging
+
+from src.connectors.oracle.oracle_connector import OracleConnector
+from src.connectors.sqlserver.sqlserver_connector import SQLServerConnector
+from src.connectors.mongodb.mongodb_connector import MongoDBConnector
+from src.connectors.databricks.databricks_connector import DatabricksConnector
+from src.utils.config_loader import ConfigLoader
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class ConnectionTester:
+    """Test all configured database connections."""
+    
+    def __init__(self):
+        self.config_loader = ConfigLoader()
+        self.db_config = self.config_loader.load_database_config()
+        self.results = []
         
-        bronze_file = self.project_root / "src" / "pipelines" / "bronze" / "bronze_pipeline.py"
-        with open(bronze_file, 'w') as f:
-            f.write(bronze_pipeline)
+    def test_oracle_connection(self, config: Dict):
+        """Test a single Oracle connection."""
+        try:
+            connector = OracleConnector(config)
+            connector.connect()
+            df = connector.execute_query("SELECT 1 FROM DUAL")
+            connector.disconnect()
+            return True, "Connection successful"
+        except Exception as e:
+            return False, str(e)
+            
+    def test_sqlserver_connection(self, config: Dict):
+        """Test a single SQL Server connection."""
+        try:
+            connector = SQLServerConnector(config)
+            connector.connect()
+            df = connector.execute_query("SELECT 1 AS test")
+            connector.disconnect()
+            return True, "Connection successful"
+        except Exception as e:
+            return False, str(e)
+            
+    def test_mongodb_connection(self, config: Dict):
+        """Test a single MongoDB connection."""
+        try:
+            connector = MongoDBConnector(config)
+            connector.connect()
+            collections = connector.list_collections()
+            connector.disconnect()
+            return True, f"Connection successful, {len(collections)} collections found"
+        except Exception as e:
+            return False, str(e)
+            
+    def test_databricks_connection(self, config: Dict):
+        """Test a single Databricks connection."""
+        try:
+            connector = DatabricksConnector(config)
+            connector.connect()
+            connector.disconnect()
+            return True, "Connection successful"
+        except Exception as e:
+            return False, str(e)
+            
+    def test_all_connections(self):
+        """Test all configured connections."""
+        print("\\n" + "="*60)
+        print("DATABASE CONNECTION TESTS")
+        print("="*60)
+        
+        # Test Oracle
+        if 'oracle' in self.db_config and 'connections' in self.db_config['oracle']:
+            print("\\nOracle Connections:")
+            for conn in self.db_config['oracle']['connections']:
+                success, message = self.test_oracle_connection(conn)
+                status = "✓" if success else "✗"
+                print(f"  {status} {conn['name']}: {message}")
+                
+        # Test SQL Server
+        if 'sqlserver' in self.db_config and 'connections' in self.db_config['sqlserver']:
+            print("\\nSQL Server Connections:")
+            for conn in self.db_config['sqlserver']['connections']:
+                success, message = self.test_sqlserver_connection(conn)
+                status = "✓" if success else "✗"
+                print(f"  {status} {conn['name']}: {message}")
+                
+        # Test MongoDB
+        if 'mongodb' in self.db_config and 'connections' in self.db_config['mongodb']:
+            print("\\nMongoDB Connections:")
+            for conn in self.db_config['mongodb']['connections']:
+                success, message = self.test_mongodb_connection(conn)
+                status = "✓" if success else "✗"
+                print(f"  {status} {conn['name']}: {message}")
+                
+        # Test Databricks
+        if 'databricks' in self.db_config and 'connections' in self.db_config['databricks']:
+            print("\\nDatabricks Connections:")
+            for conn in self.db_config['databricks']['connections']:
+                success, message = self.test_databricks_connection(conn)
+                status = "✓" if success else "✗"
+                print(f"  {status} {conn['name']}: {message}")
+                
+        print("\\n" + "="*60)
+
+
+if __name__ == "__main__":
+    tester = ConnectionTester()
+    tester.test_all_connections()
+'''
+    
+    connection_tester_file = self.project_root / "scripts" / "test_connections.py"
+    with open(connection_tester_file, 'w') as f:
+        f.write(connection_tester)
     
     def _create_orchestration_files(self):
         """Create orchestration-related files."""
