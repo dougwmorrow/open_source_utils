@@ -146,6 +146,15 @@ class ProjectSetup:
         
         # Create configuration templates
         self._create_config_templates()
+
+        # Create env files
+        self._create_env_files()
+
+        # Create config loader
+        self._create_config_loader()
+
+        # Update oracle connecctor
+        self._update_oracle_connector()
         
         # Create enhanced configuration files
         self._create_enhanced_configs()
@@ -399,6 +408,376 @@ class ProjectSetup:
         schedules_file = self.project_root / "config" / "job_schedules.yaml"
         with open(schedules_file, 'w') as f:
             yaml.dump(schedules_config, f, default_flow_style=False)
+
+    def _create_env_files(self):
+        """Create .env and .env.template files for secure credential storage."""
+        
+        # Create .env.template (for version control)
+        env_template_content = """# Database Credentials
+    # Oracle Database
+    ORACLE_USER=your_oracle_username
+    ORACLE_PASSWORD=your_oracle_password
+
+    # SQL Server
+    SQLSERVER_USER=your_sqlserver_username
+    SQLSERVER_PASSWORD=your_sqlserver_password
+
+    # MongoDB
+    MONGO_USER=your_mongo_username
+    MONGO_PASSWORD=your_mongo_password
+
+    # Databricks
+    DATABRICKS_TOKEN=your_databricks_token
+
+    # Vault Configuration (Optional)
+    VAULT_URL=http://localhost:8200
+    VAULT_TOKEN=your_vault_token
+
+    # Encryption Key Path
+    ENCRYPTION_KEY_PATH=.encryption_key
+
+    # Environment
+    ENV=development
+
+    # Logging Level
+    LOG_LEVEL=INFO
+
+    # Data Retention (days)
+    DATA_RETENTION_BRONZE=30
+    DATA_RETENTION_SILVER=90
+    DATA_RETENTION_GOLD=365
+
+    # Performance Settings
+    MAX_PARALLEL_JOBS=4
+    BATCH_SIZE=10000
+    CHECKPOINT_INTERVAL_MINUTES=30
+
+    # Cache Settings
+    CACHE_MAX_SIZE_GB=10
+    CACHE_TTL_HOURS=24
+
+    # Monitoring
+    PROMETHEUS_PORT=8000
+    METRICS_ENABLED=true
+
+    # Alert Settings
+    ALERT_EMAIL=data-team@company.com
+    PAGERDUTY_API_KEY=your_pagerduty_key
+
+    # Additional Security
+    API_KEY=your_api_key
+    JWT_SECRET=your_jwt_secret
+    """
+        
+        env_template_file = self.project_root / ".env.template"
+        with open(env_template_file, 'w') as f:
+            f.write(env_template_content)
+        
+        # Create actual .env file (not for version control)
+        env_file = self.project_root / ".env"
+        if not env_file.exists():  # Don't overwrite if exists
+            with open(env_file, 'w') as f:
+                f.write(env_template_content)
+            print(f"Created: {env_file} (Remember to update with real credentials!)")
+        
+        # Create .env.example with documentation
+        env_example_content = """# Environment Variables Documentation
+    #
+    # This file documents all environment variables used by the data pipeline.
+    # Copy this file to .env and fill in your actual values.
+    #
+    # SECURITY NOTES:
+    # - Never commit .env files to version control
+    # - Use strong, unique passwords for each service
+    # - Rotate credentials regularly
+    # - Consider using a secret management service in production
+
+    # ==================== DATABASE CONNECTIONS ====================
+
+    # Oracle Database Connection
+    # Used for: Source data extraction from Oracle databases
+    ORACLE_USER=<username>              # Oracle database username
+    ORACLE_PASSWORD=<password>          # Oracle database password
+
+    # SQL Server Connection
+    # Used for: Source data extraction from SQL Server
+    SQLSERVER_USER=<username>           # SQL Server username  
+    SQLSERVER_PASSWORD=<password>       # SQL Server password
+
+    # MongoDB Connection
+    # Used for: NoSQL data source integration
+    MONGO_USER=<username>               # MongoDB username
+    MONGO_PASSWORD=<password>           # MongoDB password
+
+    # Databricks Connection
+    # Used for: Spark processing and Delta Lake operations
+    DATABRICKS_TOKEN=<token>            # Databricks personal access token
+
+    # ==================== SECURITY CONFIGURATION ====================
+
+    # HashiCorp Vault (Optional - for production environments)
+    # If not using Vault, credentials will be read from environment variables
+    VAULT_URL=http://localhost:8200     # Vault server URL
+    VAULT_TOKEN=<token>                 # Vault access token
+
+    # Encryption Settings
+    ENCRYPTION_KEY_PATH=.encryption_key # Path to encryption key file
+
+    # API Security
+    API_KEY=<key>                       # API key for external services
+    JWT_SECRET=<secret>                 # JWT signing secret
+
+    # ==================== ENVIRONMENT SETTINGS ====================
+
+    # Environment Name
+    # Options: development, staging, production
+    ENV=development
+
+    # Logging Configuration
+    # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
+    LOG_LEVEL=INFO
+
+    # ==================== PERFORMANCE TUNING ====================
+
+    # Parallel Processing
+    MAX_PARALLEL_JOBS=4                 # Maximum concurrent jobs
+    BATCH_SIZE=10000                    # Records per batch
+    CHECKPOINT_INTERVAL_MINUTES=30      # How often to save checkpoints
+
+    # Caching Configuration
+    CACHE_MAX_SIZE_GB=10               # Maximum cache size in GB
+    CACHE_TTL_HOURS=24                 # Cache time-to-live in hours
+
+    # ==================== DATA RETENTION ====================
+
+    # Data retention periods in days
+    DATA_RETENTION_BRONZE=30           # Raw data retention
+    DATA_RETENTION_SILVER=90           # Cleaned data retention  
+    DATA_RETENTION_GOLD=365            # Aggregated data retention
+
+    # ==================== MONITORING & ALERTING ====================
+
+    # Prometheus Metrics
+    PROMETHEUS_PORT=8000               # Port for metrics endpoint
+    METRICS_ENABLED=true               # Enable/disable metrics collection
+
+    # Alerting Configuration
+    ALERT_EMAIL=data-team@company.com  # Email for alerts
+    PAGERDUTY_API_KEY=<key>           # PagerDuty integration key
+
+    # ==================== ADVANCED SETTINGS ====================
+
+    # Connection Pool Settings (per database)
+    DB_POOL_SIZE=10                    # Connection pool size
+    DB_POOL_TIMEOUT=30                 # Connection timeout in seconds
+
+    # Memory Management
+    MEMORY_LIMIT_GB=16                 # Maximum memory usage
+    SPARK_MEMORY_FRACTION=0.6          # Spark memory fraction
+
+    # Network Settings
+    REQUEST_TIMEOUT_SECONDS=300        # API request timeout
+    RETRY_ATTEMPTS=3                   # Number of retry attempts
+    RETRY_DELAY_SECONDS=5              # Delay between retries
+    """
+        
+        env_example_file = self.project_root / ".env.example"
+        with open(env_example_file, 'w') as f:
+            f.write(env_example_content)
+            
+    def _create_config_loader(self):
+        """Create the configuration loader utility."""
+        
+        config_loader_content = '''"""Secure configuration loader for the data pipeline project"""
+    import os
+    import json
+    import yaml
+    from pathlib import Path
+    from typing import Dict, Any, Optional
+    from dotenv import load_dotenv
+    import re
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+
+    class ConfigLoader:
+        """Loads configuration from files and environment variables securely."""
+        
+        def __init__(self, env_file: str = ".env", config_dir: str = "config"):
+            """
+            Initialize the configuration loader.
+            
+            Args:
+                env_file: Path to .env file
+                config_dir: Directory containing configuration files
+            """
+            self.env_file = Path(env_file)
+            self.config_dir = Path(config_dir)
+            
+            # Load environment variables
+            if self.env_file.exists():
+                load_dotenv(self.env_file)
+                logger.info(f"Loaded environment variables from {self.env_file}")
+            else:
+                logger.warning(f"No {self.env_file} found. Using system environment variables.")
+                
+        def load_database_config(self) -> Dict[str, Any]:
+            """
+            Load database configuration with environment variable substitution.
+            
+            Returns:
+                Dictionary with database configurations
+            """
+            config_path = self.config_dir / "connections" / "database_config.json"
+            
+            if not config_path.exists():
+                raise FileNotFoundError(f"Database config not found: {config_path}")
+                
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                
+            # Replace environment variable placeholders
+            return self._substitute_env_vars(config)
+            
+        def _substitute_env_vars(self, config: Any) -> Any:
+            """
+            Recursively substitute environment variable placeholders in configuration.
+            
+            Supports formats:
+            - ${VAR_NAME} - Required variable
+            - ${VAR_NAME:-default} - Variable with default value
+            """
+            if isinstance(config, dict):
+                return {k: self._substitute_env_vars(v) for k, v in config.items()}
+            elif isinstance(config, list):
+                return [self._substitute_env_vars(item) for item in config]
+            elif isinstance(config, str):
+                # Find all environment variable placeholders
+                pattern = r'\\$\\{([^}]+)\\}'
+                
+                def replacer(match):
+                    var_expr = match.group(1)
+                    
+                    # Check for default value syntax
+                    if ':-' in var_expr:
+                        var_name, default_value = var_expr.split(':-', 1)
+                        return os.getenv(var_name.strip(), default_value)
+                    else:
+                        value = os.getenv(var_expr)
+                        if value is None:
+                            raise ValueError(f"Required environment variable not set: {var_expr}")
+                        return value
+                        
+                return re.sub(pattern, replacer, config)
+            else:
+                return config
+    '''
+        
+        config_loader_file = self.project_root / "src" / "utils" / "config_loader.py"
+        with open(config_loader_file, 'w') as f:
+            f.write(config_loader_content)
+            
+    def _update_oracle_connector(self):
+        """Update the Oracle connector to use the config loader."""
+        
+        oracle_connector_updated = '''"""Oracle Database Connector with secure configuration"""
+    import oracledb
+    import pandas as pd
+    from typing import Optional, Dict, Any
+    import logging
+    from src.utils.config_loader import ConfigLoader
+
+    logger = logging.getLogger(__name__)
+
+
+    class OracleConnector:
+        """Connector for Oracle Database operations with secure configuration."""
+        
+        def __init__(self, config: Optional[Dict[str, Any]] = None):
+            """
+            Initialize Oracle connector.
+            
+            Args:
+                config: Optional configuration dict. If not provided, loads from ConfigLoader.
+            """
+            if config is None:
+                # Load configuration securely from environment
+                config_loader = ConfigLoader()
+                all_config = config_loader.load_database_config()
+                config = all_config.get('oracle', {})
+                
+                if not config:
+                    raise ValueError("Oracle configuration not found")
+                    
+            self.config = config
+            self.connection = None
+            
+            # Validate required configuration
+            required_fields = ['host', 'port', 'service_name', 'username', 'password']
+            missing_fields = [field for field in required_fields if field not in config]
+            
+            if missing_fields:
+                raise ValueError(f"Missing required Oracle configuration: {', '.join(missing_fields)}")
+            
+        def connect(self):
+            """Establish connection to Oracle database."""
+            try:
+                # Never log passwords!
+                logger.info(f"Connecting to Oracle database at {self.config['host']}:{self.config['port']}")
+                
+                self.connection = oracledb.connect(
+                    user=self.config['username'],
+                    password=self.config['password'],
+                    dsn=f"{self.config['host']}:{self.config['port']}/{self.config['service_name']}"
+                )
+                logger.info("Successfully connected to Oracle database")
+            except Exception as e:
+                logger.error(f"Failed to connect to Oracle: {str(e)}")
+                raise
+                
+        def disconnect(self):
+            """Close database connection."""
+            if self.connection:
+                self.connection.close()
+                logger.info("Disconnected from Oracle database")
+                
+        def execute_query(self, query: str) -> pd.DataFrame:
+            """Execute SQL query and return results as DataFrame."""
+            try:
+                df = pd.read_sql(query, self.connection)
+                logger.info(f"Query executed successfully, returned {len(df)} rows")
+                return df
+            except Exception as e:
+                logger.error(f"Query execution failed: {str(e)}")
+                raise
+                
+        def test_connection(self) -> bool:
+            """Test the database connection."""
+            try:
+                self.connect()
+                # Execute a simple test query
+                cursor = self.connection.cursor()
+                cursor.execute("SELECT 1 FROM DUAL")
+                result = cursor.fetchone()
+                cursor.close()
+                self.disconnect()
+                return result[0] == 1
+            except Exception as e:
+                logger.error(f"Connection test failed: {str(e)}")
+                return False
+                
+        def __enter__(self):
+            self.connect()
+            return self
+            
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            self.disconnect()
+    '''
+        
+        oracle_file = self.project_root / "src" / "connectors" / "oracle" / "oracle_connector.py"
+        with open(oracle_file, 'w') as f:
+            f.write(oracle_connector_updated)
             
     def _create_sample_files(self):
         """Create sample Python files to get started."""
