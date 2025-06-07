@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""
+Oracle to MongoDB Data Migration Script
+Migrates large datasets from Oracle to MongoDB with category filtering and time-based partitioning
+"""
+
+import oracledb
+import pymongo
+from pymongo import InsertOne
+from datetime import datetime, timedelta
+import logging
+import json
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from typing import List, Dict, Any, Optional, Tuple
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('migration.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Configuration
+CONFIG = {
+    # Oracle settings
+    'oracle': {
+        'user': 'your_oracle_user',
+        'password': 'your_oracle_password',
+        'dsn': 'your_oracle_host:1521/your_service_name',
+        'pool_min': 2,
+        'pool_max': 4,
+        'pool_increment': 1
+    },
+    # MongoDB settings
+    'mongodb': {
+        'uri': 'mongodb://localhost:27017/',
+        'database': 'your_target_db',
+        'collection_prefix': 'data',  # Will be appended with category and timestamp
+        'batch_size': 5000,  # Adjust based on document size and memory
+        'write_concern': {'w': 1, 'j': False}  # Adjust for performance vs durability
+    },
+    # Migration settings
+    'migration': {
+        'source_table': 'your_source_table',
+        'category_column': 'cat_col',
+        'timestamp_column': 'your_timestamp_col',
+        'fetch_size': 10000,  # Oracle fetch size
+        'time_granularity': 'hour',  # 'hour' or 'day'
+        'parallel_threads': 4,  # Number of parallel processing threads
+        'checkpoint_frequency': 100000  # Save progress every N records
+    }
+}
+
+# Global connection pools
+oracle_pool = None
+mongo_client = None
+
+def init_oracle_pool():
+    """Initialize Oracle connection pool"""
+    global oracle_pool
+    try:
+        oracle_pool = oracledb.create_pool(
+            user=CONFIG['oracle']['user'],
+            password=CONFIG['oracle']['password'],
+            dsn=CONFIG['oracle']['dsn'],
+            min=CONFIG['oracle']['pool_min'],
+            max=CONFIG['oracle']['pool_max'],
+            increment=CONFIG['oracle']['pool_increment']
+        )
+        logger.info("Oracle connection pool created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create Oracle pool: {e}")
+        raise
+
+def init_mongo_client():
+    """Initialize MongoDB client"""
+    global mongo_client
+    try:
+        mongo_client = pymongo.MongoClient(CONFIG['mongodb']['uri'])
+        # Test connection
+        mongo_client.admin.command('ping')
+        logger.info("MongoDB connection established successfully")
+    except Exception as e:
+        logger.error(f"Failed to connect to MongoDB: {e}")
+        raise
+
+def get_categories(connection) -> List[str]:
+    """Get distinct categories from Oracle"""
+    query = f"""
+    SELECT DISTINCT {CONFIG['migration']['category_column']}
+    FROM {CONFIG['migration']['source_table']}
+    WHERE {CONFIG['migration']['category_column']} IS NOT NULL
+    ORDER BY {CONFIG['migration']['category_column']}
+    """
+    
+    cursor = connection.cursor()
+    cursor.execute(query)
+    categories = [row[0] for row in cursor]
+    cursor.close()
+    
+    logger.info(f"Found {len(categories)} categories")
+    return categories
+
+def get_time_range(connection, category: str) -> Tuple[datetime, datetime]:
+    """Get min and max timestamps for a category"""
+    query = f"""
+    SELECT 
+        MIN({CONFIG['migration']['timestamp_column']}),
+        MAX({CONFIG['migration']['timestamp_column']})
+    FROM {CONFIG['migration']['source_table']}
+    WHERE {CONFIG['migration']['category_column']} = :category
+    """
+    
+    cursor = connection.cursor()
+    cursor.execute(query, category=category)
+    min_time, max_time = cursor.fetchone()
+    cursor.close()
+    
+    return min_time, max_time
+
+def generate_time_windows(start_time: datetime, end_time: datetime, granularity: str) -> List[Tuple[datetime, datetime]]:
+    """Generate time windows based on granularity"""
+    windows = []
+    current = start_time
+    
+    if granularity == 'hour':
+        delta = timedelta(hours=1)
+    else:  # day
+        delta = timedelta(days=1)
+    
+    while current < end_time:
+        window_end = min(current + delta, end_time)
+        windows.append((current, window_end))
+        current = window_end
+    
+    return windows
+
+def get_collection_name(category: str, timestamp: datetime, granularity: str) -> str:
+    """Generate collection name based on category and timestamp"""
+    if granularity == 'hour':
+        time_suffix = timestamp.strftime('%Y%m%d_%H')
+    else:  # day
+        time_suffix = timestamp.strftime('%Y%m%d')
+    
+    # Clean category name for MongoDB collection naming
+    clean_category = category.replace(' ', '_').replace('.', '_').lower()
+    
+    return f"{CONFIG['mongodb']['collection_prefix']}_{clean_category}_{time_suffix}"
+
+def fetch_data_batch(connection, category: str, start_time: datetime, end_time: datetime, offset: int = 0) -> List[Dict[str, Any]]:
+    """Fetch a batch of data from Oracle"""
+    query = f"""
+    SELECT * FROM (
+        SELECT a.*, ROWNUM rnum FROM (
+            SELECT *
+            FROM {CONFIG['migration']['source_table']}
+            WHERE {CONFIG['migration']['category_column']} = :category
+              AND {CONFIG['migration']['timestamp_column']} >= :start_time
+              AND {CONFIG['migration']['timestamp_column']} < :end_time
+            ORDER BY {CONFIG['migration']['timestamp_column']}
+        ) a
+        WHERE ROWNUM <= :max_row
+    )
+    WHERE rnum > :min_row
+    """
+    
+    cursor = connection.cursor()
+    cursor.prefetchrows = CONFIG['migration']['fetch_size']
+    cursor.arraysize = CONFIG['migration']['fetch_size']
+    
+    cursor.execute(query, {
+        'category': category,
+        'start_time': start_time,
+        'end_time': end_time,
+        'max_row': offset + CONFIG['migration']['fetch_size'],
+        'min_row': offset
+    })
+    
+    # Get column names
+    columns = [col[0].lower() for col in cursor.description]
+    
+    # Fetch all rows and convert to dictionaries
+    rows = []
+    for row in cursor:
+        row_dict = dict(zip(columns, row))
+        # Remove the ROWNUM column
+        row_dict.pop('rnum', None)
+        # Add extraction timestamp
+        row_dict['extracted_date'] = datetime.utcnow()
+        rows.append(row_dict)
+    
+    cursor.close()
+    return rows
+
+def insert_batch_to_mongo(collection_name: str, documents: List[Dict[str, Any]]) -> int:
+    """Insert a batch of documents to MongoDB"""
+    db = mongo_client[CONFIG['mongodb']['database']]
+    collection = db[collection_name]
+    
+    if not documents:
+        return 0
+    
+    try:
+        # Create bulk operations
+        operations = [InsertOne(doc) for doc in documents]
+        
+        # Execute bulk write
+        result = collection.bulk_write(
+            operations,
+            ordered=False,
+            bypass_document_validation=True
+        )
+        
+        return result.inserted_count
+    except pymongo.errors.BulkWriteError as e:
+        logger.error(f"Bulk write error: {e.details}")
+        # Return number of successful inserts
+        return e.details.get('nInserted', 0)
+
+def process_time_window(category: str, start_time: datetime, end_time: datetime) -> Dict[str, Any]:
+    """Process a single time window for a category"""
+    connection = oracle_pool.acquire()
+    collection_name = get_collection_name(category, start_time, CONFIG['migration']['time_granularity'])
+    
+    total_inserted = 0
+    offset = 0
+    batch_count = 0
+    
+    try:
+        while True:
+            # Fetch batch from Oracle
+            batch_start = time.time()
+            documents = fetch_data_batch(connection, category, start_time, end_time, offset)
+            
+            if not documents:
+                break
+            
+            fetch_time = time.time() - batch_start
+            
+            # Insert to MongoDB
+            insert_start = time.time()
+            inserted = insert_batch_to_mongo(collection_name, documents)
+            insert_time = time.time() - insert_start
+            
+            total_inserted += inserted
+            offset += len(documents)
+            batch_count += 1
+            
+            logger.info(
+                f"Category: {category}, Collection: {collection_name}, "
+                f"Batch: {batch_count}, Fetched: {len(documents)}, "
+                f"Inserted: {inserted}, Total: {total_inserted}, "
+                f"Fetch: {fetch_time:.2f}s, Insert: {insert_time:.2f}s"
+            )
+            
+            # If we fetched less than fetch_size, we've reached the end
+            if len(documents) < CONFIG['migration']['fetch_size']:
+                break
+    
+    except Exception as e:
+        logger.error(f"Error processing {category} [{start_time} - {end_time}]: {e}")
+        raise
+    finally:
+        oracle_pool.release(connection)
+    
+    return {
+        'category': category,
+        'collection': collection_name,
+        'start_time': start_time,
+        'end_time': end_time,
+        'total_inserted': total_inserted,
+        'batches': batch_count
+    }
+
+def save_checkpoint(checkpoint_data: Dict[str, Any]):
+    """Save migration checkpoint"""
+    with open('migration_checkpoint.json', 'w') as f:
+        json.dump(checkpoint_data, f, default=str, indent=2)
+
+def load_checkpoint() -> Optional[Dict[str, Any]]:
+    """Load migration checkpoint"""
+    try:
+        with open('migration_checkpoint.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+def migrate_category(category: str) -> Dict[str, Any]:
+    """Migrate all data for a single category"""
+    connection = oracle_pool.acquire()
+    
+    try:
+        # Get time range for category
+        min_time, max_time = get_time_range(connection, category)
+        
+        if not min_time or not max_time:
+            logger.warning(f"No data found for category: {category}")
+            return {'category': category, 'status': 'no_data'}
+        
+        logger.info(f"Processing category: {category}, Time range: {min_time} to {max_time}")
+        
+        # Generate time windows
+        time_windows = generate_time_windows(min_time, max_time, CONFIG['migration']['time_granularity'])
+        
+        # Process each time window
+        results = []
+        with ThreadPoolExecutor(max_workers=CONFIG['migration']['parallel_threads']) as executor:
+            futures = {
+                executor.submit(process_time_window, category, start, end): (start, end)
+                for start, end in time_windows
+            }
+            
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    start, end = futures[future]
+                    logger.error(f"Failed to process window {start} - {end}: {e}")
+        
+        total_inserted = sum(r['total_inserted'] for r in results)
+        
+        return {
+            'category': category,
+            'status': 'completed',
+            'time_windows': len(time_windows),
+            'total_inserted': total_inserted,
+            'results': results
+        }
+    
+    finally:
+        oracle_pool.release(connection)
+
+def main():
+    """Main migration function"""
+    start_time = time.time()
+    
+    try:
+        # Initialize connections
+        logger.info("Initializing connections...")
+        init_oracle_pool()
+        init_mongo_client()
+        
+        # Get categories
+        connection = oracle_pool.acquire()
+        categories = get_categories(connection)
+        oracle_pool.release(connection)
+        
+        # Load checkpoint if exists
+        checkpoint = load_checkpoint()
+        completed_categories = set()
+        if checkpoint:
+            completed_categories = set(checkpoint.get('completed_categories', []))
+            logger.info(f"Resuming migration. Already completed: {len(completed_categories)} categories")
+        
+        # Process each category
+        all_results = []
+        for i, category in enumerate(categories):
+            if category in completed_categories:
+                logger.info(f"Skipping already completed category: {category}")
+                continue
+            
+            logger.info(f"Processing category {i+1}/{len(categories)}: {category}")
+            
+            try:
+                result = migrate_category(category)
+                all_results.append(result)
+                completed_categories.add(category)
+                
+                # Save checkpoint
+                if (i + 1) % 10 == 0:  # Save every 10 categories
+                    save_checkpoint({
+                        'completed_categories': list(completed_categories),
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'results': all_results
+                    })
+            
+            except Exception as e:
+                logger.error(f"Failed to migrate category {category}: {e}")
+                continue
+        
+        # Final checkpoint
+        save_checkpoint({
+            'completed_categories': list(completed_categories),
+            'timestamp': datetime.utcnow().isoformat(),
+            'results': all_results,
+            'status': 'completed'
+        })
+        
+        # Summary
+        total_time = time.time() - start_time
+        total_records = sum(r.get('total_inserted', 0) for r in all_results if r.get('status') == 'completed')
+        
+        logger.info(f"""
+        Migration completed!
+        Total categories: {len(categories)}
+        Completed categories: {len(completed_categories)}
+        Total records migrated: {total_records:,}
+        Total time: {total_time/3600:.2f} hours
+        Average rate: {total_records/total_time:.0f} records/second
+        """)
+        
+    except Exception as e:
+        logger.error(f"Migration failed: {e}")
+        raise
+    finally:
+        # Cleanup
+        if oracle_pool:
+            oracle_pool.close()
+        if mongo_client:
+            mongo_client.close()
+
+if __name__ == "__main__":
+    main()
