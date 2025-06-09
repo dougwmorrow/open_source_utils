@@ -196,8 +196,11 @@ BEGIN
         END TRY
         BEGIN CATCH
             PRINT 'INFORMATION_SCHEMA not accessible. Error: ' + ERROR_MESSAGE();
-            
-            -- Try sys.columns as fallback
+        END CATCH
+        
+        -- If INFORMATION_SCHEMA failed, try sys.columns
+        IF @ColumnDiscoverySuccess = 0
+        BEGIN
             BEGIN TRY
                 SET @SQL = N'
                 SELECT 
@@ -223,7 +226,7 @@ BEGIN
             BEGIN CATCH
                 PRINT 'sys.columns not accessible. Error: ' + ERROR_MESSAGE();
             END CATCH
-        END TRY
+        END
     END
     ELSE IF @AnalysisMode = 'OPENQUERY'
     BEGIN
