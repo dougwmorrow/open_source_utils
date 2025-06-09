@@ -1,6 +1,6 @@
 /*
 =====================================================
-DATA TYPE & FORMAT ANALYSIS SCRIPT - ENHANCED VERSION
+DATA TYPE & FORMAT ANALYSIS SCRIPT - TABLE LEVEL VERSION
 =====================================================
 This script analyzes tables for:
 - Mismatched data types
@@ -12,20 +12,44 @@ This script analyzes tables for:
 - Postal/ZIP code patterns
 
 USAGE:
-- Set @AnalysisMode = 'SINGLE' for specific table
-- Set @AnalysisMode = 'ALL' for all tables in database
+- Set @AnalysisMode = 'LOCAL' for local table
 - Set @AnalysisMode = 'LINKED' for linked server table
+- Set @AnalysisMode = 'OPENQUERY' for direct SQL to linked server
 =====================================================
 */
 
 -- Configuration Parameters
-DECLARE @AnalysisMode VARCHAR(20) = 'ALL'; -- Options: 'ALL', 'SINGLE', 'LINKED'
-DECLARE @TargetSchema NVARCHAR(128) = 'dbo'; -- For SINGLE mode
-DECLARE @TargetTable NVARCHAR(128) = 'YourTableName'; -- For SINGLE mode
-DECLARE @LinkedServer NVARCHAR(128) = NULL; -- For LINKED mode
-DECLARE @LinkedDatabase NVARCHAR(128) = NULL; -- For LINKED mode
-DECLARE @LinkedSchema NVARCHAR(128) = 'dbo'; -- For LINKED mode
-DECLARE @LinkedTable NVARCHAR(128) = NULL; -- For LINKED mode
+DECLARE @AnalysisMode VARCHAR(20) = 'LOCAL'; -- Options: 'LOCAL', 'LINKED', 'OPENQUERY'
+
+-- For LOCAL mode
+DECLARE @LocalSchema NVARCHAR(128) = 'dbo';
+DECLARE @LocalTable NVARCHAR(128) = 'YourTableName';
+
+-- For LINKED mode (uses 4-part naming)
+DECLARE @LinkedServer NVARCHAR(128) = NULL;
+DECLARE @LinkedDatabase NVARCHAR(128) = NULL;
+DECLARE @LinkedSchema NVARCHAR(128) = 'dbo';
+DECLARE @LinkedTable NVARCHAR(128) = NULL;
+
+-- For OPENQUERY mode (when sys/INFORMATION_SCHEMA not available)
+DECLARE @OpenQueryServer NVARCHAR(128) = NULL;
+DECLARE @OpenQueryTable NVARCHAR(500) = NULL; -- Full table name like 'database.schema.table'
+
+-- Manual column definition (when metadata not accessible)
+DECLARE @UseManualColumns BIT = 0;
+DECLARE @ManualColumns TABLE (
+    ColumnName NVARCHAR(128),
+    DataType NVARCHAR(128)
+);
+
+-- Example manual column definition
+/*
+INSERT INTO @ManualColumns VALUES 
+    ('CustomerID', 'varchar'),
+    ('OrderDate', 'varchar'),
+    ('Amount', 'varchar'),
+    ('Phone', 'varchar');
+*/
 
 -- Create temporary tables for results
 IF OBJECT_ID('tempdb..#DataTypeAnalysis') IS NOT NULL
@@ -56,210 +80,324 @@ CREATE TABLE #ColumnsToAnalyze (
     ColumnName NVARCHAR(128),
     DataType NVARCHAR(128),
     MaxLength INT,
-    IsLinkedServer BIT DEFAULT 0
+    AnalysisMode NVARCHAR(20)
 );
 
--- Populate columns based on analysis mode
-IF @AnalysisMode = 'ALL'
+-- Verify linked server exists if using LINKED or OPENQUERY mode
+IF @AnalysisMode IN ('LINKED', 'OPENQUERY')
 BEGIN
-    INSERT INTO #ColumnsToAnalyze
-    SELECT 
-        DB_NAME() AS DatabaseName,
-        s.name AS SchemaName,
-        t.name AS TableName,
-        c.name AS ColumnName,
-        TYPE_NAME(c.user_type_id) AS DataType,
-        c.max_length,
-        0 AS IsLinkedServer
-    FROM sys.columns c
-    JOIN sys.tables t ON c.object_id = t.object_id
-    JOIN sys.schemas s ON t.schema_id = s.schema_id
-    WHERE TYPE_NAME(c.user_type_id) IN ('varchar', 'nvarchar', 'char', 'nchar', 'text', 'ntext')
-        AND t.is_ms_shipped = 0
-    ORDER BY s.name, t.name, c.name;
-END
-ELSE IF @AnalysisMode = 'SINGLE'
-BEGIN
-    INSERT INTO #ColumnsToAnalyze
-    SELECT 
-        DB_NAME() AS DatabaseName,
-        s.name AS SchemaName,
-        t.name AS TableName,
-        c.name AS ColumnName,
-        TYPE_NAME(c.user_type_id) AS DataType,
-        c.max_length,
-        0 AS IsLinkedServer
-    FROM sys.columns c
-    JOIN sys.tables t ON c.object_id = t.object_id
-    JOIN sys.schemas s ON t.schema_id = s.schema_id
-    WHERE TYPE_NAME(c.user_type_id) IN ('varchar', 'nvarchar', 'char', 'nchar', 'text', 'ntext')
-        AND t.is_ms_shipped = 0
-        AND s.name = @TargetSchema
-        AND t.name = @TargetTable
-    ORDER BY c.name;
-END
-ELSE IF @AnalysisMode = 'LINKED' AND @LinkedServer IS NOT NULL
-BEGIN
-    DECLARE @LinkedSQL NVARCHAR(MAX);
-    SET @LinkedSQL = N'
-    SELECT 
-        ''' + @LinkedDatabase + ''' AS DatabaseName,
-        TABLE_SCHEMA AS SchemaName,
-        TABLE_NAME AS TableName,
-        COLUMN_NAME AS ColumnName,
-        DATA_TYPE AS DataType,
-        CHARACTER_MAXIMUM_LENGTH AS MaxLength,
-        1 AS IsLinkedServer
-    FROM ' + QUOTENAME(@LinkedServer) + '.' + QUOTENAME(@LinkedDatabase) + '.INFORMATION_SCHEMA.COLUMNS
-    WHERE DATA_TYPE IN (''varchar'', ''nvarchar'', ''char'', ''nchar'', ''text'', ''ntext'')';
-    
-    IF @LinkedTable IS NOT NULL
-        SET @LinkedSQL = @LinkedSQL + ' AND TABLE_NAME = ''' + @LinkedTable + '''';
-    IF @LinkedSchema IS NOT NULL
-        SET @LinkedSQL = @LinkedSQL + ' AND TABLE_SCHEMA = ''' + @LinkedSchema + '''';
-    
-    INSERT INTO #ColumnsToAnalyze
-    EXEC sp_executesql @LinkedSQL;
+    DECLARE @ServerName NVARCHAR(128) = COALESCE(@LinkedServer, @OpenQueryServer);
+    IF NOT EXISTS (SELECT * FROM sys.servers WHERE name = @ServerName)
+    BEGIN
+        PRINT 'ERROR: Linked server ''' + @ServerName + ''' not found in sys.servers';
+        PRINT 'Available linked servers:';
+        SELECT name AS LinkedServerName, product, provider, data_source 
+        FROM sys.servers 
+        WHERE is_linked = 1
+        ORDER BY name;
+        RETURN;
+    END
 END
 
--- Variables for processing
+-- Build full table name based on mode
+DECLARE @FullTableName NVARCHAR(500);
+DECLARE @TableIdentifier NVARCHAR(500);
+
+IF @AnalysisMode = 'LOCAL'
+BEGIN
+    SET @FullTableName = QUOTENAME(@LocalSchema) + '.' + QUOTENAME(@LocalTable);
+    SET @TableIdentifier = @LocalSchema + '.' + @LocalTable;
+END
+ELSE IF @AnalysisMode = 'LINKED'
+BEGIN
+    SET @FullTableName = QUOTENAME(@LinkedServer) + '.' + QUOTENAME(@LinkedDatabase) + '.' + 
+                        QUOTENAME(@LinkedSchema) + '.' + QUOTENAME(@LinkedTable);
+    SET @TableIdentifier = @LinkedServer + '.' + @LinkedDatabase + '.' + @LinkedSchema + '.' + @LinkedTable;
+END
+ELSE IF @AnalysisMode = 'OPENQUERY'
+BEGIN
+    SET @TableIdentifier = @OpenQueryServer + '.' + @OpenQueryTable;
+END
+
+PRINT 'Analyzing table: ' + @TableIdentifier;
+
+-- Populate columns based on analysis mode and availability
 DECLARE @SQL NVARCHAR(MAX);
+DECLARE @ColumnDiscoverySuccess BIT = 0;
+
+-- Try to get column information
+IF @UseManualColumns = 1
+BEGIN
+    -- Use manually defined columns
+    INSERT INTO #ColumnsToAnalyze
+    SELECT 
+        CASE WHEN @AnalysisMode = 'LOCAL' THEN DB_NAME() ELSE @LinkedDatabase END,
+        CASE WHEN @AnalysisMode = 'LOCAL' THEN @LocalSchema ELSE @LinkedSchema END,
+        CASE WHEN @AnalysisMode = 'LOCAL' THEN @LocalTable ELSE COALESCE(@LinkedTable, @OpenQueryTable) END,
+        ColumnName,
+        DataType,
+        NULL AS MaxLength,
+        @AnalysisMode
+    FROM @ManualColumns;
+    
+    SET @ColumnDiscoverySuccess = 1;
+END
+ELSE
+BEGIN
+    -- Try automatic column discovery
+    IF @AnalysisMode = 'LOCAL'
+    BEGIN
+        -- Use local sys.columns
+        BEGIN TRY
+            INSERT INTO #ColumnsToAnalyze
+            SELECT 
+                DB_NAME() AS DatabaseName,
+                s.name AS SchemaName,
+                t.name AS TableName,
+                c.name AS ColumnName,
+                TYPE_NAME(c.user_type_id) AS DataType,
+                c.max_length,
+                'LOCAL'
+            FROM sys.columns c
+            JOIN sys.tables t ON c.object_id = t.object_id
+            JOIN sys.schemas s ON t.schema_id = s.schema_id
+            WHERE TYPE_NAME(c.user_type_id) IN ('varchar', 'nvarchar', 'char', 'nchar', 'text', 'ntext')
+                AND s.name = @LocalSchema
+                AND t.name = @LocalTable;
+            
+            SET @ColumnDiscoverySuccess = 1;
+        END TRY
+        BEGIN CATCH
+            PRINT 'Error discovering columns: ' + ERROR_MESSAGE();
+        END CATCH
+    END
+    ELSE IF @AnalysisMode = 'LINKED'
+    BEGIN
+        -- Try INFORMATION_SCHEMA first
+        BEGIN TRY
+            SET @SQL = N'
+            SELECT 
+                ''' + @LinkedDatabase + ''' AS DatabaseName,
+                TABLE_SCHEMA AS SchemaName,
+                TABLE_NAME AS TableName,
+                COLUMN_NAME AS ColumnName,
+                DATA_TYPE AS DataType,
+                CHARACTER_MAXIMUM_LENGTH AS MaxLength,
+                ''LINKED'' AS AnalysisMode
+            FROM ' + QUOTENAME(@LinkedServer) + '.' + QUOTENAME(@LinkedDatabase) + '.INFORMATION_SCHEMA.COLUMNS
+            WHERE DATA_TYPE IN (''varchar'', ''nvarchar'', ''char'', ''nchar'', ''text'', ''ntext'')
+                AND TABLE_SCHEMA = ''' + @LinkedSchema + '''
+                AND TABLE_NAME = ''' + @LinkedTable + '''';
+            
+            INSERT INTO #ColumnsToAnalyze
+            EXEC sp_executesql @SQL;
+            
+            SET @ColumnDiscoverySuccess = 1;
+        END TRY
+        BEGIN CATCH
+            PRINT 'INFORMATION_SCHEMA not accessible. Error: ' + ERROR_MESSAGE();
+            
+            -- Try sys.columns as fallback
+            BEGIN TRY
+                SET @SQL = N'
+                SELECT 
+                    ''' + @LinkedDatabase + ''' AS DatabaseName,
+                    s.name AS SchemaName,
+                    t.name AS TableName,
+                    c.name AS ColumnName,
+                    TYPE_NAME(c.user_type_id) AS DataType,
+                    c.max_length,
+                    ''LINKED'' AS AnalysisMode
+                FROM ' + QUOTENAME(@LinkedServer) + '.' + QUOTENAME(@LinkedDatabase) + '.sys.columns c
+                JOIN ' + QUOTENAME(@LinkedServer) + '.' + QUOTENAME(@LinkedDatabase) + '.sys.tables t ON c.object_id = t.object_id
+                JOIN ' + QUOTENAME(@LinkedServer) + '.' + QUOTENAME(@LinkedDatabase) + '.sys.schemas s ON t.schema_id = s.schema_id
+                WHERE TYPE_NAME(c.user_type_id) IN (''varchar'', ''nvarchar'', ''char'', ''nchar'', ''text'', ''ntext'')
+                    AND s.name = ''' + @LinkedSchema + '''
+                    AND t.name = ''' + @LinkedTable + '''';
+                
+                INSERT INTO #ColumnsToAnalyze
+                EXEC sp_executesql @SQL;
+                
+                SET @ColumnDiscoverySuccess = 1;
+            END TRY
+            BEGIN CATCH
+                PRINT 'sys.columns not accessible. Error: ' + ERROR_MESSAGE();
+            END CATCH
+        END TRY
+    END
+    ELSE IF @AnalysisMode = 'OPENQUERY'
+    BEGIN
+        -- Try to get column info via OPENQUERY with a dummy query
+        BEGIN TRY
+            SET @SQL = N'
+            SELECT TOP 0 * INTO #TempSchema 
+            FROM OPENQUERY(' + QUOTENAME(@OpenQueryServer) + ', ''SELECT * FROM ' + @OpenQueryTable + ' WHERE 1=0'')
+            
+            INSERT INTO #ColumnsToAnalyze
+            SELECT 
+                ''' + @OpenQueryServer + ''' AS DatabaseName,
+                ''Unknown'' AS SchemaName,
+                ''' + @OpenQueryTable + ''' AS TableName,
+                c.name AS ColumnName,
+                TYPE_NAME(c.user_type_id) AS DataType,
+                c.max_length,
+                ''OPENQUERY''
+            FROM tempdb.sys.columns c
+            WHERE c.object_id = OBJECT_ID(''tempdb..#TempSchema'')
+                AND TYPE_NAME(c.user_type_id) IN (''varchar'', ''nvarchar'', ''char'', ''nchar'', ''text'', ''ntext'')
+            
+            DROP TABLE #TempSchema';
+            
+            EXEC sp_executesql @SQL;
+            SET @ColumnDiscoverySuccess = 1;
+        END TRY
+        BEGIN CATCH
+            PRINT 'Cannot discover columns via OPENQUERY. Error: ' + ERROR_MESSAGE();
+        END CATCH
+    END
+END
+
+-- Check if we have columns to analyze
+IF NOT EXISTS (SELECT 1 FROM #ColumnsToAnalyze)
+BEGIN
+    PRINT '';
+    PRINT 'ERROR: No columns found to analyze.';
+    PRINT 'Possible solutions:';
+    PRINT '1. Set @UseManualColumns = 1 and define columns in @ManualColumns table';
+    PRINT '2. Verify table name and schema are correct';
+    PRINT '3. Check if the table has varchar/nvarchar columns';
+    PRINT '4. Ensure you have permissions to access table metadata';
+    RETURN;
+END
+
+-- Show columns to be analyzed
+PRINT '';
+PRINT 'Columns to analyze:';
+SELECT ColumnName, DataType FROM #ColumnsToAnalyze;
+
+-- Get total row count
+DECLARE @RowCount INT = 0;
+IF @AnalysisMode = 'OPENQUERY'
+BEGIN
+    SET @SQL = N'SELECT @Count = COUNT(*) FROM OPENQUERY(' + QUOTENAME(@OpenQueryServer) + 
+               ', ''SELECT COUNT(*) AS cnt FROM ' + @OpenQueryTable + ''')';
+END
+ELSE
+BEGIN
+    SET @SQL = N'SELECT @Count = COUNT(*) FROM ' + @FullTableName;
+END
+
+BEGIN TRY
+    EXEC sp_executesql @SQL, N'@Count INT OUTPUT', @Count = @RowCount OUTPUT;
+    PRINT 'Total rows in table: ' + CAST(@RowCount AS VARCHAR(20));
+END TRY
+BEGIN CATCH
+    PRINT 'Error getting row count: ' + ERROR_MESSAGE();
+    SET @RowCount = -1;
+END CATCH
+
+IF @RowCount = 0
+BEGIN
+    PRINT 'Table is empty. No analysis performed.';
+    RETURN;
+END
+
+-- Analyze each column
 DECLARE @DatabaseName NVARCHAR(128);
 DECLARE @SchemaName NVARCHAR(128);
 DECLARE @TableName NVARCHAR(128);
 DECLARE @ColumnName NVARCHAR(128);
 DECLARE @DataType NVARCHAR(128);
-DECLARE @MaxLength INT;
-DECLARE @IsLinkedServer BIT;
-DECLARE @FullTableName NVARCHAR(500);
 
--- Cursor for columns to analyze
 DECLARE column_cursor CURSOR FOR
-SELECT DatabaseName, SchemaName, TableName, ColumnName, DataType, MaxLength, IsLinkedServer
+SELECT DatabaseName, SchemaName, TableName, ColumnName, DataType
 FROM #ColumnsToAnalyze;
 
 OPEN column_cursor;
-FETCH NEXT FROM column_cursor INTO @DatabaseName, @SchemaName, @TableName, @ColumnName, @DataType, @MaxLength, @IsLinkedServer;
+FETCH NEXT FROM column_cursor INTO @DatabaseName, @SchemaName, @TableName, @ColumnName, @DataType;
 
 WHILE @@FETCH_STATUS = 0
 BEGIN
-    -- Build full table name based on source
-    IF @IsLinkedServer = 1
-        SET @FullTableName = QUOTENAME(@LinkedServer) + '.' + QUOTENAME(@DatabaseName) + '.' + QUOTENAME(@SchemaName) + '.' + QUOTENAME(@TableName);
-    ELSE
-        SET @FullTableName = QUOTENAME(@SchemaName) + '.' + QUOTENAME(@TableName);
+    PRINT 'Analyzing column: ' + @ColumnName;
     
-    -- Skip if table is empty
-    SET @SQL = N'SELECT @Count = COUNT(*) FROM ' + @FullTableName;
-    DECLARE @RowCount INT = 0;
+    -- Build table reference based on mode
+    DECLARE @TableRef NVARCHAR(500);
+    IF @AnalysisMode = 'OPENQUERY'
+        SET @TableRef = 'OPENQUERY(' + QUOTENAME(@OpenQueryServer) + ', ''SELECT * FROM ' + @OpenQueryTable + ''')';
+    ELSE
+        SET @TableRef = @FullTableName;
+    
+    -- 1. Check for numeric data
     BEGIN TRY
-        EXEC sp_executesql @SQL, N'@Count INT OUTPUT', @Count = @RowCount OUTPUT;
+        IF @AnalysisMode = 'OPENQUERY'
+        BEGIN
+            -- Simplified query for OPENQUERY
+            SET @SQL = N'
+            INSERT INTO #DataTypeAnalysis
+            SELECT 
+                ''' + @DatabaseName + ''',
+                ''' + @SchemaName + ''',
+                ''' + @TableName + ''',
+                ''' + @ColumnName + ''',
+                ''' + @DataType + ''',
+                ''Numeric as String'',
+                ''Column contains numeric values stored as string'',
+                COUNT(*) AS SampleCount,
+                ' + CAST(@RowCount AS NVARCHAR(20)) + ' AS TotalCount,
+                CAST(COUNT(*) * 100.0 / ' + CAST(@RowCount AS NVARCHAR(20)) + ' AS DECIMAL(5,2)) AS PercentageMatch,
+                ''Check manually'' AS SuggestedDataType,
+                ''See samples'' AS SampleData
+            FROM OPENQUERY(' + QUOTENAME(@OpenQueryServer) + ', 
+                ''SELECT ' + @ColumnName + ' FROM ' + @OpenQueryTable + ' 
+                  WHERE ' + @ColumnName + ' IS NOT NULL 
+                    AND ' + @ColumnName + ' REGEXP ''''^^[0-9.-]+$'''''')
+            HAVING COUNT(*) > 0';
+        END
+        ELSE
+        BEGIN
+            -- Standard query for local/linked tables
+            SET @SQL = N'
+            INSERT INTO #DataTypeAnalysis
+            SELECT 
+                ''' + @DatabaseName + ''',
+                ''' + @SchemaName + ''',
+                ''' + @TableName + ''',
+                ''' + @ColumnName + ''',
+                ''' + @DataType + ''',
+                ''Numeric as String'',
+                ''Column contains numeric values stored as string'',
+                COUNT(*),
+                ' + CAST(@RowCount AS NVARCHAR(20)) + ',
+                CAST(COUNT(*) * 100.0 / ' + CAST(@RowCount AS NVARCHAR(20)) + ' AS DECIMAL(5,2)),
+                CASE 
+                    WHEN MAX(LEN(' + QUOTENAME(@ColumnName) + ')) <= 9 THEN ''INT''
+                    WHEN MAX(LEN(' + QUOTENAME(@ColumnName) + ')) <= 18 THEN ''BIGINT''
+                    ELSE ''DECIMAL(18,4)''
+                END,
+                STUFF((SELECT TOP 5 ''; '' + CAST(' + QUOTENAME(@ColumnName) + ' AS NVARCHAR(100))
+                       FROM ' + @TableRef + '
+                       WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+                         AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
+                         AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%''
+                       FOR XML PATH('''')), 1, 2, '''')
+            FROM ' + @TableRef + '
+            WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+                AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
+                AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%''
+                AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%-%-%''
+                AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%.%.%''
+            HAVING COUNT(*) > 0';
+        END
+        
+        EXEC sp_executesql @SQL;
     END TRY
     BEGIN CATCH
-        PRINT 'Error accessing table: ' + @FullTableName;
-        GOTO NextColumn;
+        PRINT '  - Error checking numeric patterns: ' + LEFT(ERROR_MESSAGE(), 200);
     END CATCH
     
-    IF @RowCount > 0
-    BEGIN
-        PRINT 'Analyzing: ' + @FullTableName + '.' + @ColumnName;
-        
-        -- 1. Check for numeric data stored as varchar
-        SET @SQL = N'
-        INSERT INTO #DataTypeAnalysis
-        SELECT 
-            ''' + @DatabaseName + ''',
-            ''' + @SchemaName + ''',
-            ''' + @TableName + ''',
-            ''' + @ColumnName + ''',
-            ''' + @DataType + ''',
-            ''Numeric as String'',
-            ''Column contains numeric values stored as string'',
-            COUNT(*),
-            ' + CAST(@RowCount AS NVARCHAR(20)) + ',
-            CAST(COUNT(*) * 100.0 / ' + CAST(@RowCount AS NVARCHAR(20)) + ' AS DECIMAL(5,2)),
-            CASE 
-                WHEN MAX(LEN(' + QUOTENAME(@ColumnName) + ')) <= 9 AND 
-                     MIN(TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS INT)) IS NOT NULL AND
-                     MAX(TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS INT)) IS NOT NULL THEN ''INT''
-                WHEN MIN(TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS BIGINT)) IS NOT NULL AND
-                     MAX(TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS BIGINT)) IS NOT NULL THEN ''BIGINT''
-                WHEN MIN(TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DECIMAL(18,4))) IS NOT NULL AND
-                     MAX(TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DECIMAL(18,4))) IS NOT NULL THEN ''DECIMAL(18,4)''
-                ELSE ''FLOAT''
-            END,
-            STUFF((SELECT TOP 5 ''; '' + CAST(' + QUOTENAME(@ColumnName) + ' AS NVARCHAR(100))
-                   FROM ' + @FullTableName + '
-                   WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-                     AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
-                     AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%''
-                     AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%-%-%''
-                     AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%.%.%''
-                   FOR XML PATH('''')), 1, 2, '''')
-        FROM ' + @FullTableName + '
-        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-            AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
-            AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%''
-            AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%-%-%''
-            AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%.%.%''
-        HAVING COUNT(*) > 0';
-        
-        BEGIN TRY
-            EXEC sp_executesql @SQL;
-        END TRY
-        BEGIN CATCH
-            PRINT 'Error analyzing numeric patterns for: ' + @ColumnName;
-        END CATCH
-        
-        -- 2. Check for date/datetime stored as varchar
-        SET @SQL = N'
-        INSERT INTO #DataTypeAnalysis
-        SELECT 
-            ''' + @DatabaseName + ''',
-            ''' + @SchemaName + ''',
-            ''' + @TableName + ''',
-            ''' + @ColumnName + ''',
-            ''' + @DataType + ''',
-            ''Date as String'',
-            ''Column contains date values stored as string'',
-            COUNT(*),
-            ' + CAST(@RowCount AS NVARCHAR(20)) + ',
-            CAST(COUNT(*) * 100.0 / ' + CAST(@RowCount AS NVARCHAR(20)) + ' AS DECIMAL(5,2)),
-            CASE 
-                WHEN MAX(LEN(' + QUOTENAME(@ColumnName) + ')) <= 10 THEN ''DATE''
-                ELSE ''DATETIME''
-            END,
-            STUFF((SELECT TOP 5 ''; '' + CAST(' + QUOTENAME(@ColumnName) + ' AS NVARCHAR(100))
-                   FROM ' + @FullTableName + '
-                   WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-                     AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
-                     AND (
-                         TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE) IS NOT NULL
-                         OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]%''
-                         OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9]/[0-9][0-9]/[0-9][0-9][0-9][0-9]%''
-                         OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9]%''
-                     )
-                   FOR XML PATH('''')), 1, 2, '''')
-        FROM ' + @FullTableName + '
-        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-            AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
-            AND (
-                TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE) IS NOT NULL
-                OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]%''
-                OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9]/[0-9][0-9]/[0-9][0-9][0-9][0-9]%''
-                OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9]%''
-            )
-        HAVING COUNT(*) > 0';
-        
-        BEGIN TRY
-            EXEC sp_executesql @SQL;
-        END TRY
-        BEGIN CATCH
-            PRINT 'Error analyzing date patterns for: ' + @ColumnName;
-        END CATCH
-        
-        -- 3. Check for JSON data (skip for linked servers as ISJSON might not be available)
-        IF @IsLinkedServer = 0
+    -- 2. Check for date patterns
+    BEGIN TRY
+        IF @AnalysisMode != 'OPENQUERY' -- Skip complex date checks for OPENQUERY
         BEGIN
             SET @SQL = N'
             INSERT INTO #DataTypeAnalysis
@@ -269,153 +407,128 @@ BEGIN
                 ''' + @TableName + ''',
                 ''' + @ColumnName + ''',
                 ''' + @DataType + ''',
-                ''JSON Data'',
-                ''Column contains JSON formatted data'',
+                ''Date as String'',
+                ''Column contains date values stored as string'',
                 COUNT(*),
                 ' + CAST(@RowCount AS NVARCHAR(20)) + ',
                 CAST(COUNT(*) * 100.0 / ' + CAST(@RowCount AS NVARCHAR(20)) + ' AS DECIMAL(5,2)),
-                ''NVARCHAR(MAX) with JSON constraint'',
-                STUFF((SELECT TOP 5 ''; '' + LEFT(CAST(' + QUOTENAME(@ColumnName) + ' AS NVARCHAR(100)), 100)
-                       FROM ' + @FullTableName + '
+                ''DATE or DATETIME'',
+                STUFF((SELECT TOP 5 ''; '' + CAST(' + QUOTENAME(@ColumnName) + ' AS NVARCHAR(100))
+                       FROM ' + @TableRef + '
                        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-                         AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
-                         AND ISJSON(' + QUOTENAME(@ColumnName) + ') = 1
+                         AND LEN(' + QUOTENAME(@ColumnName) + ') >= 8
+                         AND (' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]%''
+                           OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9]/[0-9][0-9]/[0-9][0-9][0-9][0-9]%'')
                        FOR XML PATH('''')), 1, 2, '''')
-            FROM ' + @FullTableName + '
+            FROM ' + @TableRef + '
             WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-                AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
-                AND ISJSON(' + QUOTENAME(@ColumnName) + ') = 1
+                AND LEN(' + QUOTENAME(@ColumnName) + ') >= 8
+                AND (' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]%''
+                  OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9]/[0-9][0-9]/[0-9][0-9][0-9][0-9]%'')
             HAVING COUNT(*) > 0';
             
-            BEGIN TRY
-                EXEC sp_executesql @SQL;
-            END TRY
-            BEGIN CATCH
-                PRINT 'Error analyzing JSON patterns for: ' + @ColumnName;
-            END CATCH
-        END
-        
-        -- 4. Check for phone number patterns
-        SET @SQL = N'
-        INSERT INTO #DataTypeAnalysis
-        SELECT 
-            ''' + @DatabaseName + ''',
-            ''' + @SchemaName + ''',
-            ''' + @TableName + ''',
-            ''' + @ColumnName + ''',
-            ''' + @DataType + ''',
-            ''Phone Number Pattern'',
-            ''Column contains phone number patterns'',
-            COUNT(*),
-            ' + CAST(@RowCount AS NVARCHAR(20)) + ',
-            CAST(COUNT(*) * 100.0 / ' + CAST(@RowCount AS NVARCHAR(20)) + ' AS DECIMAL(5,2)),
-            ''VARCHAR(20) with CHECK constraint'',
-            STUFF((SELECT TOP 5 ''; '' + CAST(' + QUOTENAME(@ColumnName) + ' AS NVARCHAR(100))
-                   FROM ' + @FullTableName + '
-                   WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-                     AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
-                     AND (
-                         ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9]-[0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
-                         OR ' + QUOTENAME(@ColumnName) + ' LIKE ''([0-9][0-9][0-9]) [0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
-                         OR ' + QUOTENAME(@ColumnName) + ' LIKE ''+[0-9]%''
-                         OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]''
-                     )
-                   FOR XML PATH('''')), 1, 2, '''')
-        FROM ' + @FullTableName + '
-        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-            AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
-            AND (
-                ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9]-[0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
-                OR ' + QUOTENAME(@ColumnName) + ' LIKE ''([0-9][0-9][0-9]) [0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
-                OR ' + QUOTENAME(@ColumnName) + ' LIKE ''+[0-9]%''
-                OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]''
-            )
-        HAVING COUNT(*) > 0';
-        
-        BEGIN TRY
             EXEC sp_executesql @SQL;
-        END TRY
-        BEGIN CATCH
-            PRINT 'Error analyzing phone patterns for: ' + @ColumnName;
-        END CATCH
-        
-        -- Add more pattern checks as needed...
-    END
+        END
+    END TRY
+    BEGIN CATCH
+        PRINT '  - Error checking date patterns: ' + LEFT(ERROR_MESSAGE(), 200);
+    END CATCH
     
-    NextColumn:
-    FETCH NEXT FROM column_cursor INTO @DatabaseName, @SchemaName, @TableName, @ColumnName, @DataType, @MaxLength, @IsLinkedServer;
+    -- 3. Check for phone patterns
+    BEGIN TRY
+        IF @AnalysisMode != 'OPENQUERY'
+        BEGIN
+            SET @SQL = N'
+            INSERT INTO #DataTypeAnalysis
+            SELECT 
+                ''' + @DatabaseName + ''',
+                ''' + @SchemaName + ''',
+                ''' + @TableName + ''',
+                ''' + @ColumnName + ''',
+                ''' + @DataType + ''',
+                ''Phone Number Pattern'',
+                ''Column contains phone number patterns'',
+                COUNT(*),
+                ' + CAST(@RowCount AS NVARCHAR(20)) + ',
+                CAST(COUNT(*) * 100.0 / ' + CAST(@RowCount AS NVARCHAR(20)) + ' AS DECIMAL(5,2)),
+                ''VARCHAR(20)'',
+                STUFF((SELECT TOP 5 ''; '' + CAST(' + QUOTENAME(@ColumnName) + ' AS NVARCHAR(100))
+                       FROM ' + @TableRef + '
+                       WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+                         AND (' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9]-[0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
+                           OR ' + QUOTENAME(@ColumnName) + ' LIKE ''([0-9][0-9][0-9]) [0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
+                           OR ' + QUOTENAME(@ColumnName) + ' LIKE ''+[0-9]%'')
+                       FOR XML PATH('''')), 1, 2, '''')
+            FROM ' + @TableRef + '
+            WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+                AND (' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9]-[0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
+                  OR ' + QUOTENAME(@ColumnName) + ' LIKE ''([0-9][0-9][0-9]) [0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
+                  OR ' + QUOTENAME(@ColumnName) + ' LIKE ''+[0-9]%'')
+            HAVING COUNT(*) > 0';
+            
+            EXEC sp_executesql @SQL;
+        END
+    END TRY
+    BEGIN CATCH
+        PRINT '  - Error checking phone patterns: ' + LEFT(ERROR_MESSAGE(), 200);
+    END CATCH
+    
+    FETCH NEXT FROM column_cursor INTO @DatabaseName, @SchemaName, @TableName, @ColumnName, @DataType;
 END
 
 CLOSE column_cursor;
 DEALLOCATE column_cursor;
 
--- Generate summary report
+-- Generate report
 PRINT '';
 PRINT '=====================================================';
-PRINT 'DATA TYPE & FORMAT ANALYSIS SUMMARY';
+PRINT 'DATA TYPE & FORMAT ANALYSIS RESULTS';
 PRINT '=====================================================';
-PRINT 'Analysis Mode: ' + @AnalysisMode;
-IF @AnalysisMode = 'SINGLE'
-    PRINT 'Target Table: ' + @TargetSchema + '.' + @TargetTable;
-IF @AnalysisMode = 'LINKED'
-    PRINT 'Linked Server: ' + ISNULL(@LinkedServer, 'Not specified');
+PRINT 'Table: ' + @TableIdentifier;
+PRINT 'Mode: ' + @AnalysisMode;
 PRINT '';
 
--- Summary by analysis type
-SELECT 
-    AnalysisType,
-    COUNT(DISTINCT SchemaName + '.' + TableName + '.' + ColumnName) AS AffectedColumns,
-    COUNT(DISTINCT SchemaName + '.' + TableName) AS AffectedTables
-FROM #DataTypeAnalysis
-GROUP BY AnalysisType
-ORDER BY COUNT(DISTINCT SchemaName + '.' + TableName + '.' + ColumnName) DESC;
+-- Check if any findings
+IF NOT EXISTS (SELECT 1 FROM #DataTypeAnalysis)
+BEGIN
+    PRINT 'No data type mismatches or patterns found.';
+END
+ELSE
+BEGIN
+    -- Summary
+    SELECT 
+        AnalysisType,
+        COUNT(DISTINCT ColumnName) AS AffectedColumns,
+        MAX(PercentageMatch) AS MaxMatchPercent
+    FROM #DataTypeAnalysis
+    GROUP BY AnalysisType
+    ORDER BY COUNT(DISTINCT ColumnName) DESC;
+    
+    -- Detailed findings
+    PRINT '';
+    PRINT 'DETAILED FINDINGS:';
+    SELECT 
+        ColumnName,
+        CurrentDataType,
+        AnalysisType,
+        CAST(PercentageMatch AS VARCHAR(10)) + '%' AS MatchPercent,
+        SuggestedDataType,
+        LEFT(SampleData, 100) AS SampleData
+    FROM #DataTypeAnalysis
+    WHERE PercentageMatch >= 50
+    ORDER BY PercentageMatch DESC, ColumnName;
+END
 
--- Detailed findings
-PRINT '';
-PRINT 'DETAILED FINDINGS (80%+ confidence):';
-PRINT '====================================';
-
-SELECT 
-    CASE 
-        WHEN @AnalysisMode = 'LINKED' THEN @LinkedServer + '.' + DatabaseName + '.'
-        ELSE ''
-    END + SchemaName + '.' + TableName AS [Table],
-    ColumnName,
-    CurrentDataType,
-    AnalysisType,
-    CAST(PercentageMatch AS VARCHAR(10)) + '%' AS [% Match],
-    SuggestedDataType,
-    LEFT(SampleData, 100) AS SampleData
-FROM #DataTypeAnalysis
-WHERE PercentageMatch >= 80
-ORDER BY 
-    SchemaName,
-    TableName,
-    ColumnName,
-    PercentageMatch DESC;
-
--- Generate conversion recommendations
-IF @AnalysisMode != 'LINKED'
+-- Provide manual column template if needed
+IF @ColumnDiscoverySuccess = 0
 BEGIN
     PRINT '';
-    PRINT 'CONVERSION RECOMMENDATIONS (95%+ confidence):';
-    PRINT '=============================================';
-
-    WITH RankedFindings AS (
-        SELECT 
-            *,
-            ROW_NUMBER() OVER (PARTITION BY SchemaName, TableName, ColumnName ORDER BY PercentageMatch DESC) AS rn
-        FROM #DataTypeAnalysis
-        WHERE PercentageMatch >= 95
-    )
-    SELECT TOP 20
-        'ALTER TABLE ' + QUOTENAME(SchemaName) + '.' + QUOTENAME(TableName) + 
-        ' ALTER COLUMN ' + QUOTENAME(ColumnName) + ' ' + SuggestedDataType + ';' AS ConversionScript,
-        AnalysisType,
-        CAST(PercentageMatch AS VARCHAR(10)) + '%' AS Confidence
-    FROM RankedFindings
-    WHERE rn = 1
-    ORDER BY PercentageMatch DESC;
+    PRINT '-- Column discovery failed. Use this template:';
+    PRINT 'DECLARE @UseManualColumns BIT = 1;';
+    PRINT 'INSERT INTO @ManualColumns VALUES';
+    PRINT '    (''Column1'', ''varchar''),';
+    PRINT '    (''Column2'', ''varchar''),';
+    PRINT '    (''Column3'', ''varchar'');';
 END
 
 -- Clean up
