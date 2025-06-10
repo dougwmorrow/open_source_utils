@@ -1,539 +1,565 @@
 /*
 =====================================================
-DATA TYPE & FORMAT ANALYSIS SCRIPT - TABLE LEVEL VERSION
+TABLE DATA TYPE & FORMAT ANALYSIS SCRIPT
 =====================================================
-This script analyzes tables for:
-- Mismatched data types
-- Implicit conversion candidates
-- JSON/XML detection
-- Binary data detection
-- Currency patterns
-- Phone number formats
-- Postal/ZIP code patterns
-
-USAGE:
-- Set @AnalysisMode = 'LOCAL' for local table
-- Set @AnalysisMode = 'LINKED' for linked server table
-- Set @AnalysisMode = 'OPENQUERY' for direct SQL to linked server
+Analyzes a specific table for data type mismatches and patterns
+Returns detailed findings for each column
 =====================================================
 */
 
--- Configuration Parameters
-DECLARE @AnalysisMode VARCHAR(20) = 'LOCAL'; -- Options: 'LOCAL', 'LINKED', 'OPENQUERY'
+-- CONFIGURATION - MODIFY THESE PARAMETERS
+DECLARE @TableName NVARCHAR(500) = 'dbo.YourTableName'; -- Format: [schema].[table] or [server].[database].[schema].[table]
+DECLARE @TopSamples INT = 10; -- Number of sample values to return
+DECLARE @MinPercentageForFinding DECIMAL(5,2) = 10.0; -- Minimum % to report a finding
 
--- For LOCAL mode
-DECLARE @LocalSchema NVARCHAR(128) = 'dbo';
-DECLARE @LocalTable NVARCHAR(128) = 'YourTableName';
+-- Initialize results table
+IF OBJECT_ID('tempdb..#AnalysisResults') IS NOT NULL
+    DROP TABLE #AnalysisResults;
 
--- For LINKED mode (uses 4-part naming)
-DECLARE @LinkedServer NVARCHAR(128) = NULL;
-DECLARE @LinkedDatabase NVARCHAR(128) = NULL;
-DECLARE @LinkedSchema NVARCHAR(128) = 'dbo';
-DECLARE @LinkedTable NVARCHAR(128) = NULL;
-
--- For OPENQUERY mode (when sys/INFORMATION_SCHEMA not available)
-DECLARE @OpenQueryServer NVARCHAR(128) = NULL;
-DECLARE @OpenQueryTable NVARCHAR(500) = NULL; -- Full table name like 'database.schema.table'
-
--- Manual column definition (when metadata not accessible)
-DECLARE @UseManualColumns BIT = 0;
-DECLARE @ManualColumns TABLE (
+CREATE TABLE #AnalysisResults (
     ColumnName NVARCHAR(128),
-    DataType NVARCHAR(128)
-);
-
--- Example manual column definition
-/*
-INSERT INTO @ManualColumns VALUES 
-    ('CustomerID', 'varchar'),
-    ('OrderDate', 'varchar'),
-    ('Amount', 'varchar'),
-    ('Phone', 'varchar');
-*/
-
--- Create temporary tables for results
-IF OBJECT_ID('tempdb..#DataTypeAnalysis') IS NOT NULL
-    DROP TABLE #DataTypeAnalysis;
-
-IF OBJECT_ID('tempdb..#ColumnsToAnalyze') IS NOT NULL
-    DROP TABLE #ColumnsToAnalyze;
-
-CREATE TABLE #DataTypeAnalysis (
-    DatabaseName NVARCHAR(128),
-    SchemaName NVARCHAR(128),
-    TableName NVARCHAR(128),
-    ColumnName NVARCHAR(128),
-    CurrentDataType NVARCHAR(128),
-    AnalysisType NVARCHAR(50),
-    Finding NVARCHAR(MAX),
-    SampleCount INT,
-    TotalCount INT,
-    PercentageMatch DECIMAL(5,2),
-    SuggestedDataType NVARCHAR(128),
-    SampleData NVARCHAR(MAX)
-);
-
-CREATE TABLE #ColumnsToAnalyze (
-    DatabaseName NVARCHAR(128),
-    SchemaName NVARCHAR(128),
-    TableName NVARCHAR(128),
-    ColumnName NVARCHAR(128),
-    DataType NVARCHAR(128),
+    CurrentDataType NVARCHAR(50),
+    PatternType NVARCHAR(50),
+    MatchCount INT,
+    TotalNonNullCount INT,
+    MatchPercentage DECIMAL(5,2),
+    SuggestedDataType NVARCHAR(50),
+    MinValue NVARCHAR(MAX),
+    MaxValue NVARCHAR(MAX),
+    AvgLength INT,
     MaxLength INT,
-    AnalysisMode NVARCHAR(20)
+    SampleValues NVARCHAR(MAX),
+    ConversionNotes NVARCHAR(MAX)
 );
 
--- Verify linked server exists if using LINKED or OPENQUERY mode
-IF @AnalysisMode IN ('LINKED', 'OPENQUERY')
-BEGIN
-    DECLARE @ServerName NVARCHAR(128) = COALESCE(@LinkedServer, @OpenQueryServer);
-    IF NOT EXISTS (SELECT * FROM sys.servers WHERE name = @ServerName)
-    BEGIN
-        PRINT 'ERROR: Linked server ''' + @ServerName + ''' not found in sys.servers';
-        PRINT 'Available linked servers:';
-        SELECT name AS LinkedServerName, product, provider, data_source 
-        FROM sys.servers 
-        WHERE is_linked = 1
-        ORDER BY name;
-        RETURN;
-    END
-END
-
--- Build full table name based on mode
-DECLARE @FullTableName NVARCHAR(500);
-DECLARE @TableIdentifier NVARCHAR(500);
-
-IF @AnalysisMode = 'LOCAL'
-BEGIN
-    SET @FullTableName = QUOTENAME(@LocalSchema) + '.' + QUOTENAME(@LocalTable);
-    SET @TableIdentifier = @LocalSchema + '.' + @LocalTable;
-END
-ELSE IF @AnalysisMode = 'LINKED'
-BEGIN
-    SET @FullTableName = QUOTENAME(@LinkedServer) + '.' + QUOTENAME(@LinkedDatabase) + '.' + 
-                        QUOTENAME(@LinkedSchema) + '.' + QUOTENAME(@LinkedTable);
-    SET @TableIdentifier = @LinkedServer + '.' + @LinkedDatabase + '.' + @LinkedSchema + '.' + @LinkedTable;
-END
-ELSE IF @AnalysisMode = 'OPENQUERY'
-BEGIN
-    SET @TableIdentifier = @OpenQueryServer + '.' + @OpenQueryTable;
-END
-
-PRINT 'Analyzing table: ' + @TableIdentifier;
-
--- Populate columns based on analysis mode and availability
+-- Get column information
 DECLARE @SQL NVARCHAR(MAX);
-DECLARE @ColumnDiscoverySuccess BIT = 0;
-
--- Try to get column information
-IF @UseManualColumns = 1
-BEGIN
-    -- Use manually defined columns
-    INSERT INTO #ColumnsToAnalyze
-    SELECT 
-        CASE WHEN @AnalysisMode = 'LOCAL' THEN DB_NAME() ELSE @LinkedDatabase END,
-        CASE WHEN @AnalysisMode = 'LOCAL' THEN @LocalSchema ELSE @LinkedSchema END,
-        CASE WHEN @AnalysisMode = 'LOCAL' THEN @LocalTable ELSE COALESCE(@LinkedTable, @OpenQueryTable) END,
-        ColumnName,
-        DataType,
-        NULL AS MaxLength,
-        @AnalysisMode
-    FROM @ManualColumns;
-    
-    SET @ColumnDiscoverySuccess = 1;
-END
-ELSE
-BEGIN
-    -- Try automatic column discovery
-    IF @AnalysisMode = 'LOCAL'
-    BEGIN
-        -- Use local sys.columns
-        BEGIN TRY
-            INSERT INTO #ColumnsToAnalyze
-            SELECT 
-                DB_NAME() AS DatabaseName,
-                s.name AS SchemaName,
-                t.name AS TableName,
-                c.name AS ColumnName,
-                TYPE_NAME(c.user_type_id) AS DataType,
-                c.max_length,
-                'LOCAL'
-            FROM sys.columns c
-            JOIN sys.tables t ON c.object_id = t.object_id
-            JOIN sys.schemas s ON t.schema_id = s.schema_id
-            WHERE TYPE_NAME(c.user_type_id) IN ('varchar', 'nvarchar', 'char', 'nchar', 'text', 'ntext')
-                AND s.name = @LocalSchema
-                AND t.name = @LocalTable;
-            
-            SET @ColumnDiscoverySuccess = 1;
-        END TRY
-        BEGIN CATCH
-            PRINT 'Error discovering columns: ' + ERROR_MESSAGE();
-        END CATCH
-    END
-    ELSE IF @AnalysisMode = 'LINKED'
-    BEGIN
-        -- Try INFORMATION_SCHEMA first
-        BEGIN TRY
-            SET @SQL = N'
-            SELECT 
-                ''' + @LinkedDatabase + ''' AS DatabaseName,
-                TABLE_SCHEMA AS SchemaName,
-                TABLE_NAME AS TableName,
-                COLUMN_NAME AS ColumnName,
-                DATA_TYPE AS DataType,
-                CHARACTER_MAXIMUM_LENGTH AS MaxLength,
-                ''LINKED'' AS AnalysisMode
-            FROM ' + QUOTENAME(@LinkedServer) + '.' + QUOTENAME(@LinkedDatabase) + '.INFORMATION_SCHEMA.COLUMNS
-            WHERE DATA_TYPE IN (''varchar'', ''nvarchar'', ''char'', ''nchar'', ''text'', ''ntext'')
-                AND TABLE_SCHEMA = ''' + @LinkedSchema + '''
-                AND TABLE_NAME = ''' + @LinkedTable + '''';
-            
-            INSERT INTO #ColumnsToAnalyze
-            EXEC sp_executesql @SQL;
-            
-            SET @ColumnDiscoverySuccess = 1;
-        END TRY
-        BEGIN CATCH
-            PRINT 'INFORMATION_SCHEMA not accessible. Error: ' + ERROR_MESSAGE();
-        END CATCH
-        
-        -- If INFORMATION_SCHEMA failed, try sys.columns
-        IF @ColumnDiscoverySuccess = 0
-        BEGIN
-            BEGIN TRY
-                SET @SQL = N'
-                SELECT 
-                    ''' + @LinkedDatabase + ''' AS DatabaseName,
-                    s.name AS SchemaName,
-                    t.name AS TableName,
-                    c.name AS ColumnName,
-                    TYPE_NAME(c.user_type_id) AS DataType,
-                    c.max_length,
-                    ''LINKED'' AS AnalysisMode
-                FROM ' + QUOTENAME(@LinkedServer) + '.' + QUOTENAME(@LinkedDatabase) + '.sys.columns c
-                JOIN ' + QUOTENAME(@LinkedServer) + '.' + QUOTENAME(@LinkedDatabase) + '.sys.tables t ON c.object_id = t.object_id
-                JOIN ' + QUOTENAME(@LinkedServer) + '.' + QUOTENAME(@LinkedDatabase) + '.sys.schemas s ON t.schema_id = s.schema_id
-                WHERE TYPE_NAME(c.user_type_id) IN (''varchar'', ''nvarchar'', ''char'', ''nchar'', ''text'', ''ntext'')
-                    AND s.name = ''' + @LinkedSchema + '''
-                    AND t.name = ''' + @LinkedTable + '''';
-                
-                INSERT INTO #ColumnsToAnalyze
-                EXEC sp_executesql @SQL;
-                
-                SET @ColumnDiscoverySuccess = 1;
-            END TRY
-            BEGIN CATCH
-                PRINT 'sys.columns not accessible. Error: ' + ERROR_MESSAGE();
-            END CATCH
-        END
-    END
-    ELSE IF @AnalysisMode = 'OPENQUERY'
-    BEGIN
-        -- Try to get column info via OPENQUERY with a dummy query
-        BEGIN TRY
-            SET @SQL = N'
-            SELECT TOP 0 * INTO #TempSchema 
-            FROM OPENQUERY(' + QUOTENAME(@OpenQueryServer) + ', ''SELECT * FROM ' + @OpenQueryTable + ' WHERE 1=0'')
-            
-            INSERT INTO #ColumnsToAnalyze
-            SELECT 
-                ''' + @OpenQueryServer + ''' AS DatabaseName,
-                ''Unknown'' AS SchemaName,
-                ''' + @OpenQueryTable + ''' AS TableName,
-                c.name AS ColumnName,
-                TYPE_NAME(c.user_type_id) AS DataType,
-                c.max_length,
-                ''OPENQUERY''
-            FROM tempdb.sys.columns c
-            WHERE c.object_id = OBJECT_ID(''tempdb..#TempSchema'')
-                AND TYPE_NAME(c.user_type_id) IN (''varchar'', ''nvarchar'', ''char'', ''nchar'', ''text'', ''ntext'')
-            
-            DROP TABLE #TempSchema';
-            
-            EXEC sp_executesql @SQL;
-            SET @ColumnDiscoverySuccess = 1;
-        END TRY
-        BEGIN CATCH
-            PRINT 'Cannot discover columns via OPENQUERY. Error: ' + ERROR_MESSAGE();
-        END CATCH
-    END
-END
-
--- Check if we have columns to analyze
-IF NOT EXISTS (SELECT 1 FROM #ColumnsToAnalyze)
-BEGIN
-    PRINT '';
-    PRINT 'ERROR: No columns found to analyze.';
-    PRINT 'Possible solutions:';
-    PRINT '1. Set @UseManualColumns = 1 and define columns in @ManualColumns table';
-    PRINT '2. Verify table name and schema are correct';
-    PRINT '3. Check if the table has varchar/nvarchar columns';
-    PRINT '4. Ensure you have permissions to access table metadata';
-    RETURN;
-END
-
--- Show columns to be analyzed
-PRINT '';
-PRINT 'Columns to analyze:';
-SELECT ColumnName, DataType FROM #ColumnsToAnalyze;
+DECLARE @ColumnName NVARCHAR(128);
+DECLARE @DataType NVARCHAR(50);
+DECLARE @TotalRows INT;
 
 -- Get total row count
-DECLARE @RowCount INT = 0;
-IF @AnalysisMode = 'OPENQUERY'
-BEGIN
-    SET @SQL = N'SELECT @Count = COUNT(*) FROM OPENQUERY(' + QUOTENAME(@OpenQueryServer) + 
-               ', ''SELECT COUNT(*) AS cnt FROM ' + @OpenQueryTable + ''')';
-END
-ELSE
-BEGIN
-    SET @SQL = N'SELECT @Count = COUNT(*) FROM ' + @FullTableName;
-END
+SET @SQL = N'SELECT @Count = COUNT(*) FROM ' + @TableName;
+EXEC sp_executesql @SQL, N'@Count INT OUTPUT', @Count = @TotalRows OUTPUT;
 
-BEGIN TRY
-    EXEC sp_executesql @SQL, N'@Count INT OUTPUT', @Count = @RowCount OUTPUT;
-    PRINT 'Total rows in table: ' + CAST(@RowCount AS VARCHAR(20));
-END TRY
-BEGIN CATCH
-    PRINT 'Error getting row count: ' + ERROR_MESSAGE();
-    SET @RowCount = -1;
-END CATCH
+PRINT '========================================';
+PRINT 'TABLE ANALYSIS: ' + @TableName;
+PRINT 'Total Rows: ' + CAST(@TotalRows AS VARCHAR(20));
+PRINT '========================================';
+PRINT '';
 
-IF @RowCount = 0
-BEGIN
-    PRINT 'Table is empty. No analysis performed.';
-    RETURN;
-END
-
--- Analyze each column
-DECLARE @DatabaseName NVARCHAR(128);
-DECLARE @SchemaName NVARCHAR(128);
-DECLARE @TableName NVARCHAR(128);
-DECLARE @ColumnName NVARCHAR(128);
-DECLARE @DataType NVARCHAR(128);
-
+-- Create cursor for varchar columns
 DECLARE column_cursor CURSOR FOR
-SELECT DatabaseName, SchemaName, TableName, ColumnName, DataType
-FROM #ColumnsToAnalyze;
+    SELECT 
+        COLUMN_NAME,
+        DATA_TYPE + CASE 
+            WHEN CHARACTER_MAXIMUM_LENGTH IS NOT NULL THEN 
+                '(' + CASE WHEN CHARACTER_MAXIMUM_LENGTH = -1 THEN 'MAX' 
+                      ELSE CAST(CHARACTER_MAXIMUM_LENGTH AS VARCHAR(10)) END + ')'
+            ELSE ''
+        END AS DataType
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA + '.' + TABLE_NAME = REPLACE(REPLACE(@TableName, '[', ''), ']', '')
+        AND DATA_TYPE IN ('varchar', 'nvarchar', 'char', 'nchar', 'text', 'ntext')
+    ORDER BY ORDINAL_POSITION;
 
 OPEN column_cursor;
-FETCH NEXT FROM column_cursor INTO @DatabaseName, @SchemaName, @TableName, @ColumnName, @DataType;
+FETCH NEXT FROM column_cursor INTO @ColumnName, @DataType;
 
 WHILE @@FETCH_STATUS = 0
 BEGIN
-    PRINT 'Analyzing column: ' + @ColumnName;
+    PRINT 'Analyzing column: ' + @ColumnName + ' (' + @DataType + ')';
     
-    -- Build table reference based on mode
-    DECLARE @TableRef NVARCHAR(500);
-    IF @AnalysisMode = 'OPENQUERY'
-        SET @TableRef = 'OPENQUERY(' + QUOTENAME(@OpenQueryServer) + ', ''SELECT * FROM ' + @OpenQueryTable + ''')';
-    ELSE
-        SET @TableRef = @FullTableName;
-    
-    -- 1. Check for numeric data
-    BEGIN TRY
-        IF @AnalysisMode = 'OPENQUERY'
-        BEGIN
-            -- Simplified query for OPENQUERY
-            SET @SQL = N'
-            INSERT INTO #DataTypeAnalysis
-            SELECT 
-                ''' + @DatabaseName + ''',
-                ''' + @SchemaName + ''',
-                ''' + @TableName + ''',
-                ''' + @ColumnName + ''',
-                ''' + @DataType + ''',
-                ''Numeric as String'',
-                ''Column contains numeric values stored as string'',
-                COUNT(*) AS SampleCount,
-                ' + CAST(@RowCount AS NVARCHAR(20)) + ' AS TotalCount,
-                CAST(COUNT(*) * 100.0 / ' + CAST(@RowCount AS NVARCHAR(20)) + ' AS DECIMAL(5,2)) AS PercentageMatch,
-                ''Check manually'' AS SuggestedDataType,
-                ''See samples'' AS SampleData
-            FROM OPENQUERY(' + QUOTENAME(@OpenQueryServer) + ', 
-                ''SELECT ' + @ColumnName + ' FROM ' + @OpenQueryTable + ' 
-                  WHERE ' + @ColumnName + ' IS NOT NULL 
-                    AND ' + @ColumnName + ' REGEXP ''''^^[0-9.-]+$'''''')
-            HAVING COUNT(*) > 0';
+    -- 1. NUMERIC PATTERN DETECTION
+    SET @SQL = N'
+    WITH NumericAnalysis AS (
+        SELECT 
+            COUNT(*) as TotalCount,
+            SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%'' 
+                     AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%-%-%''
+                     AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%.%.%''
+                     AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
+                THEN 1 ELSE 0 END) as NumericCount,
+            SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS INT) IS NOT NULL THEN 1 ELSE 0 END) as IntCount,
+            SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DECIMAL(18,4)) IS NOT NULL 
+                     AND TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS INT) IS NULL THEN 1 ELSE 0 END) as DecimalCount,
+            MIN(LEN(' + QUOTENAME(@ColumnName) + ')) as MinLen,
+            MAX(LEN(' + QUOTENAME(@ColumnName) + ')) as MaxLen,
+            AVG(LEN(' + QUOTENAME(@ColumnName) + ')) as AvgLen
+        FROM ' + @TableName + '
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+    )
+    INSERT INTO #AnalysisResults
+    SELECT 
+        ''' + @ColumnName + ''',
+        ''' + @DataType + ''',
+        ''Numeric Pattern'',
+        NumericCount,
+        TotalCount,
+        CAST(NumericCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)),
+        CASE 
+            WHEN IntCount = NumericCount AND MaxLen <= 9 THEN ''INT''
+            WHEN IntCount = NumericCount AND MaxLen <= 18 THEN ''BIGINT''
+            WHEN DecimalCount > 0 THEN ''DECIMAL(18,4)''
+            WHEN NumericCount > 0 THEN ''FLOAT''
+            ELSE ''N/A''
+        END,
+        (SELECT MIN(' + QUOTENAME(@ColumnName) + ') FROM ' + @TableName + ' 
+         WHERE ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%''),
+        (SELECT MAX(' + QUOTENAME(@ColumnName) + ') FROM ' + @TableName + ' 
+         WHERE ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%''),
+        AvgLen,
+        MaxLen,
+        STUFF((SELECT TOP ' + CAST(@TopSamples AS VARCHAR(10)) + ' ''; '' + ' + QUOTENAME(@ColumnName) + '
+               FROM ' + @TableName + '
+               WHERE ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%''
+                 AND ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+               ORDER BY ' + QUOTENAME(@ColumnName) + '
+               FOR XML PATH('''')), 1, 2, ''''),
+        CASE 
+            WHEN NumericCount > 0 AND NumericCount < TotalCount 
+            THEN ''Warning: '' + CAST(TotalCount - NumericCount AS VARCHAR(20)) + '' non-numeric values found''
+            ELSE ''''
         END
-        ELSE
-        BEGIN
-            -- Standard query for local/linked tables
-            SET @SQL = N'
-            INSERT INTO #DataTypeAnalysis
-            SELECT 
-                ''' + @DatabaseName + ''',
-                ''' + @SchemaName + ''',
-                ''' + @TableName + ''',
-                ''' + @ColumnName + ''',
-                ''' + @DataType + ''',
-                ''Numeric as String'',
-                ''Column contains numeric values stored as string'',
-                COUNT(*),
-                ' + CAST(@RowCount AS NVARCHAR(20)) + ',
-                CAST(COUNT(*) * 100.0 / ' + CAST(@RowCount AS NVARCHAR(20)) + ' AS DECIMAL(5,2)),
-                CASE 
-                    WHEN MAX(LEN(' + QUOTENAME(@ColumnName) + ')) <= 9 THEN ''INT''
-                    WHEN MAX(LEN(' + QUOTENAME(@ColumnName) + ')) <= 18 THEN ''BIGINT''
-                    ELSE ''DECIMAL(18,4)''
-                END,
-                STUFF((SELECT TOP 5 ''; '' + CAST(' + QUOTENAME(@ColumnName) + ' AS NVARCHAR(100))
-                       FROM ' + @TableRef + '
-                       WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-                         AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
-                         AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%''
-                       FOR XML PATH('''')), 1, 2, '''')
-            FROM ' + @TableRef + '
-            WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-                AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
-                AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%''
-                AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%-%-%''
-                AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%.%.%''
-            HAVING COUNT(*) > 0';
-        END
-        
-        EXEC sp_executesql @SQL;
-    END TRY
-    BEGIN CATCH
-        PRINT '  - Error checking numeric patterns: ' + LEFT(ERROR_MESSAGE(), 200);
-    END CATCH
+    FROM NumericAnalysis
+    WHERE NumericCount > 0 
+      AND CAST(NumericCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)) >= ' + CAST(@MinPercentageForFinding AS VARCHAR(10));
     
-    -- 2. Check for date patterns
-    BEGIN TRY
-        IF @AnalysisMode != 'OPENQUERY' -- Skip complex date checks for OPENQUERY
-        BEGIN
-            SET @SQL = N'
-            INSERT INTO #DataTypeAnalysis
-            SELECT 
-                ''' + @DatabaseName + ''',
-                ''' + @SchemaName + ''',
-                ''' + @TableName + ''',
-                ''' + @ColumnName + ''',
-                ''' + @DataType + ''',
-                ''Date as String'',
-                ''Column contains date values stored as string'',
-                COUNT(*),
-                ' + CAST(@RowCount AS NVARCHAR(20)) + ',
-                CAST(COUNT(*) * 100.0 / ' + CAST(@RowCount AS NVARCHAR(20)) + ' AS DECIMAL(5,2)),
-                ''DATE or DATETIME'',
-                STUFF((SELECT TOP 5 ''; '' + CAST(' + QUOTENAME(@ColumnName) + ' AS NVARCHAR(100))
-                       FROM ' + @TableRef + '
-                       WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-                         AND LEN(' + QUOTENAME(@ColumnName) + ') >= 8
-                         AND (' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]%''
-                           OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9]/[0-9][0-9]/[0-9][0-9][0-9][0-9]%'')
-                       FOR XML PATH('''')), 1, 2, '''')
-            FROM ' + @TableRef + '
-            WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-                AND LEN(' + QUOTENAME(@ColumnName) + ') >= 8
-                AND (' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]%''
-                  OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9]/[0-9][0-9]/[0-9][0-9][0-9][0-9]%'')
-            HAVING COUNT(*) > 0';
-            
-            EXEC sp_executesql @SQL;
-        END
-    END TRY
-    BEGIN CATCH
-        PRINT '  - Error checking date patterns: ' + LEFT(ERROR_MESSAGE(), 200);
-    END CATCH
+    EXEC sp_executesql @SQL;
     
-    -- 3. Check for phone patterns
-    BEGIN TRY
-        IF @AnalysisMode != 'OPENQUERY'
-        BEGIN
-            SET @SQL = N'
-            INSERT INTO #DataTypeAnalysis
-            SELECT 
-                ''' + @DatabaseName + ''',
-                ''' + @SchemaName + ''',
-                ''' + @TableName + ''',
-                ''' + @ColumnName + ''',
-                ''' + @DataType + ''',
-                ''Phone Number Pattern'',
-                ''Column contains phone number patterns'',
-                COUNT(*),
-                ' + CAST(@RowCount AS NVARCHAR(20)) + ',
-                CAST(COUNT(*) * 100.0 / ' + CAST(@RowCount AS NVARCHAR(20)) + ' AS DECIMAL(5,2)),
-                ''VARCHAR(20)'',
-                STUFF((SELECT TOP 5 ''; '' + CAST(' + QUOTENAME(@ColumnName) + ' AS NVARCHAR(100))
-                       FROM ' + @TableRef + '
-                       WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-                         AND (' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9]-[0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
-                           OR ' + QUOTENAME(@ColumnName) + ' LIKE ''([0-9][0-9][0-9]) [0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
-                           OR ' + QUOTENAME(@ColumnName) + ' LIKE ''+[0-9]%'')
-                       FOR XML PATH('''')), 1, 2, '''')
-            FROM ' + @TableRef + '
-            WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-                AND (' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9]-[0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
+    -- 2. DATE/DATETIME PATTERN DETECTION
+    SET @SQL = N'
+    WITH DateAnalysis AS (
+        SELECT 
+            COUNT(*) as TotalCount,
+            SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE) IS NOT NULL THEN 1 ELSE 0 END) as ValidDateCount,
+            SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]%'' THEN 1 ELSE 0 END) as ISO_Count,
+            SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9]/[0-9][0-9]/[0-9][0-9][0-9][0-9]%'' THEN 1 ELSE 0 END) as US_Count,
+            SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9]%'' THEN 1 ELSE 0 END) as EU_Count,
+            MAX(LEN(' + QUOTENAME(@ColumnName) + ')) as MaxLen
+        FROM ' + @TableName + '
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL AND LEN(' + QUOTENAME(@ColumnName) + ') >= 8
+    )
+    INSERT INTO #AnalysisResults
+    SELECT 
+        ''' + @ColumnName + ''',
+        ''' + @DataType + ''',
+        ''Date/DateTime Pattern'',
+        ValidDateCount,
+        TotalCount,
+        CAST(ValidDateCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)),
+        CASE 
+            WHEN MaxLen <= 10 THEN ''DATE''
+            WHEN MaxLen > 10 THEN ''DATETIME''
+            ELSE ''DATE''
+        END,
+        (SELECT MIN(TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE)) FROM ' + @TableName + '),
+        (SELECT MAX(TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE)) FROM ' + @TableName + '),
+        NULL,
+        MaxLen,
+        STUFF((SELECT TOP ' + CAST(@TopSamples AS VARCHAR(10)) + ' ''; '' + ' + QUOTENAME(@ColumnName) + '
+               FROM ' + @TableName + '
+               WHERE TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE) IS NOT NULL
+               ORDER BY ' + QUOTENAME(@ColumnName) + '
+               FOR XML PATH('''')), 1, 2, ''''),
+        ''ISO: '' + CAST(ISO_Count AS VARCHAR(20)) + 
+        '', US: '' + CAST(US_Count AS VARCHAR(20)) + 
+        '', EU: '' + CAST(EU_Count AS VARCHAR(20))
+    FROM DateAnalysis
+    WHERE ValidDateCount > 0 
+      AND CAST(ValidDateCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)) >= ' + CAST(@MinPercentageForFinding AS VARCHAR(10));
+    
+    EXEC sp_executesql @SQL;
+    
+    -- 3. JSON DETECTION
+    SET @SQL = N'
+    WITH JsonAnalysis AS (
+        SELECT 
+            COUNT(*) as TotalCount,
+            SUM(CASE WHEN ISJSON(' + QUOTENAME(@ColumnName) + ') = 1 THEN 1 ELSE 0 END) as JsonCount,
+            AVG(LEN(' + QUOTENAME(@ColumnName) + ')) as AvgLen,
+            MAX(LEN(' + QUOTENAME(@ColumnName) + ')) as MaxLen
+        FROM ' + @TableName + '
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+    )
+    INSERT INTO #AnalysisResults
+    SELECT 
+        ''' + @ColumnName + ''',
+        ''' + @DataType + ''',
+        ''JSON Data'',
+        JsonCount,
+        TotalCount,
+        CAST(JsonCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)),
+        ''NVARCHAR(MAX) CHECK(ISJSON(column)=1)'',
+        NULL,
+        NULL,
+        AvgLen,
+        MaxLen,
+        (SELECT TOP 1 LEFT(' + QUOTENAME(@ColumnName) + ', 200) + ''...''
+         FROM ' + @TableName + '
+         WHERE ISJSON(' + QUOTENAME(@ColumnName) + ') = 1),
+        ''Valid JSON documents found''
+    FROM JsonAnalysis
+    WHERE JsonCount > 0 
+      AND CAST(JsonCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)) >= ' + CAST(@MinPercentageForFinding AS VARCHAR(10));
+    
+    EXEC sp_executesql @SQL;
+    
+    -- 4. XML DETECTION
+    SET @SQL = N'
+    WITH XmlAnalysis AS (
+        SELECT 
+            COUNT(*) as TotalCount,
+            SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS XML) IS NOT NULL THEN 1 ELSE 0 END) as XmlCount,
+            AVG(LEN(' + QUOTENAME(@ColumnName) + ')) as AvgLen,
+            MAX(LEN(' + QUOTENAME(@ColumnName) + ')) as MaxLen
+        FROM ' + @TableName + '
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL 
+          AND ' + QUOTENAME(@ColumnName) + ' LIKE ''<%>%</%>''
+    )
+    INSERT INTO #AnalysisResults
+    SELECT 
+        ''' + @ColumnName + ''',
+        ''' + @DataType + ''',
+        ''XML Data'',
+        XmlCount,
+        TotalCount,
+        CAST(XmlCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)),
+        ''XML'',
+        NULL,
+        NULL,
+        AvgLen,
+        MaxLen,
+        (SELECT TOP 1 LEFT(' + QUOTENAME(@ColumnName) + ', 200) + ''...''
+         FROM ' + @TableName + '
+         WHERE TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS XML) IS NOT NULL),
+        ''Valid XML documents found''
+    FROM XmlAnalysis
+    WHERE XmlCount > 0 
+      AND CAST(XmlCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)) >= ' + CAST(@MinPercentageForFinding AS VARCHAR(10));
+    
+    EXEC sp_executesql @SQL;
+    
+    -- 5. BASE64 DETECTION
+    SET @SQL = N'
+    WITH Base64Analysis AS (
+        SELECT 
+            COUNT(*) as TotalCount,
+            SUM(CASE WHEN LEN(' + QUOTENAME(@ColumnName) + ') >= 4 
+                     AND LEN(' + QUOTENAME(@ColumnName) + ') % 4 = 0
+                     AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^A-Za-z0-9+/=]%''
+                THEN 1 ELSE 0 END) as Base64Count,
+            AVG(LEN(' + QUOTENAME(@ColumnName) + ')) as AvgLen,
+            MAX(LEN(' + QUOTENAME(@ColumnName) + ')) as MaxLen
+        FROM ' + @TableName + '
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+    )
+    INSERT INTO #AnalysisResults
+    SELECT 
+        ''' + @ColumnName + ''',
+        ''' + @DataType + ''',
+        ''Base64 Encoded'',
+        Base64Count,
+        TotalCount,
+        CAST(Base64Count * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)),
+        ''VARBINARY(MAX)'',
+        NULL,
+        NULL,
+        AvgLen,
+        MaxLen,
+        STUFF((SELECT TOP ' + CAST(@TopSamples AS VARCHAR(10)) + ' ''; '' + LEFT(' + QUOTENAME(@ColumnName) + ', 50)
+               FROM ' + @TableName + '
+               WHERE LEN(' + QUOTENAME(@ColumnName) + ') >= 4 
+                 AND LEN(' + QUOTENAME(@ColumnName) + ') % 4 = 0
+                 AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^A-Za-z0-9+/=]%''
+               FOR XML PATH('''')), 1, 2, ''''),
+        ''Possible Base64 encoded binary data''
+    FROM Base64Analysis
+    WHERE Base64Count > 0 
+      AND CAST(Base64Count * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)) >= ' + CAST(@MinPercentageForFinding AS VARCHAR(10));
+    
+    EXEC sp_executesql @SQL;
+    
+    -- 6. HEXADECIMAL DETECTION
+    SET @SQL = N'
+    WITH HexAnalysis AS (
+        SELECT 
+            COUNT(*) as TotalCount,
+            SUM(CASE WHEN (LEN(' + QUOTENAME(@ColumnName) + ') >= 2 
+                      AND LEN(' + QUOTENAME(@ColumnName) + ') % 2 = 0
+                      AND (' + QUOTENAME(@ColumnName) + ' LIKE ''0x%'' OR ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9A-Fa-f]%''))
+                THEN 1 ELSE 0 END) as HexCount,
+            AVG(LEN(' + QUOTENAME(@ColumnName) + ')) as AvgLen,
+            MAX(LEN(' + QUOTENAME(@ColumnName) + ')) as MaxLen
+        FROM ' + @TableName + '
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+    )
+    INSERT INTO #AnalysisResults
+    SELECT 
+        ''' + @ColumnName + ''',
+        ''' + @DataType + ''',
+        ''Hexadecimal Data'',
+        HexCount,
+        TotalCount,
+        CAST(HexCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)),
+        ''VARBINARY(MAX)'',
+        NULL,
+        NULL,
+        AvgLen,
+        MaxLen,
+        STUFF((SELECT TOP ' + CAST(@TopSamples AS VARCHAR(10)) + ' ''; '' + LEFT(' + QUOTENAME(@ColumnName) + ', 50)
+               FROM ' + @TableName + '
+               WHERE LEN(' + QUOTENAME(@ColumnName) + ') >= 2 
+                 AND LEN(' + QUOTENAME(@ColumnName) + ') % 2 = 0
+                 AND (' + QUOTENAME(@ColumnName) + ' LIKE ''0x%'' OR ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9A-Fa-f]%'')
+               FOR XML PATH('''')), 1, 2, ''''),
+        ''Possible hexadecimal encoded data''
+    FROM HexAnalysis
+    WHERE HexCount > 0 
+      AND CAST(HexCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)) >= ' + CAST(@MinPercentageForFinding AS VARCHAR(10));
+    
+    EXEC sp_executesql @SQL;
+    
+    -- 7. CURRENCY PATTERN DETECTION
+    SET @SQL = N'
+    WITH CurrencyAnalysis AS (
+        SELECT 
+            COUNT(*) as TotalCount,
+            SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' LIKE ''[$£€¥]%'' 
+                      OR ' + QUOTENAME(@ColumnName) + ' LIKE ''%[ ]USD%''
+                      OR ' + QUOTENAME(@ColumnName) + ' LIKE ''%[ ]EUR%''
+                      OR ' + QUOTENAME(@ColumnName) + ' LIKE ''%[ ]GBP%''
+                THEN 1 ELSE 0 END) as CurrencyCount,
+            MIN(TRY_CAST(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(' + QUOTENAME(@ColumnName) + ', ''$'', ''''), ''£'', ''''), ''€'', ''''), ''¥'', ''''), '','', '''') AS MONEY)) as MinAmount,
+            MAX(TRY_CAST(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(' + QUOTENAME(@ColumnName) + ', ''$'', ''''), ''£'', ''''), ''€'', ''''), ''¥'', ''''), '','', '''') AS MONEY)) as MaxAmount
+        FROM ' + @TableName + '
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+    )
+    INSERT INTO #AnalysisResults
+    SELECT 
+        ''' + @ColumnName + ''',
+        ''' + @DataType + ''',
+        ''Currency Pattern'',
+        CurrencyCount,
+        TotalCount,
+        CAST(CurrencyCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)),
+        ''MONEY'',
+        CAST(MinAmount AS NVARCHAR(50)),
+        CAST(MaxAmount AS NVARCHAR(50)),
+        NULL,
+        NULL,
+        STUFF((SELECT TOP ' + CAST(@TopSamples AS VARCHAR(10)) + ' ''; '' + ' + QUOTENAME(@ColumnName) + '
+               FROM ' + @TableName + '
+               WHERE ' + QUOTENAME(@ColumnName) + ' LIKE ''[$£€¥]%'' 
+                  OR ' + QUOTENAME(@ColumnName) + ' LIKE ''%USD%''
+                  OR ' + QUOTENAME(@ColumnName) + ' LIKE ''%EUR%''
+               FOR XML PATH('''')), 1, 2, ''''),
+        ''Currency symbols detected''
+    FROM CurrencyAnalysis
+    WHERE CurrencyCount > 0 
+      AND CAST(CurrencyCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)) >= ' + CAST(@MinPercentageForFinding AS VARCHAR(10));
+    
+    EXEC sp_executesql @SQL;
+    
+    -- 8. PHONE NUMBER PATTERN DETECTION
+    SET @SQL = N'
+    WITH PhoneAnalysis AS (
+        SELECT 
+            COUNT(*) as TotalCount,
+            SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9]-[0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
+                      OR ' + QUOTENAME(@ColumnName) + ' LIKE ''([0-9][0-9][0-9]) [0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
+                      OR ' + QUOTENAME(@ColumnName) + ' LIKE ''+[0-9]%''
+                      OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]''
+                      OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9].[0-9][0-9][0-9].[0-9][0-9][0-9][0-9]''
+                THEN 1 ELSE 0 END) as PhoneCount,
+            MAX(LEN(' + QUOTENAME(@ColumnName) + ')) as MaxLen
+        FROM ' + @TableName + '
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+    )
+    INSERT INTO #AnalysisResults
+    SELECT 
+        ''' + @ColumnName + ''',
+        ''' + @DataType + ''',
+        ''Phone Number'',
+        PhoneCount,
+        TotalCount,
+        CAST(PhoneCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)),
+        ''VARCHAR(20)'',
+        NULL,
+        NULL,
+        NULL,
+        MaxLen,
+        STUFF((SELECT TOP ' + CAST(@TopSamples AS VARCHAR(10)) + ' ''; '' + ' + QUOTENAME(@ColumnName) + '
+               FROM ' + @TableName + '
+               WHERE ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9]-[0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
                   OR ' + QUOTENAME(@ColumnName) + ' LIKE ''([0-9][0-9][0-9]) [0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
-                  OR ' + QUOTENAME(@ColumnName) + ' LIKE ''+[0-9]%'')
-            HAVING COUNT(*) > 0';
-            
-            EXEC sp_executesql @SQL;
-        END
-    END TRY
-    BEGIN CATCH
-        PRINT '  - Error checking phone patterns: ' + LEFT(ERROR_MESSAGE(), 200);
-    END CATCH
+                  OR ' + QUOTENAME(@ColumnName) + ' LIKE ''+[0-9]%''
+               FOR XML PATH('''')), 1, 2, ''''),
+        ''Phone number patterns detected''
+    FROM PhoneAnalysis
+    WHERE PhoneCount > 0 
+      AND CAST(PhoneCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)) >= ' + CAST(@MinPercentageForFinding AS VARCHAR(10));
     
-    FETCH NEXT FROM column_cursor INTO @DatabaseName, @SchemaName, @TableName, @ColumnName, @DataType;
+    EXEC sp_executesql @SQL;
+    
+    -- 9. POSTAL/ZIP CODE PATTERN DETECTION
+    SET @SQL = N'
+    WITH PostalAnalysis AS (
+        SELECT 
+            COUNT(*) as TotalCount,
+            SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9][0-9]''
+                      OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
+                      OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[A-Z][0-9][A-Z] [0-9][A-Z][0-9]''
+                      OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[A-Z][A-Z][0-9] [0-9][A-Z][A-Z]''
+                THEN 1 ELSE 0 END) as PostalCount,
+            SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9][0-9]'' THEN 1 ELSE 0 END) as USZipCount,
+            SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' LIKE ''[A-Z][0-9][A-Z] [0-9][A-Z][0-9]'' THEN 1 ELSE 0 END) as CanadaCount,
+            SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' LIKE ''[A-Z][A-Z][0-9]%[0-9][A-Z][A-Z]'' THEN 1 ELSE 0 END) as UKCount
+        FROM ' + @TableName + '
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+    )
+    INSERT INTO #AnalysisResults
+    SELECT 
+        ''' + @ColumnName + ''',
+        ''' + @DataType + ''',
+        ''Postal/ZIP Code'',
+        PostalCount,
+        TotalCount,
+        CAST(PostalCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)),
+        ''VARCHAR(10)'',
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        STUFF((SELECT TOP ' + CAST(@TopSamples AS VARCHAR(10)) + ' ''; '' + ' + QUOTENAME(@ColumnName) + '
+               FROM ' + @TableName + '
+               WHERE ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9][0-9]''
+                  OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]''
+                  OR ' + QUOTENAME(@ColumnName) + ' LIKE ''[A-Z][0-9][A-Z] [0-9][A-Z][0-9]''
+               FOR XML PATH('''')), 1, 2, ''''),
+        ''US: '' + CAST(USZipCount AS VARCHAR(20)) + 
+        '', Canada: '' + CAST(CanadaCount AS VARCHAR(20)) + 
+        '', UK: '' + CAST(UKCount AS VARCHAR(20))
+    FROM PostalAnalysis
+    WHERE PostalCount > 0 
+      AND CAST(PostalCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)) >= ' + CAST(@MinPercentageForFinding AS VARCHAR(10));
+    
+    EXEC sp_executesql @SQL;
+    
+    -- 10. BOOLEAN PATTERN DETECTION
+    SET @SQL = N'
+    WITH BooleanAnalysis AS (
+        SELECT 
+            COUNT(*) as TotalCount,
+            SUM(CASE WHEN UPPER(' + QUOTENAME(@ColumnName) + ') IN (''YES'', ''NO'', ''Y'', ''N'', ''TRUE'', ''FALSE'', ''T'', ''F'', ''1'', ''0'') 
+                THEN 1 ELSE 0 END) as BooleanCount,
+            COUNT(DISTINCT UPPER(' + QUOTENAME(@ColumnName) + ')) as DistinctValues
+        FROM ' + @TableName + '
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+    )
+    INSERT INTO #AnalysisResults
+    SELECT 
+        ''' + @ColumnName + ''',
+        ''' + @DataType + ''',
+        ''Boolean Pattern'',
+        BooleanCount,
+        TotalCount,
+        CAST(BooleanCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)),
+        ''BIT'',
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        STUFF((SELECT DISTINCT ''; '' + UPPER(' + QUOTENAME(@ColumnName) + ')
+               FROM ' + @TableName + '
+               WHERE UPPER(' + QUOTENAME(@ColumnName) + ') IN (''YES'', ''NO'', ''Y'', ''N'', ''TRUE'', ''FALSE'', ''T'', ''F'', ''1'', ''0'')
+               FOR XML PATH('''')), 1, 2, ''''),
+        ''Distinct values: '' + CAST(DistinctValues AS VARCHAR(10))
+    FROM BooleanAnalysis
+    WHERE BooleanCount > 0 
+      AND CAST(BooleanCount * 100.0 / NULLIF(TotalCount, 0) AS DECIMAL(5,2)) >= ' + CAST(@MinPercentageForFinding AS VARCHAR(10));
+    
+    EXEC sp_executesql @SQL;
+    
+    FETCH NEXT FROM column_cursor INTO @ColumnName, @DataType;
 END
 
 CLOSE column_cursor;
 DEALLOCATE column_cursor;
 
--- Generate report
+-- Display comprehensive results
 PRINT '';
-PRINT '=====================================================';
-PRINT 'DATA TYPE & FORMAT ANALYSIS RESULTS';
-PRINT '=====================================================';
-PRINT 'Table: ' + @TableIdentifier;
-PRINT 'Mode: ' + @AnalysisMode;
+PRINT '========================================';
+PRINT 'ANALYSIS COMPLETE - SUMMARY OF FINDINGS';
+PRINT '========================================';
 PRINT '';
 
--- Check if any findings
-IF NOT EXISTS (SELECT 1 FROM #DataTypeAnalysis)
-BEGIN
-    PRINT 'No data type mismatches or patterns found.';
-END
-ELSE
-BEGIN
-    -- Summary
-    SELECT 
-        AnalysisType,
-        COUNT(DISTINCT ColumnName) AS AffectedColumns,
-        MAX(PercentageMatch) AS MaxMatchPercent
-    FROM #DataTypeAnalysis
-    GROUP BY AnalysisType
-    ORDER BY COUNT(DISTINCT ColumnName) DESC;
-    
-    -- Detailed findings
-    PRINT '';
-    PRINT 'DETAILED FINDINGS:';
-    SELECT 
-        ColumnName,
-        CurrentDataType,
-        AnalysisType,
-        CAST(PercentageMatch AS VARCHAR(10)) + '%' AS MatchPercent,
-        SuggestedDataType,
-        LEFT(SampleData, 100) AS SampleData
-    FROM #DataTypeAnalysis
-    WHERE PercentageMatch >= 50
-    ORDER BY PercentageMatch DESC, ColumnName;
-END
+-- Summary by pattern type
+SELECT 
+    PatternType,
+    COUNT(DISTINCT ColumnName) AS ColumnsAffected,
+    SUM(MatchCount) AS TotalMatches,
+    AVG(MatchPercentage) AS AvgMatchPercent
+FROM #AnalysisResults
+GROUP BY PatternType
+ORDER BY COUNT(DISTINCT ColumnName) DESC;
 
--- Provide manual column template if needed
-IF @ColumnDiscoverySuccess = 0
-BEGIN
-    PRINT '';
-    PRINT '-- Column discovery failed. Use this template:';
-    PRINT 'DECLARE @UseManualColumns BIT = 1;';
-    PRINT 'INSERT INTO @ManualColumns VALUES';
-    PRINT '    (''Column1'', ''varchar''),';
-    PRINT '    (''Column2'', ''varchar''),';
-    PRINT '    (''Column3'', ''varchar'');';
-END
+-- Detailed findings by column
+PRINT '';
+PRINT 'DETAILED FINDINGS BY COLUMN:';
+PRINT '============================';
+
+SELECT 
+    ColumnName,
+    CurrentDataType,
+    PatternType,
+    CAST(MatchPercentage AS VARCHAR(10)) + '%' AS MatchPct,
+    CAST(MatchCount AS VARCHAR(20)) + '/' + CAST(TotalNonNullCount AS VARCHAR(20)) AS MatchRatio,
+    SuggestedDataType,
+    CASE 
+        WHEN MinValue IS NOT NULL AND MaxValue IS NOT NULL 
+        THEN 'Range: ' + MinValue + ' to ' + MaxValue
+        ELSE ''
+    END AS ValueRange,
+    LEFT(SampleValues, 200) AS Samples,
+    ConversionNotes
+FROM #AnalysisResults
+ORDER BY ColumnName, MatchPercentage DESC;
+
+-- High confidence recommendations (90%+ match)
+PRINT '';
+PRINT 'HIGH CONFIDENCE RECOMMENDATIONS (90%+ Match):';
+PRINT '============================================';
+
+SELECT 
+    'ALTER TABLE ' + @TableName + ' ALTER COLUMN ' + QUOTENAME(ColumnName) + ' ' + SuggestedDataType AS ConversionScript,
+    PatternType,
+    CAST(MatchPercentage AS VARCHAR(10)) + '%' AS Confidence,
+    ConversionNotes
+FROM #AnalysisResults
+WHERE MatchPercentage >= 90
+ORDER BY MatchPercentage DESC, ColumnName;
+
+-- Data quality issues
+PRINT '';
+PRINT 'DATA QUALITY OBSERVATIONS:';
+PRINT '=========================';
+
+SELECT 
+    ColumnName,
+    PatternType,
+    'Found ' + CAST(MatchCount AS VARCHAR(20)) + ' matching values out of ' + 
+    CAST(TotalNonNullCount AS VARCHAR(20)) + ' (' + CAST(MatchPercentage AS VARCHAR(10)) + '%)' AS Finding,
+    CASE 
+        WHEN MatchPercentage < 100 AND MatchPercentage >= 50 
+        THEN 'Consider data cleansing before conversion'
+        WHEN MatchPercentage < 50 
+        THEN 'Low match rate - verify pattern detection'
+        ELSE 'Ready for conversion'
+    END AS Recommendation
+FROM #AnalysisResults
+WHERE MatchPercentage < 100
+ORDER BY MatchPercentage ASC;
 
 -- Clean up
-DROP TABLE #DataTypeAnalysis;
-DROP TABLE #ColumnsToAnalyze;
+DROP TABLE #AnalysisResults;
