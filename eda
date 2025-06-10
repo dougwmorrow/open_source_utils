@@ -1,0 +1,433 @@
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import plotly.io as pio
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+class LargeDatasetEDA:
+    """
+    Exploratory Data Analysis for large datasets (billions of rows)
+    with efficient sampling and Plotly visualizations
+    """
+    
+    def __init__(self, filepath, sample_size=1_000_000, chunk_size=100_000):
+        """
+        Initialize EDA analyzer
+        
+        Args:
+            filepath: Path to the data file (CSV, Parquet, etc.)
+            sample_size: Number of rows to sample for analysis
+            chunk_size: Size of chunks for reading large files
+        """
+        self.filepath = filepath
+        self.sample_size = sample_size
+        self.chunk_size = chunk_size
+        self.df_sample = None
+        self.total_rows = None
+        self.columns_info = {}
+        
+    def estimate_total_rows(self):
+        """Estimate total rows without loading entire dataset"""
+        print("Estimating total rows...")
+        
+        # For CSV files
+        if self.filepath.endswith('.csv'):
+            # Count rows by reading in chunks
+            total = 0
+            for chunk in pd.read_csv(self.filepath, chunksize=self.chunk_size):
+                total += len(chunk)
+            self.total_rows = total
+            
+        # For Parquet files
+        elif self.filepath.endswith('.parquet'):
+            # Parquet files have metadata with row count
+            import pyarrow.parquet as pq
+            self.total_rows = pq.ParquetFile(self.filepath).metadata.num_rows
+            
+        print(f"Total rows: {self.total_rows:,}")
+        return self.total_rows
+    
+    def load_sample(self, method='random'):
+        """
+        Load a sample of the data
+        
+        Args:
+            method: 'random', 'head', 'systematic', or 'stratified'
+        """
+        print(f"Loading {self.sample_size:,} row sample using {method} method...")
+        
+        if method == 'random':
+            # Random sampling
+            if self.filepath.endswith('.csv'):
+                # Estimate skip probability
+                skip_prob = max(0, 1 - (self.sample_size / self.total_rows))
+                self.df_sample = pd.read_csv(
+                    self.filepath,
+                    skiprows=lambda i: i > 0 and np.random.random() > skip_prob,
+                    nrows=self.sample_size
+                )
+            elif self.filepath.endswith('.parquet'):
+                # For parquet, we can use dask for efficient sampling
+                import dask.dataframe as dd
+                ddf = dd.read_parquet(self.filepath)
+                self.df_sample = ddf.sample(frac=self.sample_size/self.total_rows).compute()
+                
+        elif method == 'head':
+            # Just take first n rows
+            if self.filepath.endswith('.csv'):
+                self.df_sample = pd.read_csv(self.filepath, nrows=self.sample_size)
+            elif self.filepath.endswith('.parquet'):
+                self.df_sample = pd.read_parquet(self.filepath).head(self.sample_size)
+                
+        elif method == 'systematic':
+            # Systematic sampling (every nth row)
+            step = max(1, self.total_rows // self.sample_size)
+            if self.filepath.endswith('.csv'):
+                self.df_sample = pd.read_csv(
+                    self.filepath,
+                    skiprows=lambda i: i % step != 0,
+                    nrows=self.sample_size
+                )
+                
+        print(f"Sample loaded: {len(self.df_sample):,} rows, {len(self.df_sample.columns)} columns")
+        return self.df_sample
+    
+    def basic_info(self):
+        """Generate basic information about the dataset"""
+        print("\n" + "="*50)
+        print("BASIC DATASET INFORMATION")
+        print("="*50)
+        
+        info = {
+            'Total Rows (Full Dataset)': f"{self.total_rows:,}",
+            'Sample Size': f"{len(self.df_sample):,}",
+            'Sample Percentage': f"{(len(self.df_sample)/self.total_rows)*100:.2f}%",
+            'Number of Columns': len(self.df_sample.columns),
+            'Memory Usage (Sample)': f"{self.df_sample.memory_usage(deep=True).sum() / 1024**2:.2f} MB",
+            'Estimated Full Dataset Size': f"{(self.df_sample.memory_usage(deep=True).sum() / 1024**2) * (self.total_rows/len(self.df_sample)):.2f} MB"
+        }
+        
+        for key, value in info.items():
+            print(f"{key}: {value}")
+            
+        return info
+    
+    def column_analysis(self):
+        """Analyze each column"""
+        print("\n" + "="*50)
+        print("COLUMN ANALYSIS")
+        print("="*50)
+        
+        for col in self.df_sample.columns:
+            print(f"\n--- {col} ---")
+            dtype = self.df_sample[col].dtype
+            
+            col_info = {
+                'dtype': str(dtype),
+                'null_count': self.df_sample[col].isnull().sum(),
+                'null_percentage': f"{(self.df_sample[col].isnull().sum() / len(self.df_sample)) * 100:.2f}%",
+                'unique_values': self.df_sample[col].nunique(),
+                'unique_percentage': f"{(self.df_sample[col].nunique() / len(self.df_sample)) * 100:.2f}%"
+            }
+            
+            if dtype in ['int64', 'float64']:
+                col_info.update({
+                    'mean': f"{self.df_sample[col].mean():.2f}",
+                    'std': f"{self.df_sample[col].std():.2f}",
+                    'min': self.df_sample[col].min(),
+                    'max': self.df_sample[col].max(),
+                    'median': self.df_sample[col].median()
+                })
+            
+            self.columns_info[col] = col_info
+            
+            for key, value in col_info.items():
+                print(f"  {key}: {value}")
+                
+        return self.columns_info
+    
+    def plot_missing_values(self):
+        """Create missing values visualization"""
+        missing_data = pd.DataFrame({
+            'Column': self.df_sample.columns,
+            'Missing_Count': [self.df_sample[col].isnull().sum() for col in self.df_sample.columns],
+            'Missing_Percentage': [(self.df_sample[col].isnull().sum() / len(self.df_sample)) * 100 
+                                   for col in self.df_sample.columns]
+        })
+        
+        missing_data = missing_data[missing_data['Missing_Count'] > 0].sort_values('Missing_Percentage', ascending=True)
+        
+        if len(missing_data) > 0:
+            fig = px.bar(missing_data, 
+                        x='Missing_Percentage', 
+                        y='Column',
+                        orientation='h',
+                        title='Missing Values by Column',
+                        labels={'Missing_Percentage': 'Missing %'},
+                        text='Missing_Percentage')
+            
+            fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+            fig.update_layout(height=max(400, len(missing_data) * 30))
+            fig.show()
+        else:
+            print("No missing values found in the sample!")
+    
+    def plot_distributions(self, max_plots=20):
+        """Plot distributions for numeric columns"""
+        numeric_cols = self.df_sample.select_dtypes(include=[np.number]).columns.tolist()
+        
+        if len(numeric_cols) == 0:
+            print("No numeric columns found!")
+            return
+            
+        # Limit number of plots
+        numeric_cols = numeric_cols[:max_plots]
+        
+        # Create subplots
+        n_cols = min(3, len(numeric_cols))
+        n_rows = (len(numeric_cols) + n_cols - 1) // n_cols
+        
+        fig = make_subplots(
+            rows=n_rows, cols=n_cols,
+            subplot_titles=numeric_cols,
+            vertical_spacing=0.08,
+            horizontal_spacing=0.08
+        )
+        
+        for idx, col in enumerate(numeric_cols):
+            row = (idx // n_cols) + 1
+            col_idx = (idx % n_cols) + 1
+            
+            # Create histogram
+            hist_data = self.df_sample[col].dropna()
+            
+            fig.add_trace(
+                go.Histogram(x=hist_data, name=col, showlegend=False),
+                row=row, col=col_idx
+            )
+        
+        fig.update_layout(
+            title_text="Numeric Column Distributions",
+            height=300 * n_rows,
+            showlegend=False
+        )
+        
+        fig.show()
+    
+    def plot_correlations(self):
+        """Plot correlation matrix for numeric columns"""
+        numeric_cols = self.df_sample.select_dtypes(include=[np.number]).columns.tolist()
+        
+        if len(numeric_cols) < 2:
+            print("Not enough numeric columns for correlation analysis!")
+            return
+            
+        # Calculate correlations
+        corr_matrix = self.df_sample[numeric_cols].corr()
+        
+        # Create heatmap
+        fig = go.Figure(data=go.Heatmap(
+            z=corr_matrix.values,
+            x=corr_matrix.columns,
+            y=corr_matrix.columns,
+            colorscale='RdBu',
+            zmid=0,
+            text=np.round(corr_matrix.values, 2),
+            texttemplate='%{text}',
+            textfont={"size": 10},
+            reversescale=True
+        ))
+        
+        fig.update_layout(
+            title='Correlation Matrix',
+            width=max(800, len(numeric_cols) * 50),
+            height=max(600, len(numeric_cols) * 50)
+        )
+        
+        fig.show()
+    
+    def plot_categorical_distributions(self, max_categories=10, max_plots=10):
+        """Plot distributions for categorical columns"""
+        categorical_cols = self.df_sample.select_dtypes(include=['object', 'category']).columns.tolist()
+        
+        if len(categorical_cols) == 0:
+            print("No categorical columns found!")
+            return
+            
+        # Limit number of plots
+        categorical_cols = categorical_cols[:max_plots]
+        
+        for col in categorical_cols:
+            # Get value counts
+            value_counts = self.df_sample[col].value_counts().head(max_categories)
+            
+            fig = px.bar(
+                x=value_counts.index,
+                y=value_counts.values,
+                title=f'Top {max_categories} Categories in {col}',
+                labels={'x': col, 'y': 'Count'},
+                text=value_counts.values
+            )
+            
+            fig.update_traces(texttemplate='%{text:,}', textposition='outside')
+            fig.update_layout(showlegend=False)
+            fig.show()
+    
+    def detect_outliers(self, method='iqr'):
+        """Detect outliers in numeric columns"""
+        numeric_cols = self.df_sample.select_dtypes(include=[np.number]).columns.tolist()
+        outliers_summary = {}
+        
+        for col in numeric_cols:
+            data = self.df_sample[col].dropna()
+            
+            if method == 'iqr':
+                Q1 = data.quantile(0.25)
+                Q3 = data.quantile(0.75)
+                IQR = Q3 - Q1
+                lower_bound = Q1 - 1.5 * IQR
+                upper_bound = Q3 + 1.5 * IQR
+                outliers = data[(data < lower_bound) | (data > upper_bound)]
+                
+            elif method == 'zscore':
+                z_scores = np.abs((data - data.mean()) / data.std())
+                outliers = data[z_scores > 3]
+            
+            outliers_summary[col] = {
+                'count': len(outliers),
+                'percentage': (len(outliers) / len(data)) * 100
+            }
+        
+        # Create visualization
+        outlier_df = pd.DataFrame(outliers_summary).T.reset_index()
+        outlier_df.columns = ['Column', 'Count', 'Percentage']
+        outlier_df = outlier_df.sort_values('Percentage', ascending=False).head(20)
+        
+        fig = px.bar(
+            outlier_df,
+            x='Column',
+            y='Percentage',
+            title=f'Outlier Percentage by Column ({method.upper()} method)',
+            text='Percentage'
+        )
+        
+        fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+        fig.update_layout(xaxis_tickangle=-45)
+        fig.show()
+        
+        return outliers_summary
+    
+    def generate_report(self, output_file='eda_report.html'):
+        """Generate comprehensive EDA report"""
+        from plotly.subplots import make_subplots
+        import plotly.graph_objects as go
+        
+        # Create a comprehensive HTML report
+        html_content = f"""
+        <html>
+        <head>
+            <title>EDA Report - {datetime.now().strftime('%Y-%m-%d %H:%M')}</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                h1 {{ color: #333; }}
+                h2 {{ color: #666; }}
+                .info-box {{ background-color: #f0f0f0; padding: 10px; margin: 10px 0; }}
+            </style>
+        </head>
+        <body>
+            <h1>Exploratory Data Analysis Report</h1>
+            <p>Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            <p>Data file: {self.filepath}</p>
+            
+            <h2>Dataset Overview</h2>
+            <div class="info-box">
+                <p>Total Rows: {self.total_rows:,}</p>
+                <p>Sample Size: {len(self.df_sample):,}</p>
+                <p>Number of Columns: {len(self.df_sample.columns)}</p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        with open(output_file, 'w') as f:
+            f.write(html_content)
+        
+        print(f"Report saved to {output_file}")
+    
+    def run_full_eda(self):
+        """Run complete EDA pipeline"""
+        print("Starting Exploratory Data Analysis...")
+        print("="*70)
+        
+        # 1. Estimate total rows
+        self.estimate_total_rows()
+        
+        # 2. Load sample
+        self.load_sample(method='random')
+        
+        # 3. Basic information
+        self.basic_info()
+        
+        # 4. Column analysis
+        self.column_analysis()
+        
+        # 5. Visualizations
+        print("\n" + "="*50)
+        print("GENERATING VISUALIZATIONS")
+        print("="*50)
+        
+        print("\n1. Missing Values Analysis")
+        self.plot_missing_values()
+        
+        print("\n2. Numeric Distributions")
+        self.plot_distributions()
+        
+        print("\n3. Correlation Analysis")
+        self.plot_correlations()
+        
+        print("\n4. Categorical Distributions")
+        self.plot_categorical_distributions()
+        
+        print("\n5. Outlier Detection")
+        self.detect_outliers()
+        
+        print("\n" + "="*70)
+        print("EDA COMPLETE!")
+        print("="*70)
+
+
+# Example usage
+if __name__ == "__main__":
+    # Initialize EDA analyzer
+    # For CSV files
+    eda = LargeDatasetEDA(
+        filepath='your_large_dataset.csv',
+        sample_size=1_000_000,  # 1 million rows sample
+        chunk_size=100_000      # Read in 100k chunks
+    )
+    
+    # For Parquet files (more efficient for large data)
+    # eda = LargeDatasetEDA(
+    #     filepath='your_large_dataset.parquet',
+    #     sample_size=1_000_000
+    # )
+    
+    # Run complete EDA
+    eda.run_full_eda()
+    
+    # Or run individual analyses
+    # eda.estimate_total_rows()
+    # eda.load_sample(method='random')
+    # eda.basic_info()
+    # eda.plot_distributions()
+    
+    # Generate HTML report
+    # eda.generate_report('my_eda_report.html')
+    
+    # Access the sample dataframe for custom analysis
+    # df_sample = eda.df_sample
+    # print(df_sample.head())
