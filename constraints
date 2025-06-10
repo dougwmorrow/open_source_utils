@@ -1,5 +1,4 @@
 /*------------------------------------------------------------------------------------------------------------*/
-
 /*
 =====================================================
 ENHANCED TABLE DATA TYPE & FORMAT ANALYSIS SCRIPT
@@ -7,7 +6,7 @@ ENHANCED TABLE DATA TYPE & FORMAT ANALYSIS SCRIPT
 Analyzes tables for data type mismatches and patterns
 Works with both local and linked server tables
 Includes comprehensive error handling
-FIXED: Subquery context errors
+FIXED: Subquery context errors - simplified approach
 =====================================================
 */
 
@@ -120,101 +119,28 @@ CREATE TABLE #ColumnInfo (
     IsNullable BIT
 );
 
--- Get column information based on table type
+-- Get column information
 BEGIN TRY
-    IF @IsLinkedServer = 1
-    BEGIN
-        -- For linked servers, use OPENQUERY or sp_columns_ex
-        PRINT 'Analyzing linked server table: ' + @FullTableName;
-        
-        -- Method 1: Try sp_columns_ex
-        BEGIN TRY
-            INSERT INTO #ColumnInfo (ColumnName, DataType, MaxLength, Precision, Scale, IsNullable)
-            EXEC sp_columns_ex 
-                @table_server = @ServerName,
-                @table_catalog = @DatabaseName,
-                @table_schema = @SchemaName,
-                @table_name = @BaseTableName;
-                
-            -- Update data type format
-            UPDATE #ColumnInfo
-            SET DataType = DataType + 
-                CASE 
-                    WHEN DataType IN ('varchar', 'nvarchar', 'char', 'nchar') AND MaxLength IS NOT NULL 
-                    THEN '(' + CASE WHEN MaxLength = -1 THEN 'MAX' ELSE CAST(MaxLength AS VARCHAR(10)) END + ')'
-                    ELSE ''
-                END;
-        END TRY
-        BEGIN CATCH
-            -- Method 2: Try dynamic query
-            SET @SQL = N'
-            INSERT INTO #ColumnInfo (ColumnName, DataType, MaxLength)
-            SELECT TOP 0 * INTO #TempStructure FROM ' + @FullTableName + ';
-            
-            SELECT 
-                c.name AS ColumnName,
-                t.name AS DataType,
-                c.max_length AS MaxLength
-            FROM tempdb.sys.columns c
-            JOIN tempdb.sys.types t ON c.user_type_id = t.user_type_id
-            WHERE c.object_id = OBJECT_ID(''tempdb..#TempStructure'');
-            
-            DROP TABLE #TempStructure;';
-            
-            EXEC sp_executesql @SQL;
-        END CATCH;
-    END
-    ELSE
-    BEGIN
-        -- For local tables, use INFORMATION_SCHEMA or sys views
-        PRINT 'Analyzing local table: ' + @FullTableName;
-        
-        -- Try INFORMATION_SCHEMA first
-        SET @SQL = N'
-        INSERT INTO #ColumnInfo (ColumnName, DataType, MaxLength, Precision, Scale, IsNullable)
-        SELECT 
-            COLUMN_NAME,
-            DATA_TYPE + CASE 
-                WHEN CHARACTER_MAXIMUM_LENGTH IS NOT NULL THEN 
-                    ''('' + CASE WHEN CHARACTER_MAXIMUM_LENGTH = -1 THEN ''MAX'' 
-                          ELSE CAST(CHARACTER_MAXIMUM_LENGTH AS VARCHAR(10)) END + '')''
-                ELSE ''''
-            END,
-            CHARACTER_MAXIMUM_LENGTH,
-            NUMERIC_PRECISION,
-            NUMERIC_SCALE,
-            CASE WHEN IS_NULLABLE = ''YES'' THEN 1 ELSE 0 END
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = ''' + @SchemaName + '''
-          AND TABLE_NAME = ''' + @BaseTableName + '''
-          AND DATA_TYPE IN (''varchar'', ''nvarchar'', ''char'', ''nchar'', ''text'', ''ntext'');';
-        
-        EXEC sp_executesql @SQL;
-        
-        -- If no results, try sys views
-        IF NOT EXISTS (SELECT 1 FROM #ColumnInfo)
-        BEGIN
-            SET @SQL = N'
-            INSERT INTO #ColumnInfo (ColumnName, DataType, MaxLength, Precision, Scale, IsNullable)
-            SELECT 
-                c.name,
-                t.name + CASE 
-                    WHEN t.name IN (''varchar'', ''nvarchar'', ''char'', ''nchar'') AND c.max_length IS NOT NULL 
-                    THEN ''('' + CASE WHEN c.max_length = -1 THEN ''MAX'' ELSE CAST(c.max_length AS VARCHAR(10)) END + '')''
-                    ELSE ''''
-                END,
-                c.max_length,
-                c.precision,
-                c.scale,
-                c.is_nullable
-            FROM sys.columns c
-            JOIN sys.types t ON c.user_type_id = t.user_type_id
-            WHERE c.object_id = OBJECT_ID(''' + @FullTableName + ''')
-              AND t.name IN (''varchar'', ''nvarchar'', ''char'', ''nchar'', ''text'', ''ntext'');';
-            
-            EXEC sp_executesql @SQL;
-        END;
-    END;
+    -- For local tables
+    SET @SQL = N'
+    INSERT INTO #ColumnInfo (ColumnName, DataType, MaxLength, Precision, Scale, IsNullable)
+    SELECT 
+        c.name,
+        t.name + CASE 
+            WHEN t.name IN (''varchar'', ''nvarchar'', ''char'', ''nchar'') AND c.max_length IS NOT NULL 
+            THEN ''('' + CASE WHEN c.max_length = -1 THEN ''MAX'' ELSE CAST(c.max_length AS VARCHAR(10)) END + '')''
+            ELSE ''''
+        END,
+        c.max_length,
+        c.precision,
+        c.scale,
+        c.is_nullable
+    FROM sys.columns c
+    JOIN sys.types t ON c.user_type_id = t.user_type_id
+    WHERE c.object_id = OBJECT_ID(''' + @FullTableName + ''')
+      AND t.name IN (''varchar'', ''nvarchar'', ''char'', ''nchar'', ''text'', ''ntext'');';
+    
+    EXEC sp_executesql @SQL;
     
     -- Get total row count
     SET @SQL = N'SELECT @Count = COUNT(*) FROM ' + @FullTableName;
@@ -222,38 +148,8 @@ BEGIN TRY
     
 END TRY
 BEGIN CATCH
-    SET @ErrorMessage = 'Error getting table metadata: ' + ERROR_MESSAGE();
-    PRINT @ErrorMessage;
-    
-    -- Fallback: Try to get column info by querying the table directly
-    BEGIN TRY
-        PRINT 'Attempting fallback method to get column information...';
-        
-        SET @SQL = N'
-        SELECT TOP 0 * INTO #TempStructure FROM ' + @FullTableName + ';
-        
-        INSERT INTO #ColumnInfo (ColumnName, DataType, MaxLength)
-        SELECT 
-            c.name,
-            t.name + CASE 
-                WHEN t.name IN (''varchar'', ''nvarchar'', ''char'', ''nchar'') 
-                THEN ''('' + CASE WHEN c.max_length = -1 THEN ''MAX'' ELSE CAST(c.max_length AS VARCHAR(10)) END + '')''
-                ELSE ''''
-            END,
-            c.max_length
-        FROM tempdb.sys.columns c
-        JOIN tempdb.sys.types t ON c.user_type_id = t.user_type_id
-        WHERE c.object_id = OBJECT_ID(''tempdb..#TempStructure'')
-          AND t.name IN (''varchar'', ''nvarchar'', ''char'', ''nchar'', ''text'', ''ntext'');
-        
-        DROP TABLE #TempStructure;';
-        
-        EXEC sp_executesql @SQL;
-    END TRY
-    BEGIN CATCH
-        PRINT 'Fallback method failed: ' + ERROR_MESSAGE();
-        RETURN;
-    END CATCH;
+    PRINT 'Error getting table metadata: ' + ERROR_MESSAGE();
+    RETURN;
 END CATCH;
 
 -- Verify we have columns to analyze
@@ -269,6 +165,24 @@ PRINT 'Total Rows: ' + CAST(@TotalRows AS VARCHAR(20));
 PRINT 'Columns to Analyze: ' + CAST((SELECT COUNT(*) FROM #ColumnInfo) AS VARCHAR(10));
 PRINT '========================================';
 PRINT '';
+
+-- Create staging table for pattern analysis
+IF OBJECT_ID('tempdb..#PatternStaging') IS NOT NULL
+    DROP TABLE #PatternStaging;
+
+CREATE TABLE #PatternStaging (
+    ColumnName NVARCHAR(128),
+    PatternType NVARCHAR(50),
+    MatchCount INT,
+    TotalCount INT,
+    MatchPercentage DECIMAL(5,2),
+    MinLen INT,
+    MaxLen INT,
+    AvgLen INT,
+    IntCount INT,
+    DecimalCount INT,
+    DistinctCount INT
+);
 
 -- Analyze each column
 DECLARE @ColumnName NVARCHAR(128);
@@ -287,47 +201,14 @@ BEGIN
     BEGIN TRY
         PRINT 'Analyzing column: ' + @ColumnName + ' (' + @DataType + ')';
         
-        -- Create temporary table for storing intermediate results
-        IF OBJECT_ID('tempdb..#TempResults') IS NOT NULL
-            DROP TABLE #TempResults;
+        -- Clear staging table
+        TRUNCATE TABLE #PatternStaging;
         
-        CREATE TABLE #TempResults (
-            MinValue NVARCHAR(MAX),
-            MaxValue NVARCHAR(MAX),
-            SampleValues NVARCHAR(MAX)
-        );
-        
-        -- 1. NUMERIC PATTERN DETECTION
+        -- 1. NUMERIC PATTERN DETECTION - Simplified approach
         SET @SQL = N'
-        DECLARE @MinVal NVARCHAR(MAX);
-        DECLARE @MaxVal NVARCHAR(MAX);
-        DECLARE @Samples NVARCHAR(MAX);
-        
-        -- Get min/max values
-        SELECT @MinVal = MIN(' + QUOTENAME(@ColumnName) + '),
-               @MaxVal = MAX(' + QUOTENAME(@ColumnName) + ')
-        FROM ' + @FullTableName + '
-        WHERE ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%''
-          AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%-%-%''
-          AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%.%.%''
-          AND LEN(' + QUOTENAME(@ColumnName) + ') > 0;
-        
-        -- Get sample values
-        SELECT @Samples = STUFF((
-            SELECT TOP ' + CAST(@TopSamples AS VARCHAR(10)) + ' ''; '' + ' + QUOTENAME(@ColumnName) + '
-            FROM ' + @FullTableName + '
-            WHERE ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%''
-              AND ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-            ORDER BY ' + QUOTENAME(@ColumnName) + '
-            FOR XML PATH('''')), 1, 2, '''');
-        
-        INSERT INTO #TempResults (MinValue, MaxValue, SampleValues)
-        VALUES (@MinVal, @MaxVal, @Samples);
-        
-        INSERT INTO #AnalysisResults
+        INSERT INTO #PatternStaging (ColumnName, PatternType, MatchCount, TotalCount, MinLen, MaxLen, AvgLen, IntCount, DecimalCount)
         SELECT 
             ''' + @ColumnName + ''',
-            ''' + @DataType + ''',
             ''Numeric Pattern'',
             SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%'' 
                      AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%-%-%''
@@ -335,221 +216,177 @@ BEGIN
                      AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
                 THEN 1 ELSE 0 END),
             COUNT(*),
-            CASE WHEN COUNT(*) > 0 
-                THEN CAST(SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%'' 
-                                   AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%-%-%''
-                                   AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%.%.%''
-                                   AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
-                              THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS DECIMAL(5,2)) 
-                ELSE 0 END,
-            CASE 
-                WHEN SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS INT) IS NOT NULL THEN 1 ELSE 0 END) = 
-                     SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%'' THEN 1 ELSE 0 END) 
-                     AND MAX(LEN(' + QUOTENAME(@ColumnName) + ')) <= 9 THEN ''INT''
-                WHEN SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS INT) IS NOT NULL THEN 1 ELSE 0 END) = 
-                     SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%'' THEN 1 ELSE 0 END) 
-                     AND MAX(LEN(' + QUOTENAME(@ColumnName) + ')) <= 18 THEN ''BIGINT''
-                WHEN SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DECIMAL(18,4)) IS NOT NULL 
-                              AND TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS INT) IS NULL THEN 1 ELSE 0 END) > 0 THEN ''DECIMAL(18,4)''
-                ELSE ''FLOAT''
-            END,
-            t.MinValue,
-            t.MaxValue,
-            AVG(LEN(' + QUOTENAME(@ColumnName) + ')),
+            MIN(LEN(' + QUOTENAME(@ColumnName) + ')),
             MAX(LEN(' + QUOTENAME(@ColumnName) + ')),
-            t.SampleValues,
-            CASE 
-                WHEN SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%'' THEN 1 ELSE 0 END) > 0 
-                     AND SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%'' THEN 1 ELSE 0 END) < COUNT(*) 
-                THEN ''Warning: '' + 
-                     CAST(COUNT(*) - SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%'' THEN 1 ELSE 0 END) AS VARCHAR(20)) + 
-                     '' non-numeric values found''
-                ELSE ''''
-            END
+            AVG(LEN(' + QUOTENAME(@ColumnName) + ')),
+            SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS INT) IS NOT NULL THEN 1 ELSE 0 END),
+            SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DECIMAL(18,4)) IS NOT NULL 
+                     AND TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS INT) IS NULL THEN 1 ELSE 0 END)
         FROM ' + @FullTableName + '
-        CROSS JOIN #TempResults t
-        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-        GROUP BY t.MinValue, t.MaxValue, t.SampleValues
-        HAVING SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%'' 
-                        AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%-%-%''
-                        AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%.%.%''
-                        AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
-                   THEN 1 ELSE 0 END) > 0
-           AND CAST(SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%'' 
-                             AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%-%-%''
-                             AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%.%.%''
-                             AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
-                        THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS DECIMAL(5,2)) >= ' + CAST(@MinPercentageForFinding AS VARCHAR(10)) + ';
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL;';
         
-        TRUNCATE TABLE #TempResults;';
+        EXEC sp_executesql @SQL;
         
-        BEGIN TRY
-            EXEC sp_executesql @SQL;
-        END TRY
-        BEGIN CATCH
-            IF @DebugMode = 1 PRINT 'Numeric pattern error: ' + ERROR_MESSAGE();
-        END CATCH;
+        -- Update percentage
+        UPDATE #PatternStaging 
+        SET MatchPercentage = CASE WHEN TotalCount > 0 THEN CAST(MatchCount * 100.0 / TotalCount AS DECIMAL(5,2)) ELSE 0 END
+        WHERE PatternType = 'Numeric Pattern';
+        
+        -- Insert into results if meets threshold
+        INSERT INTO #AnalysisResults (ColumnName, CurrentDataType, PatternType, MatchCount, TotalNonNullCount, MatchPercentage,
+                                     SuggestedDataType, AvgLength, MaxLength)
+        SELECT 
+            ColumnName,
+            @DataType,
+            PatternType,
+            MatchCount,
+            TotalCount,
+            MatchPercentage,
+            CASE 
+                WHEN IntCount = MatchCount AND MaxLen <= 9 THEN 'INT'
+                WHEN IntCount = MatchCount AND MaxLen <= 18 THEN 'BIGINT'
+                WHEN DecimalCount > 0 THEN 'DECIMAL(18,4)'
+                ELSE 'FLOAT'
+            END,
+            AvgLen,
+            MaxLen
+        FROM #PatternStaging
+        WHERE PatternType = 'Numeric Pattern' 
+          AND MatchCount > 0 
+          AND MatchPercentage >= @MinPercentageForFinding;
+        
+        -- Get sample values separately
+        SET @SQL = N'
+        DECLARE @Samples NVARCHAR(MAX) = '''';
+        SELECT TOP ' + CAST(@TopSamples AS VARCHAR(10)) + ' @Samples = @Samples + ' + QUOTENAME(@ColumnName) + ' + ''; ''
+        FROM ' + @FullTableName + '
+        WHERE ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%''
+          AND ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+        ORDER BY ' + QUOTENAME(@ColumnName) + ';
+        
+        UPDATE #AnalysisResults 
+        SET SampleValues = @Samples
+        WHERE ColumnName = ''' + @ColumnName + ''' AND PatternType = ''Numeric Pattern'';';
+        
+        EXEC sp_executesql @SQL;
         
         -- 2. DATE/DATETIME PATTERN DETECTION
+        TRUNCATE TABLE #PatternStaging;
+        
         SET @SQL = N'
-        DECLARE @MinDate NVARCHAR(MAX);
-        DECLARE @MaxDate NVARCHAR(MAX);
-        DECLARE @Samples NVARCHAR(MAX);
-        
-        -- Get min/max dates
-        SELECT @MinDate = CONVERT(NVARCHAR(30), MIN(TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE)), 120),
-               @MaxDate = CONVERT(NVARCHAR(30), MAX(TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE)), 120)
-        FROM ' + @FullTableName + '
-        WHERE TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE) IS NOT NULL;
-        
-        -- Get sample values
-        SELECT @Samples = STUFF((
-            SELECT TOP ' + CAST(@TopSamples AS VARCHAR(10)) + ' ''; '' + ' + QUOTENAME(@ColumnName) + '
-            FROM ' + @FullTableName + '
-            WHERE TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE) IS NOT NULL
-            ORDER BY ' + QUOTENAME(@ColumnName) + '
-            FOR XML PATH('''')), 1, 2, '''');
-        
-        INSERT INTO #TempResults (MinValue, MaxValue, SampleValues)
-        VALUES (@MinDate, @MaxDate, @Samples);
-        
-        INSERT INTO #AnalysisResults
+        INSERT INTO #PatternStaging (ColumnName, PatternType, MatchCount, TotalCount, MaxLen)
         SELECT 
             ''' + @ColumnName + ''',
-            ''' + @DataType + ''',
             ''Date/DateTime Pattern'',
             SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE) IS NOT NULL THEN 1 ELSE 0 END),
             COUNT(*),
-            CASE WHEN COUNT(*) > 0 
-                THEN CAST(SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE) IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS DECIMAL(5,2)) 
-                ELSE 0 END,
-            CASE 
-                WHEN MAX(LEN(' + QUOTENAME(@ColumnName) + ')) <= 10 THEN ''DATE''
-                ELSE ''DATETIME''
-            END,
-            t.MinValue,
-            t.MaxValue,
-            NULL,
-            MAX(LEN(' + QUOTENAME(@ColumnName) + ')),
-            t.SampleValues,
-            ''ISO: '' + CAST(SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]%'' THEN 1 ELSE 0 END) AS VARCHAR(20)) + 
-            '', US: '' + CAST(SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9]/[0-9][0-9]/[0-9][0-9][0-9][0-9]%'' THEN 1 ELSE 0 END) AS VARCHAR(20)) + 
-            '', EU: '' + CAST(SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' LIKE ''[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9]%'' THEN 1 ELSE 0 END) AS VARCHAR(20))
+            MAX(LEN(' + QUOTENAME(@ColumnName) + '))
         FROM ' + @FullTableName + '
-        CROSS JOIN #TempResults t
-        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL AND LEN(' + QUOTENAME(@ColumnName) + ') >= 8
-        GROUP BY t.MinValue, t.MaxValue, t.SampleValues
-        HAVING SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE) IS NOT NULL THEN 1 ELSE 0 END) > 0
-           AND CAST(SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE) IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS DECIMAL(5,2)) >= ' + CAST(@MinPercentageForFinding AS VARCHAR(10)) + ';
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL AND LEN(' + QUOTENAME(@ColumnName) + ') >= 8;';
         
-        TRUNCATE TABLE #TempResults;';
+        EXEC sp_executesql @SQL;
         
-        BEGIN TRY
-            EXEC sp_executesql @SQL;
-        END TRY
-        BEGIN CATCH
-            IF @DebugMode = 1 PRINT 'Date pattern error: ' + ERROR_MESSAGE();
-        END CATCH;
+        -- Update percentage
+        UPDATE #PatternStaging 
+        SET MatchPercentage = CASE WHEN TotalCount > 0 THEN CAST(MatchCount * 100.0 / TotalCount AS DECIMAL(5,2)) ELSE 0 END
+        WHERE PatternType = 'Date/DateTime Pattern';
         
-        -- 3. JSON DETECTION
+        -- Insert into results if meets threshold
+        INSERT INTO #AnalysisResults (ColumnName, CurrentDataType, PatternType, MatchCount, TotalNonNullCount, MatchPercentage,
+                                     SuggestedDataType, MaxLength)
+        SELECT 
+            ColumnName,
+            @DataType,
+            PatternType,
+            MatchCount,
+            TotalCount,
+            MatchPercentage,
+            CASE WHEN MaxLen <= 10 THEN 'DATE' ELSE 'DATETIME' END,
+            MaxLen
+        FROM #PatternStaging
+        WHERE PatternType = 'Date/DateTime Pattern' 
+          AND MatchCount > 0 
+          AND MatchPercentage >= @MinPercentageForFinding;
+        
+        -- 3. BOOLEAN PATTERN DETECTION
+        TRUNCATE TABLE #PatternStaging;
+        
         SET @SQL = N'
-        DECLARE @Sample NVARCHAR(MAX);
-        
-        -- Get sample JSON
-        SELECT TOP 1 @Sample = LEFT(' + QUOTENAME(@ColumnName) + ', 200) + ''...''
-        FROM ' + @FullTableName + '
-        WHERE ISJSON(' + QUOTENAME(@ColumnName) + ') = 1;
-        
-        INSERT INTO #TempResults (SampleValues)
-        VALUES (@Sample);
-        
-        INSERT INTO #AnalysisResults
+        INSERT INTO #PatternStaging (ColumnName, PatternType, MatchCount, TotalCount, DistinctCount)
         SELECT 
             ''' + @ColumnName + ''',
-            ''' + @DataType + ''',
-            ''JSON Data'',
-            SUM(CASE WHEN ISJSON(' + QUOTENAME(@ColumnName) + ') = 1 THEN 1 ELSE 0 END),
-            COUNT(*),
-            CASE WHEN COUNT(*) > 0 
-                THEN CAST(SUM(CASE WHEN ISJSON(' + QUOTENAME(@ColumnName) + ') = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS DECIMAL(5,2)) 
-                ELSE 0 END,
-            ''NVARCHAR(MAX) CHECK(ISJSON(column)=1)'',
-            NULL,
-            NULL,
-            AVG(LEN(' + QUOTENAME(@ColumnName) + ')),
-            MAX(LEN(' + QUOTENAME(@ColumnName) + ')),
-            t.SampleValues,
-            ''Valid JSON documents found''
-        FROM ' + @FullTableName + '
-        CROSS JOIN #TempResults t
-        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-        GROUP BY t.SampleValues
-        HAVING SUM(CASE WHEN ISJSON(' + QUOTENAME(@ColumnName) + ') = 1 THEN 1 ELSE 0 END) > 0
-           AND CAST(SUM(CASE WHEN ISJSON(' + QUOTENAME(@ColumnName) + ') = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS DECIMAL(5,2)) >= ' + CAST(@MinPercentageForFinding AS VARCHAR(10)) + ';
-        
-        TRUNCATE TABLE #TempResults;';
-        
-        BEGIN TRY
-            EXEC sp_executesql @SQL;
-        END TRY
-        BEGIN CATCH
-            IF @DebugMode = 1 PRINT 'JSON pattern error: ' + ERROR_MESSAGE();
-        END CATCH;
-        
-        -- 4. BOOLEAN PATTERN DETECTION
-        SET @SQL = N'
-        DECLARE @Samples NVARCHAR(MAX);
-        
-        -- Get distinct boolean values
-        SELECT @Samples = STUFF((
-            SELECT DISTINCT ''; '' + UPPER(' + QUOTENAME(@ColumnName) + ')
-            FROM ' + @FullTableName + '
-            WHERE UPPER(' + QUOTENAME(@ColumnName) + ') IN (''YES'', ''NO'', ''Y'', ''N'', ''TRUE'', ''FALSE'', ''T'', ''F'', ''1'', ''0'')
-            FOR XML PATH('''')), 1, 2, '''');
-        
-        INSERT INTO #TempResults (SampleValues)
-        VALUES (@Samples);
-        
-        INSERT INTO #AnalysisResults
-        SELECT 
-            ''' + @ColumnName + ''',
-            ''' + @DataType + ''',
             ''Boolean Pattern'',
             SUM(CASE WHEN UPPER(' + QUOTENAME(@ColumnName) + ') IN (''YES'', ''NO'', ''Y'', ''N'', ''TRUE'', ''FALSE'', ''T'', ''F'', ''1'', ''0'') 
                 THEN 1 ELSE 0 END),
             COUNT(*),
-            CASE WHEN COUNT(*) > 0 
-                THEN CAST(SUM(CASE WHEN UPPER(' + QUOTENAME(@ColumnName) + ') IN (''YES'', ''NO'', ''Y'', ''N'', ''TRUE'', ''FALSE'', ''T'', ''F'', ''1'', ''0'') 
-                              THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS DECIMAL(5,2)) 
-                ELSE 0 END,
-            ''BIT'',
-            NULL,
-            NULL,
-            NULL,
-            NULL,
-            t.SampleValues,
-            ''Distinct values: '' + CAST(COUNT(DISTINCT UPPER(' + QUOTENAME(@ColumnName) + ')) AS VARCHAR(10))
+            COUNT(DISTINCT UPPER(' + QUOTENAME(@ColumnName) + '))
         FROM ' + @FullTableName + '
-        CROSS JOIN #TempResults t
-        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-        GROUP BY t.SampleValues
-        HAVING SUM(CASE WHEN UPPER(' + QUOTENAME(@ColumnName) + ') IN (''YES'', ''NO'', ''Y'', ''N'', ''TRUE'', ''FALSE'', ''T'', ''F'', ''1'', ''0'') 
-                   THEN 1 ELSE 0 END) > 0
-           AND CAST(SUM(CASE WHEN UPPER(' + QUOTENAME(@ColumnName) + ') IN (''YES'', ''NO'', ''Y'', ''N'', ''TRUE'', ''FALSE'', ''T'', ''F'', ''1'', ''0'') 
-                        THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS DECIMAL(5,2)) >= ' + CAST(@MinPercentageForFinding AS VARCHAR(10)) + ';
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL;';
         
-        TRUNCATE TABLE #TempResults;';
+        EXEC sp_executesql @SQL;
         
-        BEGIN TRY
-            EXEC sp_executesql @SQL;
-        END TRY
-        BEGIN CATCH
-            IF @DebugMode = 1 PRINT 'Boolean pattern error: ' + ERROR_MESSAGE();
-        END CATCH;
+        -- Update percentage
+        UPDATE #PatternStaging 
+        SET MatchPercentage = CASE WHEN TotalCount > 0 THEN CAST(MatchCount * 100.0 / TotalCount AS DECIMAL(5,2)) ELSE 0 END
+        WHERE PatternType = 'Boolean Pattern';
         
-        -- Clean up temp table
-        IF OBJECT_ID('tempdb..#TempResults') IS NOT NULL
-            DROP TABLE #TempResults;
+        -- Insert into results if meets threshold
+        INSERT INTO #AnalysisResults (ColumnName, CurrentDataType, PatternType, MatchCount, TotalNonNullCount, MatchPercentage,
+                                     SuggestedDataType, ConversionNotes)
+        SELECT 
+            ColumnName,
+            @DataType,
+            PatternType,
+            MatchCount,
+            TotalCount,
+            MatchPercentage,
+            'BIT',
+            'Distinct values: ' + CAST(DistinctCount AS VARCHAR(10))
+        FROM #PatternStaging
+        WHERE PatternType = 'Boolean Pattern' 
+          AND MatchCount > 0 
+          AND MatchPercentage >= @MinPercentageForFinding;
+        
+        -- 4. JSON DETECTION
+        TRUNCATE TABLE #PatternStaging;
+        
+        SET @SQL = N'
+        INSERT INTO #PatternStaging (ColumnName, PatternType, MatchCount, TotalCount, AvgLen, MaxLen)
+        SELECT 
+            ''' + @ColumnName + ''',
+            ''JSON Data'',
+            SUM(CASE WHEN ISJSON(' + QUOTENAME(@ColumnName) + ') = 1 THEN 1 ELSE 0 END),
+            COUNT(*),
+            AVG(LEN(' + QUOTENAME(@ColumnName) + ')),
+            MAX(LEN(' + QUOTENAME(@ColumnName) + '))
+        FROM ' + @FullTableName + '
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL;';
+        
+        EXEC sp_executesql @SQL;
+        
+        -- Update percentage
+        UPDATE #PatternStaging 
+        SET MatchPercentage = CASE WHEN TotalCount > 0 THEN CAST(MatchCount * 100.0 / TotalCount AS DECIMAL(5,2)) ELSE 0 END
+        WHERE PatternType = 'JSON Data';
+        
+        -- Insert into results if meets threshold
+        INSERT INTO #AnalysisResults (ColumnName, CurrentDataType, PatternType, MatchCount, TotalNonNullCount, MatchPercentage,
+                                     SuggestedDataType, AvgLength, MaxLength, ConversionNotes)
+        SELECT 
+            ColumnName,
+            @DataType,
+            PatternType,
+            MatchCount,
+            TotalCount,
+            MatchPercentage,
+            'NVARCHAR(MAX) CHECK(ISJSON(column)=1)',
+            AvgLen,
+            MaxLen,
+            'Valid JSON documents found'
+        FROM #PatternStaging
+        WHERE PatternType = 'JSON Data' 
+          AND MatchCount > 0 
+          AND MatchPercentage >= @MinPercentageForFinding;
         
     END TRY
     BEGIN CATCH
@@ -594,13 +431,10 @@ SELECT
     CAST(MatchPercentage AS VARCHAR(10)) + '%' AS MatchPct,
     CAST(MatchCount AS VARCHAR(20)) + '/' + CAST(TotalNonNullCount AS VARCHAR(20)) AS MatchRatio,
     SuggestedDataType,
-    CASE 
-        WHEN MinValue IS NOT NULL AND MaxValue IS NOT NULL 
-        THEN 'Range: ' + MinValue + ' to ' + MaxValue
-        ELSE ''
-    END AS ValueRange,
-    LEFT(SampleValues, 200) AS Samples,
-    ConversionNotes
+    CASE WHEN AvgLength IS NOT NULL THEN 'Avg Len: ' + CAST(AvgLength AS VARCHAR(10)) ELSE '' END AS AvgLen,
+    CASE WHEN MaxLength IS NOT NULL THEN 'Max Len: ' + CAST(MaxLength AS VARCHAR(10)) ELSE '' END AS MaxLen,
+    LEFT(ISNULL(SampleValues, ''), 200) AS Samples,
+    ISNULL(ConversionNotes, '') AS Notes
 FROM #AnalysisResults
 ORDER BY ColumnName, MatchPercentage DESC;
 
@@ -645,10 +479,8 @@ PRINT 'To export results, use:';
 PRINT 'SELECT * FROM #AnalysisResults';
 
 -- Clean up
-IF @DebugMode = 0
-BEGIN
-    DROP TABLE #ColumnInfo;
-END;
+DROP TABLE #PatternStaging;
+DROP TABLE #ColumnInfo;
 
 
 
@@ -693,13 +525,6 @@ END;
 
 
 /*------------------------------------------------------------------------------------------------------------*/
-
-
-
-
-
-
-
 
 
 
@@ -917,13 +742,25 @@ BEGIN TRY
     
     WHILE @@FETCH_STATUS = 0
     BEGIN
-        SET @SQL = N'
-        UPDATE #ColumnInfo 
-        SET NonNullCount = (SELECT COUNT(' + QUOTENAME(@ColumnName) + ') FROM ' + @FullTableName + '),
-            NullCount = (SELECT COUNT(*) - COUNT(' + QUOTENAME(@ColumnName) + ') FROM ' + @FullTableName + ')
-        WHERE ColumnName = ''' + @ColumnName + ''';';
+        DECLARE @NonNullCount INT, @NullCount INT;
         
-        EXEC sp_executesql @SQL;
+        -- Get counts using variables instead of subqueries
+        SET @SQL = N'
+        SELECT 
+            @NonNull = COUNT(' + QUOTENAME(@ColumnName) + '),
+            @Null = COUNT(*) - COUNT(' + QUOTENAME(@ColumnName) + ')
+        FROM ' + @FullTableName;
+        
+        EXEC sp_executesql @SQL, 
+            N'@NonNull INT OUTPUT, @Null INT OUTPUT', 
+            @NonNull = @NonNullCount OUTPUT, 
+            @Null = @NullCount OUTPUT;
+        
+        -- Update the table with the retrieved values
+        UPDATE #ColumnInfo 
+        SET NonNullCount = @NonNullCount,
+            NullCount = @NullCount
+        WHERE ColumnName = @ColumnName;
         
         FETCH NEXT FROM null_cursor INTO @ColumnName;
     END;
@@ -1416,5 +1253,40 @@ END;
 -- IF OBJECT_ID('tempdb..#CorrelationResults') IS NOT NULL DROP TABLE #CorrelationResults;
 
 
-
 /*------------------------------------------------------------------------------------------------------------*/
+
+
+-- Call the wrapper to handle XML and then execute your existing procedure
+EXEC sp_HandleXMLLinkedServerTransfer
+    @LinkedServerName = 'YourLinkedServer',
+    @SourceDatabase = 'SourceDB',
+    @SourceSchema = 'dbo',
+    @SourceTable = 'YourTable',
+    @ExistingProcedureName = 'sp_YourExistingTransferProc',
+    @ExistingProcedureParams = '@param1 = value1, @param2 = value2',
+    @CleanupStaging = 1,  -- Auto cleanup after transfer
+    @Debug = 1;           -- Show detailed progress
+
+-- Create the staging view without calling any procedure
+EXEC sp_HandleXMLLinkedServerTransfer
+    @LinkedServerName = 'YourLinkedServer',
+    @SourceDatabase = 'SourceDB',
+    @SourceTable = 'YourTable',
+    @ExistingProcedureName = NULL,  -- Don't call any procedure
+    @CleanupStaging = 0,            -- Keep the staging view
+    @Debug = 1;
+
+-- Now use the staging view in your own queries or procedures
+-- The view name will be displayed in the output
+
+-- In your existing procedure, add:
+IF EXISTS (SELECT 1 FROM sys.views WHERE name LIKE 'vw_YourTable_XMLConverted_%')
+BEGIN
+    -- Use the staging view instead of the linked server directly
+    SELECT * FROM staging.vw_YourTable_XMLConverted_[timestamp]
+END
+ELSE
+BEGIN
+    -- Use the original linked server path
+    SELECT * FROM [LinkedServer].[Database].[dbo].[YourTable]
+END
