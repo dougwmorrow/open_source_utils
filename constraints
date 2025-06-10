@@ -1,1346 +1,239 @@
-/*------------------------------------------------------------------------------------------------------------*/
-
-/*
-=====================================================
-ENHANCED TABLE DATA TYPE & FORMAT ANALYSIS SCRIPT
-=====================================================
-Analyzes tables for data type mismatches and patterns
-Works with both local and linked server tables
-Includes comprehensive error handling
-FIXED: Subquery context errors - using FOR XML PATH for string aggregation
-=====================================================
-*/
-
--- CONFIGURATION - MODIFY THESE PARAMETERS
-DECLARE @TableName NVARCHAR(500) = 'dbo.YourTableName'; -- Format: [schema].[table] or [server].[database].[schema].[table]
-DECLARE @TopSamples INT = 10; -- Number of sample values to return
-DECLARE @MinPercentageForFinding DECIMAL(5,2) = 10.0; -- Minimum % to report a finding
-DECLARE @DebugMode BIT = 0; -- Set to 1 for detailed debug output
-
--- Variables for dynamic handling
-DECLARE @SQL NVARCHAR(MAX);
-DECLARE @IsLinkedServer BIT = 0;
-DECLARE @ServerName NVARCHAR(128) = NULL;
-DECLARE @DatabaseName NVARCHAR(128) = NULL;
-DECLARE @SchemaName NVARCHAR(128) = NULL;
-DECLARE @BaseTableName NVARCHAR(128) = NULL;
-DECLARE @FullTableName NVARCHAR(500);
-DECLARE @ErrorMessage NVARCHAR(4000);
-DECLARE @TotalRows INT = 0;
-
--- Parse table name components
-BEGIN TRY
-    -- Remove brackets and parse
-    DECLARE @CleanTableName NVARCHAR(500) = REPLACE(REPLACE(@TableName, '[', ''), ']', '');
-    DECLARE @Parts TABLE (PartNumber INT IDENTITY(1,1), PartValue NVARCHAR(128));
-    
-    -- Split by dots
-    DECLARE @Delimiter CHAR(1) = '.';
-    DECLARE @StartPos INT = 1;
-    DECLARE @EndPos INT;
-    
-    WHILE CHARINDEX(@Delimiter, @CleanTableName, @StartPos) > 0
-    BEGIN
-        SET @EndPos = CHARINDEX(@Delimiter, @CleanTableName, @StartPos);
-        INSERT INTO @Parts (PartValue) 
-        VALUES (SUBSTRING(@CleanTableName, @StartPos, @EndPos - @StartPos));
-        SET @StartPos = @EndPos + 1;
-    END
-    -- Insert last part
-    INSERT INTO @Parts (PartValue) 
-    VALUES (SUBSTRING(@CleanTableName, @StartPos, LEN(@CleanTableName)));
-    
-    -- Determine structure based on number of parts
-    DECLARE @PartCount INT = (SELECT COUNT(*) FROM @Parts);
-    
-    IF @PartCount = 4
-    BEGIN
-        SET @IsLinkedServer = 1;
-        SELECT @ServerName = PartValue FROM @Parts WHERE PartNumber = 1;
-        SELECT @DatabaseName = PartValue FROM @Parts WHERE PartNumber = 2;
-        SELECT @SchemaName = PartValue FROM @Parts WHERE PartNumber = 3;
-        SELECT @BaseTableName = PartValue FROM @Parts WHERE PartNumber = 4;
-    END
-    ELSE IF @PartCount = 3
-    BEGIN
-        SELECT @DatabaseName = PartValue FROM @Parts WHERE PartNumber = 1;
-        SELECT @SchemaName = PartValue FROM @Parts WHERE PartNumber = 2;
-        SELECT @BaseTableName = PartValue FROM @Parts WHERE PartNumber = 3;
-    END
-    ELSE IF @PartCount = 2
-    BEGIN
-        SELECT @SchemaName = PartValue FROM @Parts WHERE PartNumber = 1;
-        SELECT @BaseTableName = PartValue FROM @Parts WHERE PartNumber = 2;
-    END
-    ELSE
-    BEGIN
-        SET @SchemaName = 'dbo';
-        SET @BaseTableName = @CleanTableName;
-    END
-    
-    -- Set full table name for queries
-    SET @FullTableName = @TableName;
-    
-END TRY
-BEGIN CATCH
-    PRINT 'Error parsing table name: ' + ERROR_MESSAGE();
-    RETURN;
-END CATCH;
-
--- Initialize results table
-IF OBJECT_ID('tempdb..#AnalysisResults') IS NOT NULL
-    DROP TABLE #AnalysisResults;
-
-CREATE TABLE #AnalysisResults (
-    ColumnName NVARCHAR(128),
-    CurrentDataType NVARCHAR(50),
-    PatternType NVARCHAR(50),
-    MatchCount INT,
-    TotalNonNullCount INT,
-    MatchPercentage DECIMAL(5,2),
-    SuggestedDataType NVARCHAR(50),
-    MinValue NVARCHAR(MAX),
-    MaxValue NVARCHAR(MAX),
-    AvgLength INT,
-    MaxLength INT,
-    SampleValues NVARCHAR(MAX),
-    ConversionNotes NVARCHAR(MAX)
-);
-
--- Create column information table
-IF OBJECT_ID('tempdb..#ColumnInfo') IS NOT NULL
-    DROP TABLE #ColumnInfo;
-
-CREATE TABLE #ColumnInfo (
-    ColumnName NVARCHAR(128),
-    DataType NVARCHAR(50),
-    MaxLength INT,
-    Precision INT,
-    Scale INT,
-    IsNullable BIT
-);
-
--- Get column information
-BEGIN TRY
-    -- For local tables
-    SET @SQL = N'
-    INSERT INTO #ColumnInfo (ColumnName, DataType, MaxLength, Precision, Scale, IsNullable)
-    SELECT 
-        c.name,
-        t.name + CASE 
-            WHEN t.name IN (''varchar'', ''nvarchar'', ''char'', ''nchar'') AND c.max_length IS NOT NULL 
-            THEN ''('' + CASE WHEN c.max_length = -1 THEN ''MAX'' ELSE CAST(c.max_length AS VARCHAR(10)) END + '')''
-            ELSE ''''
-        END,
-        c.max_length,
-        c.precision,
-        c.scale,
-        c.is_nullable
-    FROM sys.columns c
-    JOIN sys.types t ON c.user_type_id = t.user_type_id
-    WHERE c.object_id = OBJECT_ID(''' + @FullTableName + ''')
-      AND t.name IN (''varchar'', ''nvarchar'', ''char'', ''nchar'', ''text'', ''ntext'');';
-    
-    EXEC sp_executesql @SQL;
-    
-    -- Get total row count
-    SET @SQL = N'SELECT @Count = COUNT(*) FROM ' + @FullTableName;
-    EXEC sp_executesql @SQL, N'@Count INT OUTPUT', @Count = @TotalRows OUTPUT;
-    
-END TRY
-BEGIN CATCH
-    PRINT 'Error getting table metadata: ' + ERROR_MESSAGE();
-    RETURN;
-END CATCH;
-
--- Verify we have columns to analyze
-IF NOT EXISTS (SELECT 1 FROM #ColumnInfo)
+-- Main conversion procedure that can be called from anywhere
+CREATE OR ALTER PROCEDURE [dbo].[sp_ConvertXMLToNVarchar]
+    @LinkedServerName NVARCHAR(128),
+    @DatabaseName NVARCHAR(128),
+    @SchemaName NVARCHAR(128),
+    @TableName NVARCHAR(128),
+    @OutputTable NVARCHAR(128) = NULL,  -- Optional: store results in a table
+    @Debug BIT = 0
+AS
 BEGIN
-    PRINT 'No varchar/nvarchar columns found in table ' + @FullTableName;
-    RETURN;
-END;
-
-PRINT '========================================';
-PRINT 'TABLE ANALYSIS: ' + @FullTableName;
-PRINT 'Total Rows: ' + CAST(@TotalRows AS VARCHAR(20));
-PRINT 'Columns to Analyze: ' + CAST((SELECT COUNT(*) FROM #ColumnInfo) AS VARCHAR(10));
-PRINT '========================================';
-PRINT '';
-
--- Create staging table for pattern analysis
-IF OBJECT_ID('tempdb..#PatternStaging') IS NOT NULL
-    DROP TABLE #PatternStaging;
-
-CREATE TABLE #PatternStaging (
-    ColumnName NVARCHAR(128),
-    PatternType NVARCHAR(50),
-    MatchCount INT,
-    TotalCount INT,
-    MatchPercentage DECIMAL(5,2),
-    MinLen INT,
-    MaxLen INT,
-    AvgLen INT,
-    IntCount INT,
-    DecimalCount INT,
-    DistinctCount INT
-);
-
--- Analyze each column
-DECLARE @ColumnName NVARCHAR(128);
-DECLARE @DataType NVARCHAR(50);
-
-DECLARE column_cursor CURSOR FOR
-    SELECT ColumnName, DataType
-    FROM #ColumnInfo
-    ORDER BY ColumnName;
-
-OPEN column_cursor;
-FETCH NEXT FROM column_cursor INTO @ColumnName, @DataType;
-
-WHILE @@FETCH_STATUS = 0
-BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @SQL NVARCHAR(MAX);
+    DECLARE @ColumnList NVARCHAR(MAX) = '';
+    DECLARE @ErrorMessage NVARCHAR(4000);
+    DECLARE @ErrorSeverity INT;
+    DECLARE @ErrorState INT;
+    
     BEGIN TRY
-        PRINT 'Analyzing column: ' + @ColumnName + ' (' + @DataType + ')';
-        
-        -- Clear staging table
-        TRUNCATE TABLE #PatternStaging;
-        
-        -- 1. NUMERIC PATTERN DETECTION - Simplified approach
-        SET @SQL = N'
-        INSERT INTO #PatternStaging (ColumnName, PatternType, MatchCount, TotalCount, MinLen, MaxLen, AvgLen, IntCount, DecimalCount)
-        SELECT 
-            ''' + @ColumnName + ''',
-            ''Numeric Pattern'',
-            SUM(CASE WHEN ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%'' 
-                     AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%-%-%''
-                     AND ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%.%.%''
-                     AND LEN(' + QUOTENAME(@ColumnName) + ') > 0
-                THEN 1 ELSE 0 END),
-            COUNT(*),
-            MIN(LEN(' + QUOTENAME(@ColumnName) + ')),
-            MAX(LEN(' + QUOTENAME(@ColumnName) + ')),
-            AVG(LEN(' + QUOTENAME(@ColumnName) + ')),
-            SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS INT) IS NOT NULL THEN 1 ELSE 0 END),
-            SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DECIMAL(18,4)) IS NOT NULL 
-                     AND TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS INT) IS NULL THEN 1 ELSE 0 END)
-        FROM ' + @FullTableName + '
-        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL;';
-        
-        EXEC sp_executesql @SQL;
-        
-        -- Update percentage
-        UPDATE #PatternStaging 
-        SET MatchPercentage = CASE WHEN TotalCount > 0 THEN CAST(MatchCount * 100.0 / TotalCount AS DECIMAL(5,2)) ELSE 0 END
-        WHERE PatternType = 'Numeric Pattern';
-        
-        -- Insert into results if meets threshold
-        INSERT INTO #AnalysisResults (ColumnName, CurrentDataType, PatternType, MatchCount, TotalNonNullCount, MatchPercentage,
-                                     SuggestedDataType, AvgLength, MaxLength)
-        SELECT 
-            ColumnName,
-            @DataType,
-            PatternType,
-            MatchCount,
-            TotalCount,
-            MatchPercentage,
-            CASE 
-                WHEN IntCount = MatchCount AND MaxLen <= 9 THEN 'INT'
-                WHEN IntCount = MatchCount AND MaxLen <= 18 THEN 'BIGINT'
-                WHEN DecimalCount > 0 THEN 'DECIMAL(18,4)'
-                ELSE 'FLOAT'
-            END,
-            AvgLen,
-            MaxLen
-        FROM #PatternStaging
-        WHERE PatternType = 'Numeric Pattern' 
-          AND MatchCount > 0 
-          AND MatchPercentage >= @MinPercentageForFinding;
-        
-        -- Get sample values using FOR XML PATH instead of string concatenation
-        SET @SQL = N'
-        DECLARE @Samples NVARCHAR(MAX);
-        SELECT @Samples = STUFF((
-            SELECT TOP ' + CAST(@TopSamples AS VARCHAR(10)) + ' ''; '' + ' + QUOTENAME(@ColumnName) + '
-            FROM ' + @FullTableName + '
-            WHERE ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%''
-              AND ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-            ORDER BY ' + QUOTENAME(@ColumnName) + '
-            FOR XML PATH(''''), TYPE
-        ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, '''');
-        
-        UPDATE #AnalysisResults 
-        SET SampleValues = @Samples
-        WHERE ColumnName = ''' + @ColumnName + ''' AND PatternType = ''Numeric Pattern'';';
-        
-        EXEC sp_executesql @SQL;
-        
-        -- 2. DATE/DATETIME PATTERN DETECTION
-        TRUNCATE TABLE #PatternStaging;
-        
-        SET @SQL = N'
-        INSERT INTO #PatternStaging (ColumnName, PatternType, MatchCount, TotalCount, MaxLen)
-        SELECT 
-            ''' + @ColumnName + ''',
-            ''Date/DateTime Pattern'',
-            SUM(CASE WHEN TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE) IS NOT NULL THEN 1 ELSE 0 END),
-            COUNT(*),
-            MAX(LEN(' + QUOTENAME(@ColumnName) + '))
-        FROM ' + @FullTableName + '
-        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL AND LEN(' + QUOTENAME(@ColumnName) + ') >= 8;';
-        
-        EXEC sp_executesql @SQL;
-        
-        -- Update percentage
-        UPDATE #PatternStaging 
-        SET MatchPercentage = CASE WHEN TotalCount > 0 THEN CAST(MatchCount * 100.0 / TotalCount AS DECIMAL(5,2)) ELSE 0 END
-        WHERE PatternType = 'Date/DateTime Pattern';
-        
-        -- Insert into results if meets threshold
-        INSERT INTO #AnalysisResults (ColumnName, CurrentDataType, PatternType, MatchCount, TotalNonNullCount, MatchPercentage,
-                                     SuggestedDataType, MaxLength)
-        SELECT 
-            ColumnName,
-            @DataType,
-            PatternType,
-            MatchCount,
-            TotalCount,
-            MatchPercentage,
-            CASE WHEN MaxLen <= 10 THEN 'DATE' ELSE 'DATETIME' END,
-            MaxLen
-        FROM #PatternStaging
-        WHERE PatternType = 'Date/DateTime Pattern' 
-          AND MatchCount > 0 
-          AND MatchPercentage >= @MinPercentageForFinding;
-        
-        -- Get sample date values using FOR XML PATH
-        SET @SQL = N'
-        DECLARE @Samples NVARCHAR(MAX);
-        SELECT @Samples = STUFF((
-            SELECT TOP ' + CAST(@TopSamples AS VARCHAR(10)) + ' ''; '' + ' + QUOTENAME(@ColumnName) + '
-            FROM ' + @FullTableName + '
-            WHERE TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE) IS NOT NULL
-              AND ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-            ORDER BY ' + QUOTENAME(@ColumnName) + '
-            FOR XML PATH(''''), TYPE
-        ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, '''');
-        
-        UPDATE #AnalysisResults 
-        SET SampleValues = @Samples
-        WHERE ColumnName = ''' + @ColumnName + ''' AND PatternType = ''Date/DateTime Pattern'';';
-        
-        EXEC sp_executesql @SQL;
-        
-        -- 3. BOOLEAN PATTERN DETECTION
-        TRUNCATE TABLE #PatternStaging;
-        
-        SET @SQL = N'
-        INSERT INTO #PatternStaging (ColumnName, PatternType, MatchCount, TotalCount, DistinctCount)
-        SELECT 
-            ''' + @ColumnName + ''',
-            ''Boolean Pattern'',
-            SUM(CASE WHEN UPPER(' + QUOTENAME(@ColumnName) + ') IN (''YES'', ''NO'', ''Y'', ''N'', ''TRUE'', ''FALSE'', ''T'', ''F'', ''1'', ''0'') 
-                THEN 1 ELSE 0 END),
-            COUNT(*),
-            COUNT(DISTINCT UPPER(' + QUOTENAME(@ColumnName) + '))
-        FROM ' + @FullTableName + '
-        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL;';
-        
-        EXEC sp_executesql @SQL;
-        
-        -- Update percentage
-        UPDATE #PatternStaging 
-        SET MatchPercentage = CASE WHEN TotalCount > 0 THEN CAST(MatchCount * 100.0 / TotalCount AS DECIMAL(5,2)) ELSE 0 END
-        WHERE PatternType = 'Boolean Pattern';
-        
-        -- Insert into results if meets threshold
-        INSERT INTO #AnalysisResults (ColumnName, CurrentDataType, PatternType, MatchCount, TotalNonNullCount, MatchPercentage,
-                                     SuggestedDataType, ConversionNotes)
-        SELECT 
-            ColumnName,
-            @DataType,
-            PatternType,
-            MatchCount,
-            TotalCount,
-            MatchPercentage,
-            'BIT',
-            'Distinct values: ' + CAST(DistinctCount AS VARCHAR(10))
-        FROM #PatternStaging
-        WHERE PatternType = 'Boolean Pattern' 
-          AND MatchCount > 0 
-          AND MatchPercentage >= @MinPercentageForFinding;
-        
-        -- Get sample boolean values using FOR XML PATH
-        SET @SQL = N'
-        DECLARE @Samples NVARCHAR(MAX);
-        SELECT @Samples = STUFF((
-            SELECT DISTINCT TOP 10 ''; '' + UPPER(' + QUOTENAME(@ColumnName) + ')
-            FROM ' + @FullTableName + '
-            WHERE UPPER(' + QUOTENAME(@ColumnName) + ') IN (''YES'', ''NO'', ''Y'', ''N'', ''TRUE'', ''FALSE'', ''T'', ''F'', ''1'', ''0'')
-              AND ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-            FOR XML PATH(''''), TYPE
-        ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, '''');
-        
-        UPDATE #AnalysisResults 
-        SET SampleValues = @Samples
-        WHERE ColumnName = ''' + @ColumnName + ''' AND PatternType = ''Boolean Pattern'';';
-        
-        EXEC sp_executesql @SQL;
-        
-        -- 4. JSON DETECTION
-        TRUNCATE TABLE #PatternStaging;
-        
-        SET @SQL = N'
-        INSERT INTO #PatternStaging (ColumnName, PatternType, MatchCount, TotalCount, AvgLen, MaxLen)
-        SELECT 
-            ''' + @ColumnName + ''',
-            ''JSON Data'',
-            SUM(CASE WHEN ISJSON(' + QUOTENAME(@ColumnName) + ') = 1 THEN 1 ELSE 0 END),
-            COUNT(*),
-            AVG(LEN(' + QUOTENAME(@ColumnName) + ')),
-            MAX(LEN(' + QUOTENAME(@ColumnName) + '))
-        FROM ' + @FullTableName + '
-        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL;';
-        
-        EXEC sp_executesql @SQL;
-        
-        -- Update percentage
-        UPDATE #PatternStaging 
-        SET MatchPercentage = CASE WHEN TotalCount > 0 THEN CAST(MatchCount * 100.0 / TotalCount AS DECIMAL(5,2)) ELSE 0 END
-        WHERE PatternType = 'JSON Data';
-        
-        -- Insert into results if meets threshold
-        INSERT INTO #AnalysisResults (ColumnName, CurrentDataType, PatternType, MatchCount, TotalNonNullCount, MatchPercentage,
-                                     SuggestedDataType, AvgLength, MaxLength, ConversionNotes)
-        SELECT 
-            ColumnName,
-            @DataType,
-            PatternType,
-            MatchCount,
-            TotalCount,
-            MatchPercentage,
-            'NVARCHAR(MAX) CHECK(ISJSON(column)=1)',
-            AvgLen,
-            MaxLen,
-            'Valid JSON documents found'
-        FROM #PatternStaging
-        WHERE PatternType = 'JSON Data' 
-          AND MatchCount > 0 
-          AND MatchPercentage >= @MinPercentageForFinding;
-        
-        -- Get sample JSON (first few characters only)
-        SET @SQL = N'
-        DECLARE @Samples NVARCHAR(MAX);
-        SELECT @Samples = STUFF((
-            SELECT TOP 3 ''; '' + LEFT(' + QUOTENAME(@ColumnName) + ', 50) + ''...''
-            FROM ' + @FullTableName + '
-            WHERE ISJSON(' + QUOTENAME(@ColumnName) + ') = 1
-              AND ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-            FOR XML PATH(''''), TYPE
-        ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, '''');
-        
-        UPDATE #AnalysisResults 
-        SET SampleValues = @Samples
-        WHERE ColumnName = ''' + @ColumnName + ''' AND PatternType = ''JSON Data'';';
-        
-        EXEC sp_executesql @SQL;
-        
-    END TRY
-    BEGIN CATCH
-        SET @ErrorMessage = 'Error analyzing column ' + @ColumnName + ': ' + ERROR_MESSAGE();
-        PRINT @ErrorMessage;
-    END CATCH;
-    
-    FETCH NEXT FROM column_cursor INTO @ColumnName, @DataType;
-END
-
-CLOSE column_cursor;
-DEALLOCATE column_cursor;
-
--- Display comprehensive results
-PRINT '';
-PRINT '========================================';
-PRINT 'ANALYSIS COMPLETE - SUMMARY OF FINDINGS';
-PRINT '========================================';
-PRINT '';
-
--- Summary by pattern type
-PRINT 'PATTERN SUMMARY:';
-PRINT '================';
-SELECT 
-    PatternType,
-    COUNT(DISTINCT ColumnName) AS ColumnsAffected,
-    SUM(MatchCount) AS TotalMatches,
-    CAST(AVG(MatchPercentage) AS DECIMAL(5,2)) AS AvgMatchPercent
-FROM #AnalysisResults
-GROUP BY PatternType
-ORDER BY COUNT(DISTINCT ColumnName) DESC;
-
--- Detailed findings by column
-PRINT '';
-PRINT 'DETAILED FINDINGS BY COLUMN:';
-PRINT '============================';
-
-SELECT 
-    ColumnName,
-    CurrentDataType,
-    PatternType,
-    CAST(MatchPercentage AS VARCHAR(10)) + '%' AS MatchPct,
-    CAST(MatchCount AS VARCHAR(20)) + '/' + CAST(TotalNonNullCount AS VARCHAR(20)) AS MatchRatio,
-    SuggestedDataType,
-    CASE WHEN AvgLength IS NOT NULL THEN 'Avg Len: ' + CAST(AvgLength AS VARCHAR(10)) ELSE '' END AS AvgLen,
-    CASE WHEN MaxLength IS NOT NULL THEN 'Max Len: ' + CAST(MaxLength AS VARCHAR(10)) ELSE '' END AS MaxLen,
-    LEFT(ISNULL(SampleValues, ''), 200) AS Samples,
-    ISNULL(ConversionNotes, '') AS Notes
-FROM #AnalysisResults
-ORDER BY ColumnName, MatchPercentage DESC;
-
--- High confidence recommendations (90%+ match)
-PRINT '';
-PRINT 'HIGH CONFIDENCE RECOMMENDATIONS (90%+ Match):';
-PRINT '============================================';
-
-SELECT 
-    'ALTER TABLE ' + @FullTableName + ' ALTER COLUMN ' + QUOTENAME(ColumnName) + ' ' + SuggestedDataType AS ConversionScript,
-    PatternType,
-    CAST(MatchPercentage AS VARCHAR(10)) + '%' AS Confidence,
-    ConversionNotes
-FROM #AnalysisResults
-WHERE MatchPercentage >= 90
-ORDER BY MatchPercentage DESC, ColumnName;
-
--- Data quality issues
-PRINT '';
-PRINT 'DATA QUALITY OBSERVATIONS:';
-PRINT '=========================';
-
-SELECT 
-    ColumnName,
-    PatternType,
-    'Found ' + CAST(MatchCount AS VARCHAR(20)) + ' matching values out of ' + 
-    CAST(TotalNonNullCount AS VARCHAR(20)) + ' (' + CAST(MatchPercentage AS VARCHAR(10)) + '%)' AS Finding,
-    CASE 
-        WHEN MatchPercentage < 100 AND MatchPercentage >= 50 
-        THEN 'Consider data cleansing before conversion'
-        WHEN MatchPercentage < 50 
-        THEN 'Low match rate - verify pattern detection'
-        ELSE 'Ready for conversion'
-    END AS Recommendation
-FROM #AnalysisResults
-WHERE MatchPercentage < 100
-ORDER BY MatchPercentage ASC;
-
--- Export results to a table if needed
-PRINT '';
-PRINT 'To export results, use:';
-PRINT 'SELECT * FROM #AnalysisResults';
-
--- Clean up
-DROP TABLE #PatternStaging;
-DROP TABLE #ColumnInfo;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/*------------------------------------------------------------------------------------------------------------*/
-
-
-/*
-=====================================================
-COMPREHENSIVE STATISTICAL PROFILING ANALYSIS SCRIPT
-Enhanced Version with Better Edge Case Handling
-Fixed: Subquery Context Error
-=====================================================
-Performs statistical analysis on table data including:
-- Distribution analysis (normal, skewed, bimodal)
-- Outlier detection
-- Frequency distributions
-- Percentile analysis
-- Standard deviation & variance
-- Correlation analysis
-- Seasonality patterns
-=====================================================
-*/
-
--- CONFIGURATION - MODIFY THESE PARAMETERS
-DECLARE @TableName NVARCHAR(500) = 'dbo.YourTableName'; -- Format: [schema].[table] or [server].[database].[schema].[table]
-DECLARE @TopFrequencyItems INT = 10; -- Number of most/least frequent values to show
-DECLARE @OutlierStdDevs DECIMAL(3,1) = 3.0; -- Number of standard deviations for outlier detection
-DECLARE @CorrelationThreshold DECIMAL(3,2) = 0.30; -- Minimum correlation to report (absolute value)
-DECLARE @MinRowsForStats INT = 10; -- Minimum rows needed for statistical calculations
-DECLARE @DebugMode BIT = 1; -- Set to 1 for detailed debug output
-DECLARE @ForceAnalysis BIT = 1; -- Set to 1 to analyze tables with few rows (with warnings)
-
--- Variables
-DECLARE @SQL NVARCHAR(MAX);
-DECLARE @TotalRows BIGINT = 0;
-DECLARE @ColumnName NVARCHAR(128);
-DECLARE @DataType NVARCHAR(50);
-DECLARE @ErrorMessage NVARCHAR(4000);
-DECLARE @FullTableName NVARCHAR(500) = @TableName;
-DECLARE @AnalysisPerformed BIT = 0;
-DECLARE @ColumnCount INT = 0;
-
--- Initialize results tables
-IF OBJECT_ID('tempdb..#StatisticalResults') IS NOT NULL
-    DROP TABLE #StatisticalResults;
-
-CREATE TABLE #StatisticalResults (
-    AnalysisType NVARCHAR(50),
-    ColumnName NVARCHAR(128),
-    Metric NVARCHAR(100),
-    MetricValue NVARCHAR(MAX),
-    NumericValue DECIMAL(20,6),
-    Details NVARCHAR(MAX),
-    InsightLevel NVARCHAR(20), -- 'Critical', 'High', 'Medium', 'Low'
-    Timestamp DATETIME DEFAULT GETDATE()
-);
-
-IF OBJECT_ID('tempdb..#ColumnInfo') IS NOT NULL
-    DROP TABLE #ColumnInfo;
-
-CREATE TABLE #ColumnInfo (
-    ColumnName NVARCHAR(128),
-    DataType NVARCHAR(50),
-    IsNumeric BIT,
-    IsDate BIT,
-    ColumnPosition INT,
-    NonNullCount INT DEFAULT 0,
-    NullCount INT DEFAULT 0
-);
-
-IF OBJECT_ID('tempdb..#NumericStats') IS NOT NULL
-    DROP TABLE #NumericStats;
-
-CREATE TABLE #NumericStats (
-    ColumnName NVARCHAR(128),
-    RecordCount INT,
-    MinValue DECIMAL(20,6),
-    MaxValue DECIMAL(20,6),
-    AvgValue DECIMAL(20,6),
-    StdDev DECIMAL(20,6),
-    Variance DECIMAL(20,6),
-    Skewness DECIMAL(20,6),
-    Kurtosis DECIMAL(20,6),
-    P25 DECIMAL(20,6),
-    P50 DECIMAL(20,6),
-    P75 DECIMAL(20,6),
-    P95 DECIMAL(20,6),
-    IQR DECIMAL(20,6),
-    OutlierCountLow INT,
-    OutlierCountHigh INT
-);
-
--- Diagnostic information table
-IF OBJECT_ID('tempdb..#DiagnosticInfo') IS NOT NULL
-    DROP TABLE #DiagnosticInfo;
-
-CREATE TABLE #DiagnosticInfo (
-    DiagnosticType NVARCHAR(50),
-    Message NVARCHAR(MAX),
-    Timestamp DATETIME DEFAULT GETDATE()
-);
-
--- Temporary table for frequency data
-IF OBJECT_ID('tempdb..#FrequencyData') IS NOT NULL
-    DROP TABLE #FrequencyData;
-
-CREATE TABLE #FrequencyData (
-    ColumnName NVARCHAR(128),
-    Value NVARCHAR(100),
-    Frequency INT,
-    Percentage DECIMAL(10,2),
-    FreqRank INT
-);
-
-PRINT '========================================';
-PRINT 'STATISTICAL PROFILING: ' + @FullTableName;
-PRINT '========================================';
-PRINT '';
-
--- Check if table exists
-BEGIN TRY
-    IF OBJECT_ID(@FullTableName) IS NULL
-    BEGIN
-        INSERT INTO #DiagnosticInfo (DiagnosticType, Message)
-        VALUES ('ERROR', 'Table ' + @FullTableName + ' does not exist.');
-        
-        PRINT 'ERROR: Table ' + @FullTableName + ' does not exist.';
-        GOTO EndScript;
-    END
-END TRY
-BEGIN CATCH
-    INSERT INTO #DiagnosticInfo (DiagnosticType, Message)
-    VALUES ('ERROR', 'Error checking table existence: ' + ERROR_MESSAGE());
-    
-    PRINT 'Error checking table existence: ' + ERROR_MESSAGE();
-    GOTO EndScript;
-END CATCH;
-
--- Get total row count
-BEGIN TRY
-    SET @SQL = N'SELECT @Count = COUNT(*) FROM ' + @FullTableName;
-    EXEC sp_executesql @SQL, N'@Count BIGINT OUTPUT', @Count = @TotalRows OUTPUT;
-    
-    INSERT INTO #DiagnosticInfo (DiagnosticType, Message)
-    VALUES ('INFO', 'Total rows in table: ' + CAST(@TotalRows AS VARCHAR(20)));
-    
-    PRINT 'Total Rows: ' + CAST(@TotalRows AS VARCHAR(20));
-    
-    IF @TotalRows = 0
-    BEGIN
-        INSERT INTO #DiagnosticInfo (DiagnosticType, Message)
-        VALUES ('WARNING', 'Table is empty. No statistics can be generated.');
-        
-        PRINT 'WARNING: Table is empty. No statistics can be generated.';
-        GOTO EndScript;
-    END
-    ELSE IF @TotalRows < @MinRowsForStats AND @ForceAnalysis = 0
-    BEGIN
-        INSERT INTO #DiagnosticInfo (DiagnosticType, Message)
-        VALUES ('WARNING', 'Table has only ' + CAST(@TotalRows AS VARCHAR(20)) + ' rows. Minimum ' + CAST(@MinRowsForStats AS VARCHAR(10)) + ' rows required. Set @ForceAnalysis = 1 to analyze anyway.');
-        
-        PRINT 'WARNING: Table has only ' + CAST(@TotalRows AS VARCHAR(20)) + ' rows.';
-        PRINT 'Minimum ' + CAST(@MinRowsForStats AS VARCHAR(10)) + ' rows required for meaningful statistical analysis.';
-        PRINT 'Set @ForceAnalysis = 1 to analyze anyway.';
-        GOTO EndScript;
-    END
-    ELSE IF @TotalRows < @MinRowsForStats AND @ForceAnalysis = 1
-    BEGIN
-        INSERT INTO #DiagnosticInfo (DiagnosticType, Message)
-        VALUES ('WARNING', 'Analyzing table with only ' + CAST(@TotalRows AS VARCHAR(20)) + ' rows. Statistics may not be meaningful.');
-        
-        PRINT 'WARNING: Analyzing table with only ' + CAST(@TotalRows AS VARCHAR(20)) + ' rows.';
-        PRINT 'Statistics may not be meaningful with such a small sample size.';
-        PRINT '';
-    END;
-END TRY
-BEGIN CATCH
-    INSERT INTO #DiagnosticInfo (DiagnosticType, Message)
-    VALUES ('ERROR', 'Error getting row count: ' + ERROR_MESSAGE());
-    
-    PRINT 'Error getting row count: ' + ERROR_MESSAGE();
-    GOTO EndScript;
-END CATCH;
-
--- Get column information with NULL counts
-BEGIN TRY
-    SET @SQL = N'
-    INSERT INTO #ColumnInfo (ColumnName, DataType, IsNumeric, IsDate, ColumnPosition)
-    SELECT 
-        c.name AS ColumnName,
-        t.name + CASE 
-            WHEN t.name IN (''varchar'', ''nvarchar'', ''char'', ''nchar'') 
-            THEN ''('' + CASE WHEN c.max_length = -1 THEN ''MAX'' 
-                         WHEN t.name LIKE ''n%'' THEN CAST(c.max_length/2 AS VARCHAR(10))
-                         ELSE CAST(c.max_length AS VARCHAR(10)) END + '')''
-            WHEN t.name IN (''decimal'', ''numeric'') 
-            THEN ''('' + CAST(c.precision AS VARCHAR(10)) + '','' + CAST(c.scale AS VARCHAR(10)) + '')''
-            ELSE ''''
-        END AS DataType,
-        CASE WHEN t.name IN (''int'', ''bigint'', ''smallint'', ''tinyint'', ''decimal'', ''numeric'', ''float'', ''real'', ''money'', ''smallmoney'') THEN 1 ELSE 0 END,
-        CASE WHEN t.name IN (''date'', ''datetime'', ''datetime2'', ''smalldatetime'', ''time'') THEN 1 ELSE 0 END,
-        c.column_id
-    FROM sys.columns c
-    JOIN sys.types t ON c.user_type_id = t.user_type_id
-    WHERE c.object_id = OBJECT_ID(''' + @FullTableName + ''')
-    ORDER BY c.column_id;';
-    
-    EXEC sp_executesql @SQL;
-    
-    SELECT @ColumnCount = COUNT(*) FROM #ColumnInfo;
-    
-    INSERT INTO #DiagnosticInfo (DiagnosticType, Message)
-    VALUES ('INFO', 'Found ' + CAST(@ColumnCount AS VARCHAR(10)) + ' columns in table.');
-    
-    IF @ColumnCount = 0
-    BEGIN
-        INSERT INTO #DiagnosticInfo (DiagnosticType, Message)
-        VALUES ('ERROR', 'No columns found in table. Check table name and permissions.');
-        
-        PRINT 'ERROR: No columns found in table. Check table name and permissions.';
-        GOTO EndScript;
-    END;
-    
-    -- Update NULL counts for each column
-    DECLARE null_cursor CURSOR FOR
-        SELECT ColumnName FROM #ColumnInfo;
-    
-    OPEN null_cursor;
-    FETCH NEXT FROM null_cursor INTO @ColumnName;
-    
-    WHILE @@FETCH_STATUS = 0
-    BEGIN
-        DECLARE @NonNullCount INT, @NullCount INT;
-        
-        -- Get counts using variables instead of subqueries
-        SET @SQL = N'
-        SELECT 
-            @NonNull = COUNT(' + QUOTENAME(@ColumnName) + '),
-            @Null = COUNT(*) - COUNT(' + QUOTENAME(@ColumnName) + ')
-        FROM ' + @FullTableName;
-        
-        EXEC sp_executesql @SQL, 
-            N'@NonNull INT OUTPUT, @Null INT OUTPUT', 
-            @NonNull = @NonNullCount OUTPUT, 
-            @Null = @NullCount OUTPUT;
-        
-        -- Update the table with the retrieved values
-        UPDATE #ColumnInfo 
-        SET NonNullCount = @NonNullCount,
-            NullCount = @NullCount
-        WHERE ColumnName = @ColumnName;
-        
-        FETCH NEXT FROM null_cursor INTO @ColumnName;
-    END;
-    
-    CLOSE null_cursor;
-    DEALLOCATE null_cursor;
-    
-    -- Log columns with all NULL values
-    INSERT INTO #DiagnosticInfo (DiagnosticType, Message)
-    SELECT 
-        'WARNING',
-        'Column [' + ColumnName + '] contains only NULL values.'
-    FROM #ColumnInfo
-    WHERE NonNullCount = 0;
-    
-END TRY
-BEGIN CATCH
-    INSERT INTO #DiagnosticInfo (DiagnosticType, Message)
-    VALUES ('ERROR', 'Error getting column information: ' + ERROR_MESSAGE());
-    
-    PRINT 'Error getting column information: ' + ERROR_MESSAGE();
-    GOTO EndScript;
-END CATCH;
-
--- Add basic table overview to results
-INSERT INTO #StatisticalResults (AnalysisType, ColumnName, Metric, MetricValue, NumericValue, Details, InsightLevel)
-VALUES 
-    ('Table Overview', 'Table', 'Total Rows', CAST(@TotalRows AS VARCHAR(20)), @TotalRows, 'Total number of rows in the table', 'Low'),
-    ('Table Overview', 'Table', 'Total Columns', CAST(@ColumnCount AS VARCHAR(10)), @ColumnCount, 'Total number of columns in the table', 'Low');
-
--- Add column summary
-INSERT INTO #StatisticalResults (AnalysisType, ColumnName, Metric, MetricValue, NumericValue, Details, InsightLevel)
-SELECT 
-    'Column Overview',
-    ColumnName,
-    'Data Completeness',
-    CAST(ROUND(NonNullCount * 100.0 / NULLIF(@TotalRows, 0), 2) AS VARCHAR(10)) + '% Complete',
-    NonNullCount * 100.0 / NULLIF(@TotalRows, 0),
-    'Non-NULL: ' + CAST(NonNullCount AS VARCHAR(20)) + ', NULL: ' + CAST(NullCount AS VARCHAR(20)) + 
-    ', Data Type: ' + DataType,
-    CASE 
-        WHEN NonNullCount = 0 THEN 'Critical'
-        WHEN NonNullCount < @TotalRows * 0.5 THEN 'High'
-        WHEN NonNullCount < @TotalRows * 0.9 THEN 'Medium'
-        ELSE 'Low'
-    END
-FROM #ColumnInfo
-ORDER BY ColumnPosition;
-
--- 1. NUMERIC STATISTICS AND DISTRIBUTION ANALYSIS
-PRINT 'Analyzing Numeric Distributions...';
-
-DECLARE numeric_cursor CURSOR FOR
-    SELECT ColumnName, DataType
-    FROM #ColumnInfo
-    WHERE IsNumeric = 1 AND NonNullCount > 0
-    ORDER BY ColumnPosition;
-
-OPEN numeric_cursor;
-FETCH NEXT FROM numeric_cursor INTO @ColumnName, @DataType;
-
-WHILE @@FETCH_STATUS = 0
-BEGIN
-    BEGIN TRY
-        -- Calculate comprehensive statistics
-        SET @SQL = N'
-        WITH NumericData AS (
-            SELECT 
-                CAST(' + QUOTENAME(@ColumnName) + ' AS DECIMAL(20,6)) as Value,
-                COUNT(*) OVER() as TotalCount
-            FROM ' + @FullTableName + '
-            WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-        ),
-        BasicStats AS (
-            SELECT 
-                COUNT(*) as N,
-                MIN(Value) as MinVal,
-                MAX(Value) as MaxVal,
-                AVG(Value) as AvgVal,
-                CASE WHEN COUNT(*) > 1 THEN STDEV(Value) ELSE 0 END as StdDev,
-                CASE WHEN COUNT(*) > 1 THEN VAR(Value) ELSE 0 END as Variance
-            FROM NumericData
-        ),
-        PercentileData AS (
-            SELECT DISTINCT
-                PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY Value) OVER() as P25,
-                PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY Value) OVER() as P50,
-                PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Value) OVER() as P75,
-                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY Value) OVER() as P95
-            FROM NumericData
-        ),
-        SkewKurtosis AS (
-            SELECT 
-                -- Skewness = E[(X-μ)³] / σ³
-                CASE 
-                    WHEN StdDev > 0 AND COUNT(*) > 2 
-                    THEN AVG(POWER((Value - AvgVal) / StdDev, 3)) 
-                    ELSE 0 
-                END as Skewness,
-                -- Kurtosis = E[(X-μ)⁴] / σ⁴ - 3
-                CASE 
-                    WHEN StdDev > 0 AND COUNT(*) > 3 
-                    THEN AVG(POWER((Value - AvgVal) / StdDev, 4)) - 3 
-                    ELSE 0 
-                END as Kurtosis
-            FROM NumericData
-            CROSS JOIN BasicStats
-            GROUP BY StdDev
-        ),
-        OutlierCounts AS (
-            SELECT 
-                SUM(CASE WHEN StdDev > 0 AND Value < (AvgVal - ' + CAST(@OutlierStdDevs AS VARCHAR(10)) + ' * StdDev) THEN 1 ELSE 0 END) as OutlierLow,
-                SUM(CASE WHEN StdDev > 0 AND Value > (AvgVal + ' + CAST(@OutlierStdDevs AS VARCHAR(10)) + ' * StdDev) THEN 1 ELSE 0 END) as OutlierHigh
-            FROM NumericData
-            CROSS JOIN BasicStats
-        )
-        INSERT INTO #NumericStats
-        SELECT 
-            ''' + @ColumnName + ''',
-            bs.N,
-            bs.MinVal,
-            bs.MaxVal,
-            bs.AvgVal,
-            bs.StdDev,
-            bs.Variance,
-            ISNULL(sk.Skewness, 0),
-            ISNULL(sk.Kurtosis, 0),
-            pd.P25,
-            pd.P50,
-            pd.P75,
-            pd.P95,
-            pd.P75 - pd.P25,
-            ISNULL(oc.OutlierLow, 0),
-            ISNULL(oc.OutlierHigh, 0)
-        FROM BasicStats bs
-        CROSS JOIN PercentileData pd
-        LEFT JOIN SkewKurtosis sk ON 1=1
-        LEFT JOIN OutlierCounts oc ON 1=1;';
-        
-        EXEC sp_executesql @SQL;
-        SET @AnalysisPerformed = 1;
-        
-        -- Insert distribution analysis results
-        INSERT INTO #StatisticalResults (AnalysisType, ColumnName, Metric, MetricValue, NumericValue, Details, InsightLevel)
-        SELECT 
-            'Distribution Analysis',
-            ColumnName,
-            'Distribution Type',
-            CASE 
-                WHEN RecordCount < 10 THEN 'Insufficient Data'
-                WHEN ABS(Skewness) < 0.5 AND ABS(Kurtosis) < 1 THEN 'Normal Distribution'
-                WHEN Skewness > 1 THEN 'Right Skewed (Positive)'
-                WHEN Skewness < -1 THEN 'Left Skewed (Negative)'
-                WHEN ABS(Skewness) BETWEEN 0.5 AND 1 THEN 'Moderately Skewed'
-                WHEN Kurtosis > 3 THEN 'Leptokurtic (Heavy Tails)'
-                WHEN Kurtosis < -1 THEN 'Platykurtic (Light Tails)'
-                ELSE 'Approximately Normal'
-            END,
-            Skewness,
-            'Skewness: ' + CAST(ROUND(Skewness, 3) AS VARCHAR(20)) + 
-            ', Kurtosis: ' + CAST(ROUND(Kurtosis, 3) AS VARCHAR(20)) +
-            ', StdDev: ' + CAST(ROUND(StdDev, 3) AS VARCHAR(20)) +
-            ', Sample Size: ' + CAST(RecordCount AS VARCHAR(20)),
-            CASE 
-                WHEN RecordCount < 10 THEN 'Low'
-                WHEN ABS(Skewness) > 2 OR ABS(Kurtosis) > 7 THEN 'High'
-                WHEN ABS(Skewness) > 1 OR ABS(Kurtosis) > 3 THEN 'Medium'
-                ELSE 'Low'
-            END
-        FROM #NumericStats
-        WHERE ColumnName = @ColumnName;
-        
-        -- Insert outlier analysis
-        INSERT INTO #StatisticalResults (AnalysisType, ColumnName, Metric, MetricValue, NumericValue, Details, InsightLevel)
-        SELECT 
-            'Outlier Detection',
-            ColumnName,
-            'Outliers (' + CAST(@OutlierStdDevs AS VARCHAR(10)) + ' StdDev)',
-            CAST(OutlierCountLow + OutlierCountHigh AS VARCHAR(20)) + ' outliers',
-            OutlierCountLow + OutlierCountHigh,
-            'Low outliers: ' + CAST(OutlierCountLow AS VARCHAR(20)) + 
-            CASE 
-                WHEN StdDev > 0 THEN ' (< ' + CAST(ROUND(AvgValue - @OutlierStdDevs * StdDev, 2) AS VARCHAR(20)) + ')'
-                ELSE ' (StdDev = 0)'
-            END +
-            ', High outliers: ' + CAST(OutlierCountHigh AS VARCHAR(20)) + 
-            CASE 
-                WHEN StdDev > 0 THEN ' (> ' + CAST(ROUND(AvgValue + @OutlierStdDevs * StdDev, 2) AS VARCHAR(20)) + ')'
-                ELSE ' (StdDev = 0)'
-            END,
-            CASE 
-                WHEN RecordCount = 0 THEN 'Low'
-                WHEN (OutlierCountLow + OutlierCountHigh) > RecordCount * 0.05 THEN 'Critical'
-                WHEN (OutlierCountLow + OutlierCountHigh) > RecordCount * 0.01 THEN 'High'
-                WHEN (OutlierCountLow + OutlierCountHigh) > 0 THEN 'Medium'
-                ELSE 'Low'
-            END
-        FROM #NumericStats
-        WHERE ColumnName = @ColumnName;
-        
-        -- Insert percentile analysis
-        INSERT INTO #StatisticalResults (AnalysisType, ColumnName, Metric, MetricValue, NumericValue, Details, InsightLevel)
-        SELECT 
-            'Percentile Analysis',
-            ColumnName,
-            'Percentiles',
-            'Median: ' + CAST(ROUND(P50, 2) AS VARCHAR(20)),
-            P50,
-            'P25: ' + CAST(ROUND(P25, 2) AS VARCHAR(20)) + 
-            ', P50: ' + CAST(ROUND(P50, 2) AS VARCHAR(20)) + 
-            ', P75: ' + CAST(ROUND(P75, 2) AS VARCHAR(20)) + 
-            ', P95: ' + CAST(ROUND(P95, 2) AS VARCHAR(20)) + 
-            ', IQR: ' + CAST(ROUND(IQR, 2) AS VARCHAR(20)),
-            'Low'
-        FROM #NumericStats
-        WHERE ColumnName = @ColumnName;
-        
-    END TRY
-    BEGIN CATCH
-        INSERT INTO #DiagnosticInfo (DiagnosticType, Message)
-        VALUES ('ERROR', 'Numeric analysis error for ' + @ColumnName + ': ' + ERROR_MESSAGE());
-        
-        IF @DebugMode = 1 PRINT 'Numeric analysis error for ' + @ColumnName + ': ' + ERROR_MESSAGE();
-    END CATCH;
-    
-    FETCH NEXT FROM numeric_cursor INTO @ColumnName, @DataType;
-END;
-
-CLOSE numeric_cursor;
-DEALLOCATE numeric_cursor;
-
--- 2. FREQUENCY DISTRIBUTION ANALYSIS (for all columns with data)
-PRINT 'Analyzing Frequency Distributions...';
-
-DECLARE freq_cursor CURSOR FOR
-    SELECT ColumnName, DataType
-    FROM #ColumnInfo
-    WHERE NonNullCount > 0
-    ORDER BY ColumnPosition;
-
-OPEN freq_cursor;
-FETCH NEXT FROM freq_cursor INTO @ColumnName, @DataType;
-
-WHILE @@FETCH_STATUS = 0
-BEGIN
-    BEGIN TRY
-        -- First, collect frequency data into temporary table
-        TRUNCATE TABLE #FrequencyData;
-        
-        SET @SQL = N'
-        INSERT INTO #FrequencyData (ColumnName, Value, Frequency, Percentage, FreqRank)
-        SELECT TOP ' + CAST(@TopFrequencyItems AS VARCHAR(10)) + '
-            ''' + @ColumnName + ''',
-            CAST(' + QUOTENAME(@ColumnName) + ' AS NVARCHAR(100)) as Value,
-            COUNT(*) as Frequency,
-            COUNT(*) * 100.0 / ' + CAST(@TotalRows AS VARCHAR(20)) + ' as Percentage,
-            DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) as FreqRank
-        FROM ' + @FullTableName + '
-        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-        GROUP BY ' + QUOTENAME(@ColumnName) + '
-        ORDER BY COUNT(*) DESC;';
-        
-        EXEC sp_executesql @SQL;
-        
-        -- Now insert the aggregated results
-        DECLARE @TopValue NVARCHAR(100);
-        DECLARE @TopFrequency INT;
-        DECLARE @TopPercentage DECIMAL(10,2);
-        DECLARE @FreqDetails NVARCHAR(MAX);
-        
-        -- Get top value
-        SELECT TOP 1 
-            @TopValue = Value,
-            @TopFrequency = Frequency,
-            @TopPercentage = Percentage
-        FROM #FrequencyData
-        WHERE ColumnName = @ColumnName
-        ORDER BY Frequency DESC;
-        
-        -- Build frequency details string
-        SELECT @FreqDetails = STRING_AGG(
-            Value + ' (' + CAST(Frequency AS VARCHAR(20)) + ', ' + 
-            CAST(ROUND(Percentage, 2) AS VARCHAR(10)) + '%)', '; '
-        )
-        FROM (
-            SELECT TOP (@TopFrequencyItems) Value, Frequency, Percentage
-            FROM #FrequencyData
-            WHERE ColumnName = @ColumnName
-            ORDER BY Frequency DESC
-        ) t;
-        
-        -- Insert frequency distribution results
-        INSERT INTO #StatisticalResults (AnalysisType, ColumnName, Metric, MetricValue, NumericValue, Details, InsightLevel)
-        VALUES (
-            'Frequency Distribution',
-            @ColumnName,
-            'Most Common Values',
-            'Top value: ' + ISNULL(@TopValue, 'N/A'),
-            ISNULL(@TopFrequency, 0),
-            ISNULL(@FreqDetails, 'No data'),
-            CASE 
-                WHEN @TopPercentage > 50 THEN 'High'
-                WHEN @TopPercentage > 20 THEN 'Medium'
-                ELSE 'Low'
-            END
+        -- Step 1: Get column information from linked server
+        CREATE TABLE #ColumnInfo (
+            COLUMN_NAME NVARCHAR(128),
+            DATA_TYPE NVARCHAR(128),
+            IS_XML BIT DEFAULT 0
         );
         
-        SET @AnalysisPerformed = 1;
-        
-        -- Unique value count
+        -- Query the linked server's information schema
         SET @SQL = N'
-        WITH UniqueCount AS (
-            SELECT COUNT(DISTINCT ' + QUOTENAME(@ColumnName) + ') as UniqueValues
-            FROM ' + @FullTableName + '
-            WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-        )
-        INSERT INTO #StatisticalResults (AnalysisType, ColumnName, Metric, MetricValue, NumericValue, Details, InsightLevel)
-        SELECT 
-            ''Frequency Distribution'',
-            ''' + @ColumnName + ''',
-            ''Unique Values'',
-            CAST(UniqueValues AS VARCHAR(20)) + '' unique values'',
-            UniqueValues,
-            ''Cardinality: '' + CAST(ROUND(UniqueValues * 100.0 / NULLIF(' + CAST(@TotalRows AS VARCHAR(20)) + ', 0), 2) AS VARCHAR(10)) + ''%'',
-            CASE 
-                WHEN UniqueValues = ' + CAST(@TotalRows AS VARCHAR(20)) + ' THEN ''High''
-                WHEN UniqueValues > ' + CAST(@TotalRows AS VARCHAR(20)) + ' * 0.9 THEN ''Medium''
-                ELSE ''Low''
-            END
-        FROM UniqueCount;';
+        INSERT INTO #ColumnInfo (COLUMN_NAME, DATA_TYPE)
+        SELECT COLUMN_NAME, DATA_TYPE
+        FROM OPENQUERY(' + QUOTENAME(@LinkedServerName) + ', 
+            ''SELECT COLUMN_NAME, DATA_TYPE 
+             FROM ' + @DatabaseName + '.INFORMATION_SCHEMA.COLUMNS 
+             WHERE TABLE_SCHEMA = ''''' + @SchemaName + ''''' 
+             AND TABLE_NAME = ''''' + @TableName + ''''''')';
         
+        IF @Debug = 1
+            PRINT 'Getting column info: ' + @SQL;
+            
+        EXEC sp_executesql @SQL;
+        
+        -- Mark XML columns
+        UPDATE #ColumnInfo 
+        SET IS_XML = 1 
+        WHERE DATA_TYPE = 'xml';
+        
+        -- Step 2: Build dynamic column list with XML conversion
+        SELECT @ColumnList = @ColumnList + 
+            CASE 
+                WHEN IS_XML = 1 THEN 
+                    'CAST(' + QUOTENAME(COLUMN_NAME) + ' AS NVARCHAR(MAX)) AS ' + QUOTENAME(COLUMN_NAME)
+                ELSE 
+                    QUOTENAME(COLUMN_NAME)
+            END + ', '
+        FROM #ColumnInfo;
+        
+        -- Remove trailing comma
+        SET @ColumnList = LEFT(@ColumnList, LEN(@ColumnList) - 1);
+        
+        IF @Debug = 1
+        BEGIN
+            PRINT 'Column list generated: ' + @ColumnList;
+            SELECT * FROM #ColumnInfo;
+        END
+        
+        -- Step 3: Execute the query with converted columns
+        IF @OutputTable IS NOT NULL
+        BEGIN
+            -- Drop temp table if exists
+            SET @SQL = 'IF OBJECT_ID(''' + @OutputTable + ''', ''U'') IS NOT NULL DROP TABLE ' + @OutputTable;
+            EXEC sp_executesql @SQL;
+            
+            -- Create and populate output table
+            SET @SQL = N'
+            SELECT ' + @ColumnList + '
+            INTO ' + @OutputTable + '
+            FROM OPENQUERY(' + QUOTENAME(@LinkedServerName) + ', 
+                ''SELECT ' + @ColumnList + '
+                 FROM ' + @DatabaseName + '.' + @SchemaName + '.' + @TableName + ''')';
+        END
+        ELSE
+        BEGIN
+            -- Just select the data
+            SET @SQL = N'
+            SELECT *
+            FROM OPENQUERY(' + QUOTENAME(@LinkedServerName) + ', 
+                ''SELECT ' + @ColumnList + '
+                 FROM ' + @DatabaseName + '.' + @SchemaName + '.' + @TableName + ''')';
+        END
+        
+        IF @Debug = 1
+            PRINT 'Final query: ' + @SQL;
+            
+        EXEC sp_executesql @SQL;
+        
+        -- Cleanup
+        DROP TABLE #ColumnInfo;
+        
+    END TRY
+    BEGIN CATCH
+        -- Capture error details
+        SET @ErrorMessage = ERROR_MESSAGE();
+        SET @ErrorSeverity = ERROR_SEVERITY();
+        SET @ErrorState = ERROR_STATE();
+        
+        -- Cleanup if needed
+        IF OBJECT_ID('tempdb..#ColumnInfo') IS NOT NULL
+            DROP TABLE #ColumnInfo;
+        
+        -- Log error (optional - create error log table if needed)
+        IF OBJECT_ID('dbo.XMLConversionErrors', 'U') IS NOT NULL
+        BEGIN
+            INSERT INTO dbo.XMLConversionErrors (
+                ErrorDate, LinkedServer, DatabaseName, SchemaName, TableName,
+                ErrorMessage, ErrorSeverity, ErrorState
+            )
+            VALUES (
+                GETDATE(), @LinkedServerName, @DatabaseName, @SchemaName, @TableName,
+                @ErrorMessage, @ErrorSeverity, @ErrorState
+            );
+        END
+        
+        -- Re-raise the error
+        RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);
+    END CATCH
+END
+GO
+
+-- Helper procedure for single column conversion
+CREATE OR ALTER PROCEDURE [dbo].[sp_ConvertSingleXMLColumn]
+    @LinkedServerName NVARCHAR(128),
+    @FullTablePath NVARCHAR(500),  -- Format: Database.Schema.Table
+    @XMLColumnName NVARCHAR(128),
+    @WhereClause NVARCHAR(MAX) = '',
+    @ResultSet BIT = 1  -- 0 = Return as output parameter, 1 = Return as result set
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @SQL NVARCHAR(MAX);
+    DECLARE @ConvertedXML NVARCHAR(MAX);
+    
+    BEGIN TRY
+        IF @ResultSet = 1
+        BEGIN
+            -- Return as result set
+            SET @SQL = N'
+            SELECT CAST(' + QUOTENAME(@XMLColumnName) + ' AS NVARCHAR(MAX)) AS ConvertedXML
+            FROM OPENQUERY(' + QUOTENAME(@LinkedServerName) + ', 
+                ''SELECT CAST(' + @XMLColumnName + ' AS NVARCHAR(MAX)) AS ' + @XMLColumnName + '
+                 FROM ' + @FullTablePath + 
+                 CASE WHEN @WhereClause <> '' THEN ' WHERE ' + @WhereClause ELSE '' END + ''')';
+            
+            EXEC sp_executesql @SQL;
+        END
+        ELSE
+        BEGIN
+            -- Return as output parameter (for single row)
+            SET @SQL = N'
+            SELECT @ConvertedXML = ConvertedXML
+            FROM OPENQUERY(' + QUOTENAME(@LinkedServerName) + ', 
+                ''SELECT TOP 1 CAST(' + @XMLColumnName + ' AS NVARCHAR(MAX)) AS ConvertedXML
+                 FROM ' + @FullTablePath + 
+                 CASE WHEN @WhereClause <> '' THEN ' WHERE ' + @WhereClause ELSE '' END + ''')';
+            
+            EXEC sp_executesql @SQL, N'@ConvertedXML NVARCHAR(MAX) OUTPUT', @ConvertedXML OUTPUT;
+            
+            SELECT @ConvertedXML AS ConvertedXML;
+        END
+    END TRY
+    BEGIN CATCH
+        DECLARE @ErrorMessage NVARCHAR(4000) = ERROR_MESSAGE();
+        RAISERROR('Error converting XML column: %s', 16, 1, @ErrorMessage);
+    END CATCH
+END
+GO
+
+-- Create error logging table
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[XMLConversionErrors]') AND type in (N'U'))
+BEGIN
+    CREATE TABLE [dbo].[XMLConversionErrors](
+        [ErrorID] [int] IDENTITY(1,1) NOT NULL,
+        [ErrorDate] [datetime] NOT NULL,
+        [LinkedServer] [nvarchar](128) NULL,
+        [DatabaseName] [nvarchar](128) NULL,
+        [SchemaName] [nvarchar](128) NULL,
+        [TableName] [nvarchar](128) NULL,
+        [ErrorMessage] [nvarchar](4000) NULL,
+        [ErrorSeverity] [int] NULL,
+        [ErrorState] [int] NULL,
+        CONSTRAINT [PK_XMLConversionErrors] PRIMARY KEY CLUSTERED ([ErrorID] ASC)
+    );
+END
+GO
+
+-- Example usage procedure that calls the conversion procedure
+CREATE OR ALTER PROCEDURE [dbo].[sp_ProcessLinkedServerData]
+    @LinkedServerName NVARCHAR(128),
+    @ProcessingType NVARCHAR(50)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @TempTableName NVARCHAR(128) = '##XMLConverted_' + REPLACE(NEWID(), '-', '');
+    
+    BEGIN TRY
+        -- Call the XML conversion procedure at any point
+        EXEC [dbo].[sp_ConvertXMLToNVarchar] 
+            @LinkedServerName = @LinkedServerName,
+            @DatabaseName = 'YourDatabase',
+            @SchemaName = 'dbo',
+            @TableName = 'YourTableWithXML',
+            @OutputTable = @TempTableName,
+            @Debug = 0;
+        
+        -- Now process the converted data
+        DECLARE @SQL NVARCHAR(MAX);
+        SET @SQL = 'SELECT * FROM ' + @TempTableName + ' WHERE ProcessingType = @ProcessingType';
+        
+        EXEC sp_executesql @SQL, N'@ProcessingType NVARCHAR(50)', @ProcessingType;
+        
+        -- Cleanup
+        SET @SQL = 'DROP TABLE ' + @TempTableName;
         EXEC sp_executesql @SQL;
         
     END TRY
     BEGIN CATCH
-        INSERT INTO #DiagnosticInfo (DiagnosticType, Message)
-        VALUES ('ERROR', 'Frequency analysis error for ' + @ColumnName + ': ' + ERROR_MESSAGE());
+        -- Cleanup on error
+        IF OBJECT_ID(@TempTableName) IS NOT NULL
+        BEGIN
+            SET @SQL = 'DROP TABLE ' + @TempTableName;
+            EXEC sp_executesql @SQL;
+        END
         
-        IF @DebugMode = 1 PRINT 'Frequency analysis error for ' + @ColumnName + ': ' + ERROR_MESSAGE();
-    END CATCH;
-    
-    FETCH NEXT FROM freq_cursor INTO @ColumnName, @DataType;
-END;
-
-CLOSE freq_cursor;
-DEALLOCATE freq_cursor;
-
--- Check if any analysis was performed
-IF @AnalysisPerformed = 0
-BEGIN
-    INSERT INTO #DiagnosticInfo (DiagnosticType, Message)
-    VALUES ('WARNING', 'No statistical analysis could be performed. All columns may contain only NULL values.');
-    
-    PRINT '';
-    PRINT 'WARNING: No statistical analysis could be performed.';
-    PRINT 'Possible reasons:';
-    PRINT '  - All columns contain only NULL values';
-    PRINT '  - Data type issues preventing analysis';
-    PRINT '  - Insufficient permissions';
-    PRINT '';
-END;
-
--- SUMMARY REPORTS
-PRINT '';
-PRINT '========================================';
-PRINT 'STATISTICAL PROFILING COMPLETE';
-PRINT '========================================';
-PRINT '';
-
--- Show diagnostic information if any issues occurred
-IF EXISTS (SELECT 1 FROM #DiagnosticInfo WHERE DiagnosticType IN ('WARNING', 'ERROR'))
-BEGIN
-    PRINT 'DIAGNOSTIC INFORMATION:';
-    PRINT '======================';
-    
-    SELECT 
-        DiagnosticType,
-        Message,
-        Timestamp
-    FROM #DiagnosticInfo
-    WHERE DiagnosticType IN ('WARNING', 'ERROR')
-    ORDER BY Timestamp;
-    
-    PRINT '';
-END;
-
--- 1. Table Overview
-PRINT 'TABLE OVERVIEW:';
-PRINT '===============';
-
-SELECT 
-    Metric,
-    MetricValue,
-    Details
-FROM #StatisticalResults
-WHERE AnalysisType = 'Table Overview'
-ORDER BY Metric;
-
--- 2. Column Overview
-PRINT '';
-PRINT 'COLUMN OVERVIEW:';
-PRINT '================';
-
-SELECT 
-    ColumnName,
-    MetricValue as DataCompleteness,
-    Details
-FROM #StatisticalResults
-WHERE AnalysisType = 'Column Overview'
-ORDER BY NumericValue DESC, ColumnName;
-
--- Only show detailed statistics if we have data
-IF EXISTS (SELECT 1 FROM #StatisticalResults WHERE AnalysisType NOT IN ('Table Overview', 'Column Overview'))
-BEGIN
-    -- 3. Distribution Summary
-    IF EXISTS (SELECT 1 FROM #StatisticalResults WHERE AnalysisType = 'Distribution Analysis')
-    BEGIN
-        PRINT '';
-        PRINT 'DISTRIBUTION SUMMARY:';
-        PRINT '====================';
-
-        SELECT 
-            ColumnName,
-            MetricValue as DistributionType,
-            CAST(ROUND(NumericValue, 3) AS VARCHAR(20)) as Skewness,
-            LEFT(Details, 100) as [StatisticDetails]
-        FROM #StatisticalResults
-        WHERE AnalysisType = 'Distribution Analysis'
-          AND Metric = 'Distribution Type'
-        ORDER BY ABS(NumericValue) DESC;
-    END;
-
-    -- 4. Critical Insights
-    IF EXISTS (SELECT 1 FROM #StatisticalResults WHERE InsightLevel IN ('Critical', 'High'))
-    BEGIN
-        PRINT '';
-        PRINT 'CRITICAL INSIGHTS:';
-        PRINT '==================';
-
-        SELECT 
-            AnalysisType,
-            ColumnName,
-            Metric,
-            MetricValue,
-            LEFT(Details, 150) as Details
-        FROM #StatisticalResults
-        WHERE InsightLevel IN ('Critical', 'High')
-        ORDER BY 
-            CASE InsightLevel 
-                WHEN 'Critical' THEN 1 
-                WHEN 'High' THEN 2 
-            END,
-            AnalysisType,
-            ColumnName;
-    END;
-
-    -- 5. Numeric Column Statistics
-    IF EXISTS (SELECT 1 FROM #NumericStats)
-    BEGIN
-        PRINT '';
-        PRINT 'NUMERIC COLUMN STATISTICS:';
-        PRINT '=========================';
-
-        SELECT 
-            ColumnName,
-            RecordCount,
-            CAST(ROUND(MinValue, 2) AS VARCHAR(20)) as [Min],
-            CAST(ROUND(P25, 2) AS VARCHAR(20)) as Q1,
-            CAST(ROUND(P50, 2) AS VARCHAR(20)) as Median,
-            CAST(ROUND(P75, 2) AS VARCHAR(20)) as Q3,
-            CAST(ROUND(MaxValue, 2) AS VARCHAR(20)) as [Max],
-            CAST(ROUND(AvgValue, 2) AS VARCHAR(20)) as Mean,
-            CAST(ROUND(StdDev, 2) AS VARCHAR(20)) as StdDev,
-            CAST(ROUND(Skewness, 3) AS VARCHAR(20)) as Skewness,
-            OutlierCountLow + OutlierCountHigh as Outliers
-        FROM #NumericStats
-        ORDER BY ColumnName;
-    END;
+        -- Re-raise error
+        THROW;
+    END CATCH
 END
-ELSE
-BEGIN
-    PRINT '';
-    PRINT 'No detailed statistics available. Check diagnostic information above.';
-END;
-
--- Export options
-PRINT '';
-PRINT 'To export detailed results:';
-PRINT 'SELECT * FROM #StatisticalResults ORDER BY AnalysisType, ColumnName, Metric;';
-PRINT 'SELECT * FROM #NumericStats ORDER BY ColumnName;';
-PRINT 'SELECT * FROM #DiagnosticInfo ORDER BY Timestamp;';
-
-EndScript:
-
--- Show final summary
-IF EXISTS (SELECT 1 FROM #StatisticalResults)
-BEGIN
-    PRINT '';
-    PRINT 'Analysis Summary:';
-    PRINT '  - Total results generated: ' + CAST((SELECT COUNT(*) FROM #StatisticalResults) AS VARCHAR(10));
-    PRINT '  - Columns analyzed: ' + CAST((SELECT COUNT(DISTINCT ColumnName) FROM #StatisticalResults WHERE AnalysisType NOT IN ('Table Overview')) AS VARCHAR(10));
-END
-ELSE
-BEGIN
-    PRINT '';
-    PRINT 'No results were generated. Please check the diagnostic information above.';
-END;
-
--- Cleanup option (commented out to allow result inspection)
--- DROP TABLE #StatisticalResults;
--- DROP TABLE #ColumnInfo;
--- DROP TABLE #NumericStats;
--- DROP TABLE #DiagnosticInfo;
--- DROP TABLE #FrequencyData;
-
-/*------------------------------------------------------------------------------------------------------------*/
+GO
