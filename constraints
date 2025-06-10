@@ -1,4 +1,5 @@
 /*------------------------------------------------------------------------------------------------------------*/
+
 /*
 =====================================================
 ENHANCED TABLE DATA TYPE & FORMAT ANALYSIS SCRIPT
@@ -6,7 +7,7 @@ ENHANCED TABLE DATA TYPE & FORMAT ANALYSIS SCRIPT
 Analyzes tables for data type mismatches and patterns
 Works with both local and linked server tables
 Includes comprehensive error handling
-FIXED: Subquery context errors - simplified approach
+FIXED: Subquery context errors - using FOR XML PATH for string aggregation
 =====================================================
 */
 
@@ -255,14 +256,17 @@ BEGIN
           AND MatchCount > 0 
           AND MatchPercentage >= @MinPercentageForFinding;
         
-        -- Get sample values separately
+        -- Get sample values using FOR XML PATH instead of string concatenation
         SET @SQL = N'
-        DECLARE @Samples NVARCHAR(MAX) = '''';
-        SELECT TOP ' + CAST(@TopSamples AS VARCHAR(10)) + ' @Samples = @Samples + ' + QUOTENAME(@ColumnName) + ' + ''; ''
-        FROM ' + @FullTableName + '
-        WHERE ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%''
-          AND ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-        ORDER BY ' + QUOTENAME(@ColumnName) + ';
+        DECLARE @Samples NVARCHAR(MAX);
+        SELECT @Samples = STUFF((
+            SELECT TOP ' + CAST(@TopSamples AS VARCHAR(10)) + ' ''; '' + ' + QUOTENAME(@ColumnName) + '
+            FROM ' + @FullTableName + '
+            WHERE ' + QUOTENAME(@ColumnName) + ' NOT LIKE ''%[^0-9.-]%''
+              AND ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+            ORDER BY ' + QUOTENAME(@ColumnName) + '
+            FOR XML PATH(''''), TYPE
+        ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, '''');
         
         UPDATE #AnalysisResults 
         SET SampleValues = @Samples
@@ -308,6 +312,24 @@ BEGIN
           AND MatchCount > 0 
           AND MatchPercentage >= @MinPercentageForFinding;
         
+        -- Get sample date values using FOR XML PATH
+        SET @SQL = N'
+        DECLARE @Samples NVARCHAR(MAX);
+        SELECT @Samples = STUFF((
+            SELECT TOP ' + CAST(@TopSamples AS VARCHAR(10)) + ' ''; '' + ' + QUOTENAME(@ColumnName) + '
+            FROM ' + @FullTableName + '
+            WHERE TRY_CAST(' + QUOTENAME(@ColumnName) + ' AS DATE) IS NOT NULL
+              AND ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+            ORDER BY ' + QUOTENAME(@ColumnName) + '
+            FOR XML PATH(''''), TYPE
+        ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, '''');
+        
+        UPDATE #AnalysisResults 
+        SET SampleValues = @Samples
+        WHERE ColumnName = ''' + @ColumnName + ''' AND PatternType = ''Date/DateTime Pattern'';';
+        
+        EXEC sp_executesql @SQL;
+        
         -- 3. BOOLEAN PATTERN DETECTION
         TRUNCATE TABLE #PatternStaging;
         
@@ -346,6 +368,23 @@ BEGIN
         WHERE PatternType = 'Boolean Pattern' 
           AND MatchCount > 0 
           AND MatchPercentage >= @MinPercentageForFinding;
+        
+        -- Get sample boolean values using FOR XML PATH
+        SET @SQL = N'
+        DECLARE @Samples NVARCHAR(MAX);
+        SELECT @Samples = STUFF((
+            SELECT DISTINCT TOP 10 ''; '' + UPPER(' + QUOTENAME(@ColumnName) + ')
+            FROM ' + @FullTableName + '
+            WHERE UPPER(' + QUOTENAME(@ColumnName) + ') IN (''YES'', ''NO'', ''Y'', ''N'', ''TRUE'', ''FALSE'', ''T'', ''F'', ''1'', ''0'')
+              AND ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+            FOR XML PATH(''''), TYPE
+        ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, '''');
+        
+        UPDATE #AnalysisResults 
+        SET SampleValues = @Samples
+        WHERE ColumnName = ''' + @ColumnName + ''' AND PatternType = ''Boolean Pattern'';';
+        
+        EXEC sp_executesql @SQL;
         
         -- 4. JSON DETECTION
         TRUNCATE TABLE #PatternStaging;
@@ -387,6 +426,23 @@ BEGIN
         WHERE PatternType = 'JSON Data' 
           AND MatchCount > 0 
           AND MatchPercentage >= @MinPercentageForFinding;
+        
+        -- Get sample JSON (first few characters only)
+        SET @SQL = N'
+        DECLARE @Samples NVARCHAR(MAX);
+        SELECT @Samples = STUFF((
+            SELECT TOP 3 ''; '' + LEFT(' + QUOTENAME(@ColumnName) + ', 50) + ''...''
+            FROM ' + @FullTableName + '
+            WHERE ISJSON(' + QUOTENAME(@ColumnName) + ') = 1
+              AND ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+            FOR XML PATH(''''), TYPE
+        ).value(''.'', ''NVARCHAR(MAX)''), 1, 2, '''');
+        
+        UPDATE #AnalysisResults 
+        SET SampleValues = @Samples
+        WHERE ColumnName = ''' + @ColumnName + ''' AND PatternType = ''JSON Data'';';
+        
+        EXEC sp_executesql @SQL;
         
     END TRY
     BEGIN CATCH
@@ -527,12 +583,11 @@ DROP TABLE #ColumnInfo;
 /*------------------------------------------------------------------------------------------------------------*/
 
 
-
-
 /*
 =====================================================
 COMPREHENSIVE STATISTICAL PROFILING ANALYSIS SCRIPT
 Enhanced Version with Better Edge Case Handling
+Fixed: Subquery Context Error
 =====================================================
 Performs statistical analysis on table data including:
 - Distribution analysis (normal, skewed, bimodal)
@@ -622,6 +677,18 @@ CREATE TABLE #DiagnosticInfo (
     DiagnosticType NVARCHAR(50),
     Message NVARCHAR(MAX),
     Timestamp DATETIME DEFAULT GETDATE()
+);
+
+-- Temporary table for frequency data
+IF OBJECT_ID('tempdb..#FrequencyData') IS NOT NULL
+    DROP TABLE #FrequencyData;
+
+CREATE TABLE #FrequencyData (
+    ColumnName NVARCHAR(128),
+    Value NVARCHAR(100),
+    Frequency INT,
+    Percentage DECIMAL(10,2),
+    FreqRank INT
 );
 
 PRINT '========================================';
@@ -1007,43 +1074,67 @@ FETCH NEXT FROM freq_cursor INTO @ColumnName, @DataType;
 WHILE @@FETCH_STATUS = 0
 BEGIN
     BEGIN TRY
-        -- Most frequent values
+        -- First, collect frequency data into temporary table
+        TRUNCATE TABLE #FrequencyData;
+        
         SET @SQL = N'
-        WITH FrequencyAnalysis AS (
-            SELECT 
-                CAST(' + QUOTENAME(@ColumnName) + ' AS NVARCHAR(100)) as Value,
-                COUNT(*) as Frequency,
-                COUNT(*) * 100.0 / ' + CAST(@TotalRows AS VARCHAR(20)) + ' as Percentage,
-                DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) as FreqRankDesc,
-                DENSE_RANK() OVER (ORDER BY COUNT(*) ASC) as FreqRankAsc
-            FROM ' + @FullTableName + '
-            WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
-            GROUP BY ' + QUOTENAME(@ColumnName) + '
-        )
-        INSERT INTO #StatisticalResults (AnalysisType, ColumnName, Metric, MetricValue, NumericValue, Details, InsightLevel)
-        SELECT 
-            ''Frequency Distribution'',
+        INSERT INTO #FrequencyData (ColumnName, Value, Frequency, Percentage, FreqRank)
+        SELECT TOP ' + CAST(@TopFrequencyItems AS VARCHAR(10)) + '
             ''' + @ColumnName + ''',
-            ''Most Common Values'',
-            ''Top value: '' + ISNULL(MAX(CASE WHEN FreqRankDesc = 1 THEN Value ELSE NULL END), ''N/A''),
-            MAX(CASE WHEN FreqRankDesc = 1 THEN Frequency ELSE 0 END),
-            STUFF((
-                SELECT TOP ' + CAST(@TopFrequencyItems AS VARCHAR(10)) + '
-                    ''; '' + Value + '' ('' + CAST(Frequency AS VARCHAR(20)) + '', '' + 
-                    CAST(ROUND(Percentage, 2) AS VARCHAR(10)) + ''%)''
-                FROM FrequencyAnalysis
-                WHERE FreqRankDesc <= ' + CAST(@TopFrequencyItems AS VARCHAR(10)) + '
-                ORDER BY Frequency DESC
-                FOR XML PATH('''')
-            ), 1, 2, ''''),
-            CASE 
-                WHEN MAX(CASE WHEN FreqRankDesc = 1 THEN Percentage ELSE 0 END) > 50 THEN ''High''
-                WHEN MAX(CASE WHEN FreqRankDesc = 1 THEN Percentage ELSE 0 END) > 20 THEN ''Medium''
-                ELSE ''Low''
-            END
-        FROM FrequencyAnalysis;';
+            CAST(' + QUOTENAME(@ColumnName) + ' AS NVARCHAR(100)) as Value,
+            COUNT(*) as Frequency,
+            COUNT(*) * 100.0 / ' + CAST(@TotalRows AS VARCHAR(20)) + ' as Percentage,
+            DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) as FreqRank
+        FROM ' + @FullTableName + '
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+        GROUP BY ' + QUOTENAME(@ColumnName) + '
+        ORDER BY COUNT(*) DESC;';
         
         EXEC sp_executesql @SQL;
+        
+        -- Now insert the aggregated results
+        DECLARE @TopValue NVARCHAR(100);
+        DECLARE @TopFrequency INT;
+        DECLARE @TopPercentage DECIMAL(10,2);
+        DECLARE @FreqDetails NVARCHAR(MAX);
+        
+        -- Get top value
+        SELECT TOP 1 
+            @TopValue = Value,
+            @TopFrequency = Frequency,
+            @TopPercentage = Percentage
+        FROM #FrequencyData
+        WHERE ColumnName = @ColumnName
+        ORDER BY Frequency DESC;
+        
+        -- Build frequency details string
+        SELECT @FreqDetails = STRING_AGG(
+            Value + ' (' + CAST(Frequency AS VARCHAR(20)) + ', ' + 
+            CAST(ROUND(Percentage, 2) AS VARCHAR(10)) + '%)', '; '
+        )
+        FROM (
+            SELECT TOP (@TopFrequencyItems) Value, Frequency, Percentage
+            FROM #FrequencyData
+            WHERE ColumnName = @ColumnName
+            ORDER BY Frequency DESC
+        ) t;
+        
+        -- Insert frequency distribution results
+        INSERT INTO #StatisticalResults (AnalysisType, ColumnName, Metric, MetricValue, NumericValue, Details, InsightLevel)
+        VALUES (
+            'Frequency Distribution',
+            @ColumnName,
+            'Most Common Values',
+            'Top value: ' + ISNULL(@TopValue, 'N/A'),
+            ISNULL(@TopFrequency, 0),
+            ISNULL(@FreqDetails, 'No data'),
+            CASE 
+                WHEN @TopPercentage > 50 THEN 'High'
+                WHEN @TopPercentage > 20 THEN 'Medium'
+                ELSE 'Low'
+            END
+        );
+        
         SET @AnalysisPerformed = 1;
         
         -- Unique value count
@@ -1250,43 +1341,6 @@ END;
 -- DROP TABLE #ColumnInfo;
 -- DROP TABLE #NumericStats;
 -- DROP TABLE #DiagnosticInfo;
--- IF OBJECT_ID('tempdb..#CorrelationResults') IS NOT NULL DROP TABLE #CorrelationResults;
-
+-- DROP TABLE #FrequencyData;
 
 /*------------------------------------------------------------------------------------------------------------*/
-
-
--- Call the wrapper to handle XML and then execute your existing procedure
-EXEC sp_HandleXMLLinkedServerTransfer
-    @LinkedServerName = 'YourLinkedServer',
-    @SourceDatabase = 'SourceDB',
-    @SourceSchema = 'dbo',
-    @SourceTable = 'YourTable',
-    @ExistingProcedureName = 'sp_YourExistingTransferProc',
-    @ExistingProcedureParams = '@param1 = value1, @param2 = value2',
-    @CleanupStaging = 1,  -- Auto cleanup after transfer
-    @Debug = 1;           -- Show detailed progress
-
--- Create the staging view without calling any procedure
-EXEC sp_HandleXMLLinkedServerTransfer
-    @LinkedServerName = 'YourLinkedServer',
-    @SourceDatabase = 'SourceDB',
-    @SourceTable = 'YourTable',
-    @ExistingProcedureName = NULL,  -- Don't call any procedure
-    @CleanupStaging = 0,            -- Keep the staging view
-    @Debug = 1;
-
--- Now use the staging view in your own queries or procedures
--- The view name will be displayed in the output
-
--- In your existing procedure, add:
-IF EXISTS (SELECT 1 FROM sys.views WHERE name LIKE 'vw_YourTable_XMLConverted_%')
-BEGIN
-    -- Use the staging view instead of the linked server directly
-    SELECT * FROM staging.vw_YourTable_XMLConverted_[timestamp]
-END
-ELSE
-BEGIN
-    -- Use the original linked server path
-    SELECT * FROM [LinkedServer].[Database].[dbo].[YourTable]
-END
