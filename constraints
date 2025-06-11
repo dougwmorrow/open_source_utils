@@ -1,506 +1,883 @@
-#!/usr/bin/env python3
-"""
-Enhanced Oracle Database Query Script with SQL-to-Pandas Conversion
-Handles large datasets (1.5-3M rows/day) with performance optimizations
-Includes SQL-to-Pandas conversion utilities
-"""
-
-import oracledb
-import pandas as pd
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Any, Optional, Tuple, Union
-import time
-from contextlib import contextmanager
-import os
-import logging
 import re
 import sqlparse
-from dataclasses import dataclass
-from pathlib import Path
+from sqlparse import sql, tokens as T
+from typing import Dict, List, Optional, Tuple, Set
+from collections import OrderedDict
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-@dataclass
-class QueryConfig:
-    """Configuration for query execution"""
-    chunk_hours: int = 6
-    max_workers: int = 4
-    array_size: int = 50000
-    pool_size: int = 10
-    pool_max: int = 20
-    sort_area_size: int = 67108864  # 64MB
-    hash_area_size: int = 67108864  # 64MB
-
-class SQLToPandasConverter:
-    """Converts SQL queries to equivalent Pandas operations"""
-    
+class TSQLToPandasConverter:
     def __init__(self):
-        self.supported_functions = {
-            'COUNT': 'count',
-            'SUM': 'sum',
-            'AVG': 'mean',
-            'MIN': 'min',
-            'MAX': 'max',
-            'STDDEV': 'std',
-            'VARIANCE': 'var'
-        }
+        self.table_aliases = {}
+        self.joins = []
+        self.pandas_code = []
+        self.temp_tables = {}  # Track temporary tables
+        self.cte_definitions = {}  # Track CTE definitions
+        self.variables = {}  # Track variable declarations
         
-    def parse_sql_file(self, file_path: str) -> List[str]:
-        """Parse SQL file and extract individual queries"""
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+    def convert_sql_to_pandas(self, sql_query: str) -> str:
+        """
+        Main method to convert T-SQL query to Pandas equivalent
+        """
+        self.reset_state()
         
-        # Split by semicolon but be careful with strings
-        queries = sqlparse.split(content)
-        return [q.strip() for q in queries if q.strip()]
+        # Handle multiple statements
+        statements = self.split_statements(sql_query)
+        all_pandas_code = []
+        
+        for i, statement in enumerate(statements):
+            if not statement.strip():
+                continue
+                
+            # Add statement separator
+            if i > 0:
+                all_pandas_code.append(f"\n# --- Statement {i + 1} ---")
+            
+            try:
+                parsed = sqlparse.parse(statement)[0]
+                statement_code = self.process_statement(parsed, statement)
+                all_pandas_code.append(statement_code)
+            except Exception as e:
+                all_pandas_code.append(f"# Error parsing statement: {str(e)}")
+                all_pandas_code.append(f"# Original statement: {statement}")
+        
+        return '\n'.join(all_pandas_code)
     
-    def convert_select_query(self, sql: str) -> str:
-        """Convert SELECT query to Pandas operations"""
-        parsed = sqlparse.parse(sql)[0]
+    def split_statements(self, sql_query: str) -> List[str]:
+        """Split SQL into individual statements"""
+        # Simple statement splitting - could be enhanced
+        statements = []
+        current_statement = ""
+        
+        for line in sql_query.split('\n'):
+            line = line.strip()
+            if line.endswith(';'):
+                current_statement += line[:-1]  # Remove semicolon
+                if current_statement.strip():
+                    statements.append(current_statement)
+                current_statement = ""
+            else:
+                current_statement += line + " "
+        
+        # Add remaining statement if no semicolon
+        if current_statement.strip():
+            statements.append(current_statement)
+        
+        return statements
+    
+    def reset_state(self):
+        """Reset converter state for new query"""
+        self.table_aliases = {}
+        self.joins = []
+        self.pandas_code = []
+        self.temp_tables = {}
+        self.cte_definitions = {}
+        self.variables = {}
+    
+    def process_statement(self, parsed_statement, original_statement: str) -> str:
+        """Process individual SQL statement"""
+        statement_type = self.identify_statement_type(parsed_statement, original_statement)
+        
+        if statement_type == 'CTE':
+            return self.handle_cte_statement(parsed_statement, original_statement)
+        elif statement_type == 'CREATE_TEMP':
+            return self.handle_create_temp_table(parsed_statement, original_statement)
+        elif statement_type == 'DROP':
+            return self.handle_drop_statement(parsed_statement, original_statement)
+        elif statement_type == 'TRUNCATE':
+            return self.handle_truncate_statement(parsed_statement, original_statement)
+        elif statement_type == 'INSERT':
+            return self.handle_insert_statement(parsed_statement, original_statement)
+        elif statement_type == 'UPDATE':
+            return self.handle_update_statement(parsed_statement, original_statement)
+        elif statement_type == 'DELETE':
+            return self.handle_delete_statement(parsed_statement, original_statement)
+        elif statement_type == 'DECLARE':
+            return self.handle_declare_statement(parsed_statement, original_statement)
+        elif statement_type == 'SELECT':
+            return self.handle_select_statement(parsed_statement, original_statement)
+        else:
+            return f"# Unsupported statement type: {statement_type}\n# Original: {original_statement}"
+    
+    def identify_statement_type(self, parsed_statement, original_statement: str) -> str:
+        """Identify the type of SQL statement"""
+        original_upper = original_statement.upper().strip()
+        
+        if original_upper.startswith('WITH '):
+            return 'CTE'
+        elif 'CREATE' in original_upper and ('#' in original_upper or 'TEMP' in original_upper):
+            return 'CREATE_TEMP'
+        elif original_upper.startswith('DROP '):
+            return 'DROP'
+        elif original_upper.startswith('TRUNCATE '):
+            return 'TRUNCATE'
+        elif original_upper.startswith('INSERT '):
+            return 'INSERT'
+        elif original_upper.startswith('UPDATE '):
+            return 'UPDATE'
+        elif original_upper.startswith('DELETE '):
+            return 'DELETE'
+        elif original_upper.startswith('DECLARE '):
+            return 'DECLARE'
+        elif original_upper.startswith('SELECT '):
+            return 'SELECT'
+        else:
+            return 'UNKNOWN'
+    
+    def handle_cte_statement(self, parsed_statement, original_statement: str) -> str:
+        """Handle Common Table Expression (CTE)"""
+        code_lines = []
+        code_lines.append("# Common Table Expression (CTE)")
+        
+        # Parse CTE structure
+        cte_pattern = r'WITH\s+(\w+)\s+AS\s*\(\s*(.*?)\s*\)\s*(SELECT.*)'
+        match = re.search(cte_pattern, original_statement, re.IGNORECASE | re.DOTALL)
+        
+        if match:
+            cte_name = match.group(1)
+            cte_query = match.group(2)
+            main_query = match.group(3)
+            
+            # Store CTE definition
+            self.cte_definitions[cte_name] = cte_query
+            
+            code_lines.append(f"# Define CTE: {cte_name}")
+            cte_code = self.convert_select_query(cte_query)
+            code_lines.append(f"{cte_name.lower()}_df = {cte_code}")
+            code_lines.append("")
+            
+            # Process main query
+            code_lines.append("# Main query using CTE")
+            main_code = self.convert_select_query(main_query, cte_name)
+            code_lines.append(f"result_df = {main_code}")
+        else:
+            # Handle multiple CTEs
+            code_lines.append("# Multiple CTEs - manual parsing required")
+            code_lines.append(f"# Original CTE: {original_statement}")
+        
+        return '\n'.join(code_lines)
+    
+    def handle_create_temp_table(self, parsed_statement, original_statement: str) -> str:
+        """Handle CREATE temporary table"""
+        code_lines = []
+        
+        # Extract table name
+        temp_table_pattern = r'CREATE.*?(?:TABLE|#)?\s+(#?\w+)\s*\((.*?)\)'
+        match = re.search(temp_table_pattern, original_statement, re.IGNORECASE | re.DOTALL)
+        
+        if match:
+            table_name = match.group(1).replace('#', 'temp_')
+            columns_def = match.group(2)
+            
+            # Store temp table
+            self.temp_tables[table_name] = columns_def
+            
+            code_lines.append(f"# Create temporary table: {table_name}")
+            
+            # Parse column definitions
+            columns = self.parse_column_definitions(columns_def)
+            
+            if columns:
+                code_lines.append(f"# Define {table_name} structure")
+                code_lines.append(f"{table_name} = pd.DataFrame({{")
+                for col_name, col_type in columns.items():
+                    pandas_type = self.sql_type_to_pandas(col_type)
+                    code_lines.append(f"    '{col_name}': pd.Series([], dtype='{pandas_type}'),")
+                code_lines.append("})")
+            else:
+                code_lines.append(f"{table_name} = pd.DataFrame()")
+        else:
+            # Handle CREATE TABLE AS SELECT
+            create_as_pattern = r'CREATE.*?(?:TABLE|#)?\s+(#?\w+)\s+AS\s+(SELECT.*)'
+            as_match = re.search(create_as_pattern, original_statement, re.IGNORECASE | re.DOTALL)
+            
+            if as_match:
+                table_name = as_match.group(1).replace('#', 'temp_')
+                select_query = as_match.group(2)
+                
+                code_lines.append(f"# Create temporary table from SELECT: {table_name}")
+                select_code = self.convert_select_query(select_query)
+                code_lines.append(f"{table_name} = {select_code}")
+                
+                self.temp_tables[table_name] = "from_select"
+            else:
+                code_lines.append(f"# Could not parse CREATE statement: {original_statement}")
+        
+        return '\n'.join(code_lines)
+    
+    def handle_drop_statement(self, parsed_statement, original_statement: str) -> str:
+        """Handle DROP statement"""
+        code_lines = []
+        
+        # Extract what's being dropped
+        drop_pattern = r'DROP\s+(TABLE|INDEX|VIEW|PROCEDURE)\s+(?:IF\s+EXISTS\s+)?(.+)'
+        match = re.search(drop_pattern, original_statement, re.IGNORECASE)
+        
+        if match:
+            object_type = match.group(1).upper()
+            object_name = match.group(2).strip()
+            
+            if object_type == 'TABLE':
+                # Clean table name
+                clean_name = self.clean_identifier(object_name).replace('#', 'temp_')
+                
+                code_lines.append(f"# Drop table: {object_name}")
+                code_lines.append(f"# Remove DataFrame from memory")
+                code_lines.append(f"try:")
+                code_lines.append(f"    del {clean_name}")
+                code_lines.append(f"except NameError:")
+                code_lines.append(f"    pass  # Table doesn't exist")
+                
+                # Remove from temp tables tracking
+                if clean_name in self.temp_tables:
+                    del self.temp_tables[clean_name]
+                    
+            else:
+                code_lines.append(f"# Drop {object_type}: {object_name}")
+                code_lines.append(f"# Note: {object_type} operations not directly applicable to Pandas")
+        else:
+            code_lines.append(f"# Could not parse DROP statement: {original_statement}")
+        
+        return '\n'.join(code_lines)
+    
+    def handle_truncate_statement(self, parsed_statement, original_statement: str) -> str:
+        """Handle TRUNCATE statement"""
+        code_lines = []
+        
+        # Extract table name
+        truncate_pattern = r'TRUNCATE\s+TABLE\s+(.+)'
+        match = re.search(truncate_pattern, original_statement, re.IGNORECASE)
+        
+        if match:
+            table_name = self.clean_identifier(match.group(1)).replace('#', 'temp_')
+            
+            code_lines.append(f"# Truncate table: {table_name}")
+            code_lines.append(f"# Clear all data but keep structure")
+            code_lines.append(f"if '{table_name}' in locals():")
+            code_lines.append(f"    {table_name} = {table_name}.iloc[0:0].copy()  # Keep structure, remove data")
+            code_lines.append(f"else:")
+            code_lines.append(f"    print('Table {table_name} does not exist')")
+        else:
+            code_lines.append(f"# Could not parse TRUNCATE statement: {original_statement}")
+        
+        return '\n'.join(code_lines)
+    
+    def handle_insert_statement(self, parsed_statement, original_statement: str) -> str:
+        """Handle INSERT statement"""
+        code_lines = []
+        
+        # INSERT INTO table VALUES
+        values_pattern = r'INSERT\s+INTO\s+(.+?)\s*(?:\(([^)]+)\))?\s*VALUES\s*\((.+)\)'
+        values_match = re.search(values_pattern, original_statement, re.IGNORECASE | re.DOTALL)
+        
+        # INSERT INTO table SELECT
+        select_pattern = r'INSERT\s+INTO\s+(.+?)\s*(?:\(([^)]+)\))?\s*(SELECT.*)'
+        select_match = re.search(select_pattern, original_statement, re.IGNORECASE | re.DOTALL)
+        
+        if values_match:
+            table_name = self.clean_identifier(values_match.group(1)).replace('#', 'temp_')
+            columns = values_match.group(2)
+            values = values_match.group(3)
+            
+            code_lines.append(f"# Insert values into {table_name}")
+            
+            if columns:
+                col_list = [self.clean_identifier(c.strip()) for c in columns.split(',')]
+                val_list = [v.strip().strip("'\"") for v in values.split(',')]
+                
+                code_lines.append(f"new_row = pd.DataFrame({{")
+                for col, val in zip(col_list, val_list):
+                    code_lines.append(f"    '{col}': [{val}],")
+                code_lines.append(f"}})")
+            else:
+                code_lines.append(f"# Insert into all columns")
+                val_list = [v.strip().strip("'\"") for v in values.split(',')]
+                code_lines.append(f"new_row = pd.DataFrame([{val_list}])")
+            
+            code_lines.append(f"{table_name} = pd.concat([{table_name}, new_row], ignore_index=True)")
+            
+        elif select_match:
+            table_name = self.clean_identifier(select_match.group(1)).replace('#', 'temp_')
+            columns = select_match.group(2)
+            select_query = select_match.group(3)
+            
+            code_lines.append(f"# Insert SELECT results into {table_name}")
+            select_code = self.convert_select_query(select_query)
+            code_lines.append(f"insert_data = {select_code}")
+            code_lines.append(f"{table_name} = pd.concat([{table_name}, insert_data], ignore_index=True)")
+        else:
+            code_lines.append(f"# Could not parse INSERT statement: {original_statement}")
+        
+        return '\n'.join(code_lines)
+    
+    def handle_update_statement(self, parsed_statement, original_statement: str) -> str:
+        """Handle UPDATE statement"""
+        code_lines = []
+        
+        # Basic UPDATE pattern
+        update_pattern = r'UPDATE\s+(.+?)\s+SET\s+(.+?)(?:\s+WHERE\s+(.+))?'
+        match = re.search(update_pattern, original_statement, re.IGNORECASE | re.DOTALL)
+        
+        if match:
+            table_name = self.clean_identifier(match.group(1)).replace('#', 'temp_')
+            set_clause = match.group(2)
+            where_clause = match.group(3) if match.group(3) else None
+            
+            code_lines.append(f"# Update {table_name}")
+            
+            # Parse SET clause
+            set_pairs = [pair.strip() for pair in set_clause.split(',')]
+            
+            if where_clause:
+                where_pandas = self.convert_where_clause(where_clause)
+                code_lines.append(f"# Apply WHERE condition: {where_clause}")
+                code_lines.append(f"mask = {table_name}.eval('{where_pandas}')")
+            else:
+                code_lines.append(f"# Update all rows")
+                code_lines.append(f"mask = True")
+            
+            for set_pair in set_pairs:
+                if '=' in set_pair:
+                    column, value = set_pair.split('=', 1)
+                    column = self.clean_identifier(column.strip())
+                    value = value.strip().strip("'\"")
+                    code_lines.append(f"{table_name}.loc[mask, '{column}'] = {value}")
+        else:
+            code_lines.append(f"# Could not parse UPDATE statement: {original_statement}")
+        
+        return '\n'.join(code_lines)
+
+    
+    def handle_delete_statement(self, parsed_statement, original_statement: str) -> str:
+        """Handle DELETE statement"""
+        code_lines = []
+        
+        # DELETE pattern
+        delete_pattern = r'DELETE\s+FROM\s+(.+?)(?:\s+WHERE\s+(.+))?'
+        match = re.search(delete_pattern, original_statement, re.IGNORECASE | re.DOTALL)
+        
+        if match:
+            table_name = self.clean_identifier(match.group(1)).replace('#', 'temp_')
+            where_clause = match.group(2) if match.group(2) else None
+            
+            code_lines.append(f"# Delete from {table_name}")
+            
+            if where_clause:
+                where_pandas = self.convert_where_clause(where_clause)
+                code_lines.append(f"# Apply WHERE condition: {where_clause}")
+                code_lines.append(f"mask = ~{table_name}.eval('{where_pandas}')  # Keep rows that DON'T match")
+                code_lines.append(f"{table_name} = {table_name}[mask].reset_index(drop=True)")
+            else:
+                code_lines.append(f"# Delete all rows")
+                code_lines.append(f"{table_name} = {table_name}.iloc[0:0].copy()  # Keep structure, remove data")
+        else:
+            code_lines.append(f"# Could not parse DELETE statement: {original_statement}")
+        
+        return '\n'.join(code_lines)
+    
+    def handle_declare_statement(self, parsed_statement, original_statement: str) -> str:
+        """Handle DECLARE statement for variables"""
+        code_lines = []
+        
+        # DECLARE pattern
+        declare_pattern = r'DECLARE\s+(@\w+)\s+(\w+)(?:\s*=\s*(.+))?'
+        match = re.search(declare_pattern, original_statement, re.IGNORECASE)
+        
+        if match:
+            var_name = match.group(1).replace('@', 'var_')
+            var_type = match.group(2)
+            var_value = match.group(3) if match.group(3) else None
+            
+            code_lines.append(f"# Declare variable: {match.group(1)}")
+            
+            if var_value:
+                # Clean the value
+                clean_value = var_value.strip().strip("'\"")
+                if var_type.upper() in ['INT', 'INTEGER', 'BIGINT']:
+                    code_lines.append(f"{var_name} = {clean_value}")
+                elif var_type.upper() in ['VARCHAR', 'NVARCHAR', 'CHAR', 'TEXT']:
+                    code_lines.append(f"{var_name} = '{clean_value}'")
+                elif var_type.upper() in ['DECIMAL', 'FLOAT', 'REAL']:
+                    code_lines.append(f"{var_name} = {clean_value}")
+                else:
+                    code_lines.append(f"{var_name} = '{clean_value}'  # {var_type}")
+            else:
+                code_lines.append(f"{var_name} = None  # {var_type}")
+            
+            self.variables[match.group(1)] = var_name
+        else:
+            code_lines.append(f"# Could not parse DECLARE statement: {original_statement}")
+        
+        return '\n'.join(code_lines)
+    
+    def handle_select_statement(self, parsed_statement, original_statement: str) -> str:
+        """Handle SELECT statement"""
+        code_lines = []
+        code_lines.append("import pandas as pd")
+        code_lines.append("import numpy as np")
+        code_lines.append("")
         
         # Extract components
-        select_clause = self._extract_select_clause(parsed)
-        from_clause = self._extract_from_clause(parsed)
-        where_clause = self._extract_where_clause(parsed)
-        group_by_clause = self._extract_group_by_clause(parsed)
-        order_by_clause = self._extract_order_by_clause(parsed)
+        components = self.extract_query_components(parsed_statement)
         
-        # Build Pandas code
-        pandas_code = []
+        # Generate Pandas code
+        pandas_code = self.generate_pandas_code(components)
+        code_lines.append(pandas_code)
         
-        # Start with DataFrame
-        pandas_code.append(f"# Original SQL: {sql.strip()}")
-        pandas_code.append(f"df = {from_clause}")
-        
-        # Apply WHERE conditions
-        if where_clause:
-            pandas_code.append(f"df = df.query('{where_clause}')")
-        
-        # Apply GROUP BY and aggregations
-        if group_by_clause:
-            agg_code = self._convert_aggregations(select_clause, group_by_clause)
-            pandas_code.append(agg_code)
-        else:
-            # Simple SELECT
-            if select_clause != '*':
-                pandas_code.append(f"df = df[{select_clause}]")
-        
-        # Apply ORDER BY
-        if order_by_clause:
-            pandas_code.append(f"df = df.sort_values({order_by_clause})")
-        
-        return '\n'.join(pandas_code)
+        return '\n'.join(code_lines)
     
-    def _extract_select_clause(self, parsed) -> str:
-        """Extract SELECT clause columns"""
-        # Simplified implementation - would need more robust parsing
-        tokens = list(parsed.flatten())
-        select_found = False
+    def convert_select_query(self, query: str, cte_context: str = None) -> str:
+        """Convert a SELECT query to Pandas code (returns code as string)"""
+        try:
+            parsed = sqlparse.parse(query)[0]
+            components = self.extract_query_components(parsed)
+            
+            # Build the query step by step
+            steps = []
+            
+            # Handle FROM clause
+            if components['from']:
+                table_name = self.clean_identifier(components['from'])
+                
+                # Check if it's a CTE reference
+                if cte_context and table_name == cte_context:
+                    steps.append(f"{cte_context.lower()}_df")
+                # Check if it's a temp table
+                elif table_name.replace('#', 'temp_') in self.temp_tables:
+                    steps.append(f"{table_name.replace('#', 'temp_')}")
+                else:
+                    steps.append(f"pd.read_sql_table('{table_name}', connection)")
+            
+            # Add other operations as method chains
+            df_var = "df_temp"
+            result_steps = [f"{df_var} = {steps[0] if steps else 'df'}"]
+            
+            # WHERE clause
+            if components['where']:
+                where_code = self.convert_where_clause(components['where'])
+                result_steps.append(f"{df_var} = {df_var}.query('{where_code}')")
+            
+            # GROUP BY
+            if components['group_by']:
+                group_code = self.convert_group_by_simple(components['group_by'], components['select'])
+                result_steps.append(f"{df_var} = {group_code.replace('df', df_var)}")
+            
+            # SELECT (column selection)
+            if components['select'] and not components['group_by']:
+                select_code = self.convert_select_simple(components['select'])
+                if select_code:
+                    result_steps.append(f"{df_var} = {select_code.replace('df', df_var)}")
+            
+            # ORDER BY
+            if components['order_by']:
+                order_code = self.convert_order_by_simple(components['order_by'])
+                result_steps.append(f"{df_var} = {order_code.replace('df', df_var)}")
+            
+            return f"({'; '.join(result_steps)}; {df_var})[-1]"  # Return the final result
+            
+        except Exception as e:
+            return f"# Error converting SELECT: {str(e)}"
+    
+    def parse_column_definitions(self, columns_def: str) -> Dict[str, str]:
+        """Parse column definitions from CREATE TABLE"""
+        columns = {}
+        
+        # Simple parsing - split by comma and extract name/type
+        col_defs = [col.strip() for col in columns_def.split(',')]
+        
+        for col_def in col_defs:
+            parts = col_def.split()
+            if len(parts) >= 2:
+                col_name = self.clean_identifier(parts[0])
+                col_type = parts[1]
+                columns[col_name] = col_type
+        
+        return columns
+    
+    def sql_type_to_pandas(self, sql_type: str) -> str:
+        """Convert SQL data type to Pandas dtype"""
+        sql_type_upper = sql_type.upper()
+        
+        if any(t in sql_type_upper for t in ['INT', 'BIGINT', 'SMALLINT']):
+            return 'int64'
+        elif any(t in sql_type_upper for t in ['DECIMAL', 'FLOAT', 'REAL', 'NUMERIC']):
+            return 'float64'
+        elif any(t in sql_type_upper for t in ['VARCHAR', 'CHAR', 'TEXT', 'NVARCHAR']):
+            return 'object'
+        elif any(t in sql_type_upper for t in ['DATE', 'DATETIME', 'TIMESTAMP']):
+            return 'datetime64[ns]'
+        elif 'BIT' in sql_type_upper:
+            return 'bool'
+        else:
+            return 'object'
+    
+    def convert_select_simple(self, select_items: List[str]) -> str:
+        """Simple SELECT conversion returning code string"""
+        select_clause = ' '.join(select_items).strip()
+        
+        if select_clause.upper().startswith('*'):
+            return ""  # No change needed
+        
+        columns = self.parse_select_items(select_clause)
+        if columns:
+            column_list = ', '.join([f"'{col}'" for col in columns])
+            return f"df[[{column_list}]]"
+        
+        return ""
+    
+    def convert_group_by_simple(self, group_items: List[str], select_items: List[str]) -> str:
+        """Simple GROUP BY conversion returning code string"""
+        group_clause = ' '.join(group_items).strip()
+        group_columns = [self.clean_identifier(col.strip()) for col in group_clause.split(',')]
+        
+        select_clause = ' '.join(select_items).strip()
+        agg_functions = self.detect_aggregations(select_clause)
+        
+        if agg_functions:
+            agg_dict = ', '.join([f"'{col}': '{func}'" for col, func in agg_functions.items()])
+            return f"df.groupby({group_columns}).agg({{{agg_dict}}}).reset_index()"
+        else:
+            return f"df.groupby({group_columns}).size().reset_index(name='count')"
+    
+    def convert_order_by_simple(self, order_items: List[str]) -> str:
+        """Simple ORDER BY conversion returning code string"""
+        order_clause = ' '.join(order_items).strip()
+        
+        order_columns = []
+        ascending = []
+        
+        items = [item.strip() for item in order_clause.split(',')]
+        for item in items:
+            parts = item.split()
+            column = self.clean_identifier(parts[0])
+            order_columns.append(column)
+            
+            if len(parts) > 1 and parts[1].upper() == 'DESC':
+                ascending.append(False)
+            else:
+                ascending.append(True)
+        
+        if len(order_columns) == 1:
+            return f"df.sort_values('{order_columns[0]}', ascending={str(ascending[0]).lower()})"
+        else:
+            return f"df.sort_values({order_columns}, ascending={ascending})"
+    
+    # Include all the previous methods (extract_query_components, generate_pandas_code, etc.)
+    # [Previous methods remain the same - copying them here for completeness]
+    
+    def extract_query_components(self, parsed_query) -> Dict:
+        """Extract key components from parsed SQL"""
+        components = {
+            'select': [],
+            'from': None,
+            'joins': [],
+            'where': None,
+            'group_by': [],
+            'having': None,
+            'order_by': [],
+            'limit': None
+        }
+        
+        current_keyword = None
+        
+        for token in parsed_query.flatten():
+            if token.ttype is T.Keyword:
+                keyword_upper = token.value.upper()
+                if keyword_upper in ['SELECT', 'FROM', 'WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'TOP']:
+                    current_keyword = keyword_upper
+                elif keyword_upper in ['JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL']:
+                    current_keyword = 'JOIN'
+                elif keyword_upper == 'BY' and current_keyword in ['GROUP', 'ORDER']:
+                    continue
+            elif token.ttype not in [T.Whitespace, T.Newline] and current_keyword:
+                self.add_component_token(components, current_keyword, token)
+        
+        return components
+    
+    def add_component_token(self, components: Dict, keyword: str, token):
+        """Add token to appropriate component"""
+        if keyword == 'SELECT':
+            components['select'].append(token.value)
+        elif keyword == 'FROM':
+            if not components['from']:
+                components['from'] = token.value
+        elif keyword == 'WHERE':
+            if not components['where']:
+                components['where'] = token.value
+            else:
+                components['where'] += ' ' + token.value
+        elif keyword == 'GROUP':
+            components['group_by'].append(token.value)
+        elif keyword == 'ORDER':
+            components['order_by'].append(token.value)
+        elif keyword == 'JOIN':
+            components['joins'].append(token.value)
+    
+    def generate_pandas_code(self, components: Dict) -> str:
+        """Generate Pandas code from extracted components"""
+        code_lines = []
+        
+        # Handle FROM clause
+        if components['from']:
+            main_table = self.clean_identifier(components['from'])
+            code_lines.append(f"# Load main table")
+            code_lines.append(f"df = pd.read_sql_table('{main_table}', connection)")
+            code_lines.append("# Or load from CSV: df = pd.read_csv('{main_table}.csv')")
+            code_lines.append("")
+        
+        # Handle JOINs
+        if components['joins']:
+            join_code = self.convert_joins(components['joins'])
+            code_lines.extend(join_code)
+        
+        # Handle WHERE clause
+        if components['where']:
+            where_code = self.convert_where_clause(components['where'])
+            code_lines.append(f"# Apply WHERE conditions")
+            code_lines.append(f"df = df.query('{where_code}')")
+            code_lines.append("")
+        
+        # Handle GROUP BY
+        if components['group_by']:
+            group_code = self.convert_group_by(components['group_by'], components['select'])
+            code_lines.extend(group_code)
+        
+        # Handle SELECT
+        if components['select']:
+            select_code = self.convert_select(components['select'])
+            if not components['group_by']:
+                code_lines.extend(select_code)
+        
+        # Handle ORDER BY
+        if components['order_by']:
+            order_code = self.convert_order_by(components['order_by'])
+            code_lines.extend(order_code)
+        
+        return '\n'.join(code_lines)
+    
+    def convert_select(self, select_items: List[str]) -> List[str]:
+        """Convert SELECT clause to Pandas column selection"""
+        code_lines = []
+        
+        select_clause = ' '.join(select_items).strip()
+        
+        if select_clause.upper().startswith('*'):
+            code_lines.append("# Select all columns (already selected)")
+            return code_lines
+        
+        columns = self.parse_select_items(select_clause)
+        
+        if columns:
+            code_lines.append("# Select specific columns")
+            column_list = ', '.join([f"'{col}'" for col in columns])
+            code_lines.append(f"df = df[[{column_list}]]")
+            code_lines.append("")
+        
+        return code_lines
+    
+    def parse_select_items(self, select_clause: str) -> List[str]:
+        """Parse individual SELECT items"""
+        items = [item.strip() for item in select_clause.split(',')]
         columns = []
         
-        for token in tokens:
-            if token.ttype is sqlparse.tokens.Keyword and token.value.upper() == 'SELECT':
-                select_found = True
-                continue
-            elif token.ttype is sqlparse.tokens.Keyword and token.value.upper() == 'FROM':
-                break
-            elif select_found and token.ttype not in (sqlparse.tokens.Whitespace, sqlparse.tokens.Punctuation):
-                if token.value != ',':
-                    columns.append(f"'{token.value}'")
-        
-        return '[' + ', '.join(columns) + ']' if columns else "'*'"
-    
-    def _extract_from_clause(self, parsed) -> str:
-        """Extract FROM clause table name"""
-        tokens = list(parsed.flatten())
-        from_found = False
-        
-        for token in tokens:
-            if token.ttype is sqlparse.tokens.Keyword and token.value.upper() == 'FROM':
-                from_found = True
-                continue
-            elif from_found and token.ttype not in (sqlparse.tokens.Whitespace, sqlparse.tokens.Punctuation):
-                if token.ttype is sqlparse.tokens.Keyword:
-                    break
-                return f"load_table('{token.value}')"  # Placeholder function
-        
-        return "df"
-    
-    def _extract_where_clause(self, parsed) -> Optional[str]:
-        """Extract WHERE clause conditions"""
-        # Simplified - would need proper condition parsing
-        sql_str = str(parsed)
-        where_match = re.search(r'WHERE\s+(.+?)(?:\s+GROUP\s+BY|\s+ORDER\s+BY|\s*$)', sql_str, re.IGNORECASE)
-        if where_match:
-            condition = where_match.group(1).strip()
-            # Convert SQL operators to Python
-            condition = condition.replace('=', '==')
-            condition = condition.replace('AND', '&')
-            condition = condition.replace('OR', '|')
-            return condition
-        return None
-    
-    def _extract_group_by_clause(self, parsed) -> Optional[List[str]]:
-        """Extract GROUP BY columns"""
-        sql_str = str(parsed)
-        group_match = re.search(r'GROUP\s+BY\s+(.+?)(?:\s+ORDER\s+BY|\s*$)', sql_str, re.IGNORECASE)
-        if group_match:
-            columns = [col.strip().strip("'\"") for col in group_match.group(1).split(',')]
-            return columns
-        return None
-    
-    def _extract_order_by_clause(self, parsed) -> Optional[str]:
-        """Extract ORDER BY clause"""
-        sql_str = str(parsed)
-        order_match = re.search(r'ORDER\s+BY\s+(.+)$', sql_str, re.IGNORECASE)
-        if order_match:
-            order_clause = order_match.group(1).strip()
-            # Convert to Pandas format
-            columns = []
-            ascending = []
-            for col in order_clause.split(','):
-                col = col.strip()
-                if 'DESC' in col.upper():
-                    columns.append(f"'{col.replace('DESC', '').strip()}'")
-                    ascending.append('False')
+        for item in items:
+            if ' AS ' in item.upper():
+                parts = re.split(r'\s+AS\s+', item, flags=re.IGNORECASE)
+                if len(parts) == 2:
+                    columns.append(self.clean_identifier(parts[1]))
                 else:
-                    columns.append(f"'{col.replace('ASC', '').strip()}'")
-                    ascending.append('True')
-            
-            return f"[{', '.join(columns)}], ascending=[{', '.join(ascending)}]"
-        return None
-    
-    def _convert_aggregations(self, select_clause: str, group_by_columns: List[str]) -> str:
-        """Convert aggregation functions to Pandas"""
-        # Simplified aggregation conversion
-        return f"df = df.groupby({group_by_columns}).agg({select_clause})"
-    
-    def convert_sql_file(self, input_file: str, output_file: str):
-        """Convert entire SQL file to Pandas operations"""
-        queries = self.parse_sql_file(input_file)
-        pandas_code = []
-        
-        pandas_code.append("import pandas as pd")
-        pandas_code.append("import numpy as np")
-        pandas_code.append("from datetime import datetime")
-        pandas_code.append("")
-        
-        for i, query in enumerate(queries):
-            pandas_code.append(f"# Query {i + 1}")
-            converted = self.convert_select_query(query)
-            pandas_code.append(converted)
-            pandas_code.append("")
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(pandas_code))
-        
-        logger.info(f"Converted {len(queries)} queries to {output_file}")
-
-class EnhancedOracleConnector:
-    """Enhanced Oracle connector with improved error handling and monitoring"""
-    
-    def __init__(self, config: QueryConfig = None):
-        self.config = config or QueryConfig()
-        self.pool = None
-        self.stats = {
-            'queries_executed': 0,
-            'total_rows_fetched': 0,
-            'total_execution_time': 0,
-            'errors': 0
-        }
-    
-    def create_connection_pool(self, username: str, password: str, dsn: str):
-        """Create Oracle connection pool with enhanced configuration"""
-        try:
-            self.pool = oracledb.create_pool(
-                user=username,
-                password=password,
-                dsn=dsn,
-                min=self.config.pool_size,
-                max=self.config.pool_max,
-                increment=5,
-                threaded=True,
-                getmode=oracledb.POOL_GETMODE_WAIT,
-                timeout=300,  # 5 minutes
-                max_lifetime_session=3600,  # 1 hour
-                retry_count=3,
-                retry_delay=1
-            )
-            logger.info(f"Created connection pool: {self.config.pool_size}-{self.config.pool_max} connections")
-            return self.pool
-        except Exception as e:
-            logger.error(f"Failed to create connection pool: {e}")
-            raise
-    
-    @contextmanager
-    def get_connection(self):
-        """Enhanced context manager with retry logic"""
-        connection = None
-        max_retries = 3
-        
-        for attempt in range(max_retries):
-            try:
-                connection = self.pool.acquire()
-                yield connection
-                break
-            except Exception as e:
-                self.stats['errors'] += 1
-                if attempt == max_retries - 1:
-                    logger.error(f"Failed to acquire connection after {max_retries} attempts: {e}")
-                    raise
-                else:
-                    logger.warning(f"Connection attempt {attempt + 1} failed, retrying: {e}")
-                    time.sleep(2 ** attempt)  # Exponential backoff
-            finally:
-                if connection:
-                    self.pool.release(connection)
-    
-    def optimize_session(self, connection):
-        """Apply comprehensive session-level optimizations"""
-        optimizations = [
-            f"ALTER SESSION SET OPTIMIZER_MODE = FIRST_ROWS_{self.config.array_size}",
-            "ALTER SESSION SET CURSOR_SHARING = FORCE",
-            "ALTER SESSION SET DB_FILE_MULTIBLOCK_READ_COUNT = 128",
-            f"ALTER SESSION SET SORT_AREA_SIZE = {self.config.sort_area_size}",
-            f"ALTER SESSION SET HASH_AREA_SIZE = {self.config.hash_area_size}",
-            "ALTER SESSION SET WORKAREA_SIZE_POLICY = AUTO",
-            "ALTER SESSION SET PGA_AGGREGATE_TARGET = 1G",
-            "ALTER SESSION SET PARALLEL_DEGREE_POLICY = AUTO"
-        ]
-        
-        cursor = connection.cursor()
-        try:
-            cursor.arraysize = self.config.array_size
-            
-            for opt in optimizations:
-                try:
-                    cursor.execute(opt)
-                except Exception as e:
-                    logger.debug(f"Optimization failed (continuing): {opt} - {e}")
-                    
-        finally:
-            cursor.close()
-    
-    def execute_with_metrics(self, connection, query: str, bind_vars: Dict = None) -> Tuple[pd.DataFrame, Dict]:
-        """Execute query with performance metrics"""
-        start_time = time.time()
-        
-        cursor = connection.cursor()
-        cursor.arraysize = self.config.array_size
-        cursor.prefetchrows = self.config.array_size
-        
-        try:
-            if bind_vars:
-                cursor.execute(query, bind_vars)
+                    columns.append(self.clean_identifier(item))
             else:
-                cursor.execute(query)
-            
-            columns = [desc[0] for desc in cursor.description]
-            
-            # Fetch data efficiently
-            all_rows = []
-            fetch_count = 0
-            
-            while True:
-                rows = cursor.fetchmany(self.config.array_size)
-                if not rows:
-                    break
-                all_rows.extend(rows)
-                fetch_count += 1
-            
-            df = pd.DataFrame(all_rows, columns=columns)
-            
-            # Update statistics
-            execution_time = time.time() - start_time
-            self.stats['queries_executed'] += 1
-            self.stats['total_rows_fetched'] += len(df)
-            self.stats['total_execution_time'] += execution_time
-            
-            metrics = {
-                'execution_time': execution_time,
-                'rows_fetched': len(df),
-                'fetch_operations': fetch_count,
-                'rows_per_second': len(df) / execution_time if execution_time > 0 else 0
-            }
-            
-            logger.info(f"Query executed: {len(df)} rows in {execution_time:.2f}s "
-                       f"({metrics['rows_per_second']:.0f} rows/sec)")
-            
-            return df, metrics
-            
-        finally:
-            cursor.close()
+                columns.append(self.clean_identifier(item))
+        
+        return columns
     
-    def execute_chunked_query_enhanced(self, base_query: str, date_column: str,
-                                     start_date: datetime, end_date: datetime,
-                                     chunk_hours: int = None, max_workers: int = None) -> pd.DataFrame:
-        """Enhanced chunked query execution with better error handling"""
-        chunk_hours = chunk_hours or self.config.chunk_hours
-        max_workers = max_workers or self.config.max_workers
+    def convert_where_clause(self, where_clause: str) -> str:
+        """Convert WHERE clause to Pandas query format"""
+        pandas_where = where_clause
         
-        chunks = self._generate_time_chunks(start_date, end_date, chunk_hours)
-        results = []
-        failed_chunks = []
-        
-        logger.info(f"Executing query in {len(chunks)} chunks with {max_workers} workers")
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_chunk = {
-                executor.submit(self._execute_chunk_safe, base_query, chunk, date_column): chunk
-                for chunk in chunks
-            }
-            
-            for future in as_completed(future_to_chunk):
-                chunk = future_to_chunk[future]
-                try:
-                    df_chunk = future.result()
-                    if not df_chunk.empty:
-                        results.append(df_chunk)
-                        logger.debug(f"Chunk {chunk} completed: {len(df_chunk)} rows")
-                except Exception as e:
-                    failed_chunks.append(chunk)
-                    logger.error(f"Chunk {chunk} failed: {e}")
-        
-        if failed_chunks:
-            logger.warning(f"{len(failed_chunks)} chunks failed out of {len(chunks)}")
-        
-        if results:
-            final_df = pd.concat(results, ignore_index=True)
-            logger.info(f"Total rows retrieved: {len(final_df)}")
-            return final_df
-        else:
-            logger.warning("No data retrieved from any chunks")
-            return pd.DataFrame()
-    
-    def _execute_chunk_safe(self, base_query: str, chunk: Tuple[datetime, datetime], 
-                           date_column: str) -> pd.DataFrame:
-        """Safely execute a single chunk with error handling"""
-        start_time, end_time = chunk
-        
-        query = base_query.format(
-            start_time=start_time.strftime('%Y-%m-%d %H:%M:%S'),
-            end_time=end_time.strftime('%Y-%m-%d %H:%M:%S'),
-            date_column=date_column
-        )
-        
-        with self.get_connection() as connection:
-            self.optimize_session(connection)
-            df, metrics = self.execute_with_metrics(connection, query)
-            return df
-    
-    def _generate_time_chunks(self, start_date: datetime, end_date: datetime, 
-                            chunk_hours: int) -> List[Tuple[datetime, datetime]]:
-        """Generate time-based chunks for parallel processing"""
-        chunks = []
-        current = start_date
-        
-        while current < end_date:
-            chunk_end = min(current + timedelta(hours=chunk_hours), end_date)
-            chunks.append((current, chunk_end))
-            current = chunk_end
-            
-        return chunks
-    
-    def get_performance_stats(self) -> Dict[str, Any]:
-        """Get performance statistics"""
-        if self.stats['queries_executed'] > 0:
-            avg_execution_time = self.stats['total_execution_time'] / self.stats['queries_executed']
-            avg_rows_per_query = self.stats['total_rows_fetched'] / self.stats['queries_executed']
-        else:
-            avg_execution_time = 0
-            avg_rows_per_query = 0
-        
-        return {
-            **self.stats,
-            'avg_execution_time': avg_execution_time,
-            'avg_rows_per_query': avg_rows_per_query,
-            'success_rate': (self.stats['queries_executed'] - self.stats['errors']) / max(1, self.stats['queries_executed'])
+        replacements = {
+            ' = ': ' == ',
+            ' <> ': ' != ',
+            ' AND ': ' & ',
+            ' OR ': ' | ',
+            ' NOT ': ' ~ ',
+            'IS NULL': '.isna()',
+            'IS NOT NULL': '.notna()'
         }
-    
-    def close_pool(self):
-        """Close connection pool and log final statistics"""
-        if self.pool:
-            self.pool.close()
-            stats = self.get_performance_stats()
-            logger.info(f"Connection pool closed. Final stats: {stats}")
-
-def convert_tsql_to_pandas(sql_file: str, output_file: str):
-    """High-level function to convert T-SQL file to Pandas"""
-    converter = SQLToPandasConverter()
-    converter.convert_sql_file(sql_file, output_file)
-
-def main():
-    """Enhanced main function with SQL conversion demo"""
-    
-    # Configuration
-    config = QueryConfig(
-        chunk_hours=4,
-        max_workers=6,
-        array_size=100000,
-        pool_size=15,
-        pool_max=25
-    )
-    
-    # Database credentials
-    username = os.getenv('ORACLE_USER', 'your_username')
-    password = os.getenv('ORACLE_PASSWORD', 'your_password')
-    dsn = os.getenv('ORACLE_DSN', 'localhost:1521/xe')
-    
-    # Example 1: SQL to Pandas conversion
-    print("=== SQL to Pandas Conversion Demo ===")
-    sample_sql = """
-    SELECT customer_id, product_name, SUM(quantity) as total_qty, AVG(price) as avg_price
-    FROM sales_data 
-    WHERE sale_date >= '2024-01-01' AND status = 'COMPLETE'
-    GROUP BY customer_id, product_name
-    ORDER BY total_qty DESC;
-    """
-    
-    # Create sample SQL file
-    with open('sample_queries.sql', 'w') as f:
-        f.write(sample_sql)
-    
-    convert_tsql_to_pandas('sample_queries.sql', 'converted_pandas.py')
-    print("SQL converted to Pandas operations in 'converted_pandas.py'")
-    
-    # Example 2: Enhanced Oracle querying
-    print("\n=== Enhanced Oracle Querying Demo ===")
-    connector = EnhancedOracleConnector(config)
-    
-    try:
-        connector.create_connection_pool(username, password, dsn)
         
-        # Query with enhanced monitoring
-        start_date = datetime(2024, 1, 1)
-        end_date = datetime(2024, 1, 2)
+        for sql_op, pandas_op in replacements.items():
+            pandas_where = re.sub(sql_op, pandas_op, pandas_where, flags=re.IGNORECASE)
         
-        base_query = """
-        SELECT id, timestamp_col, data_column1, data_column2
-        FROM your_large_table 
-        WHERE {date_column} BETWEEN 
-            TO_TIMESTAMP('{start_time}', 'YYYY-MM-DD HH24:MI:SS') 
-            AND TO_TIMESTAMP('{end_time}', 'YYYY-MM-DD HH24:MI:SS')
-        AND status = 'ACTIVE'
-        ORDER BY {date_column}
+        return pandas_where
+    
+    def convert_group_by(self, group_items: List[str], select_items: List[str]) -> List[str]:
+        """Convert GROUP BY clause to Pandas groupby"""
+        code_lines = []
+        
+        group_clause = ' '.join(group_items).strip()
+        group_columns = [self.clean_identifier(col.strip()) for col in group_clause.split(',')]
+        
+        select_clause = ' '.join(select_items).strip()
+        agg_functions = self.detect_aggregations(select_clause)
+        
+        code_lines.append("# Group by operation")
+        
+        if agg_functions:
+            code_lines.append(f"df = df.groupby({group_columns}).agg({{")
+            for col, func in agg_functions.items():
+                code_lines.append(f"    '{col}': '{func}',")
+            code_lines.append("}).reset_index()")
+        else:
+            code_lines.append(f"df = df.groupby({group_columns}).size().reset_index(name='count')")
+        
+        code_lines.append("")
+        return code_lines
+    
+    def detect_aggregations(self, select_clause: str) -> Dict[str, str]:
+        """Detect aggregation functions in SELECT clause"""
+        agg_functions = {}
+        
+        agg_patterns = {
+            r'COUNT\s*\(\s*([^)]+)\s*\)': 'count',
+            r'SUM\s*\(\s*([^)]+)\s*\)': 'sum',
+            r'AVG\s*\(\s*([^)]+)\s*\)': 'mean',
+            r'MIN\s*\(\s*([^)]+)\s*\)': 'min',
+            r'MAX\s*\(\s*([^)]+)\s*\)': 'max'
+        }
+        
+        for pattern, func in agg_patterns.items():
+            matches = re.finditer(pattern, select_clause, re.IGNORECASE)
+            for match in matches:
+                column = self.clean_identifier(match.group(1))
+                if column != '*':
+                    agg_functions[column] = func
+        
+        return agg_functions
+    
+    def convert_order_by(self, order_items: List[str]) -> List[str]:
+        """Convert ORDER BY clause to Pandas sort_values"""
+        code_lines = []
+        
+        order_clause = ' '.join(order_items).strip()
+        
+        order_columns = []
+        ascending = []
+        
+        items = [item.strip() for item in order_clause.split(',')]
+        for item in items:
+            parts = item.split()
+            column = self.clean_identifier(parts[0])
+            order_columns.append(column)
+            
+            if len(parts) > 1 and parts[1].upper() == 'DESC':
+                ascending.append(False)
+            else:
+                ascending.append(True)
+        
+        code_lines.append("# Sort results")
+        if len(order_columns) == 1:
+            asc_val = str(ascending[0]).lower()
+            code_lines.append(f"df = df.sort_values('{order_columns[0]}', ascending={asc_val})")
+        else:
+            columns_str = str(order_columns)
+            ascending_str = str(ascending)
+            code_lines.append(f"df = df.sort_values({columns_str}, ascending={ascending_str})")
+        
+        code_lines.append("")
+        return code_lines
+    
+    def convert_joins(self, join_items: List[str]) -> List[str]:
+        """Convert JOIN clauses to Pandas merge operations"""
+        code_lines = []
+        
+        join_clause = ' '.join(join_items)
+        
+        code_lines.append("# JOIN operations")
+        code_lines.append("# Note: Load additional tables and use pd.merge()")
+        code_lines.append(f"# Original JOIN: {join_clause}")
+        code_lines.append("# df = pd.merge(df, other_df, on='key_column', how='inner')")
+        code_lines.append("")
+        
+        return code_lines
+    
+    def clean_identifier(self, identifier: str) -> str:
+        """Clean SQL identifier (remove brackets, quotes, etc.)"""
+        if not identifier:
+            return identifier
+        
+        cleaned = identifier.strip()
+        cleaned = re.sub(r'[\[\]"`]', '', cleaned)
+        
+        return cleaned
+
+# Enhanced test function with new features
+def test_enhanced_converter():
+    """Test the enhanced converter with CTEs, temp tables, etc."""
+    converter = TSQLToPandasConverter()
+    
+    test_queries = [
+        # CTE Example
         """
-        
-        df_result = connector.execute_chunked_query_enhanced(
-            base_query=base_query,
-            date_column='timestamp_col',
-            start_date=start_date,
-            end_date=end_date
+        WITH RegionalSales AS (
+            SELECT Region, SUM(Sales) as TotalSales
+            FROM SalesData
+            WHERE Year = 2023
+            GROUP BY Region
         )
+        SELECT Region, TotalSales
+        FROM RegionalSales
+        WHERE TotalSales > 100000
+        ORDER BY TotalSales DESC;
+        """,
         
-        print(f"Retrieved {len(df_result)} rows")
-        print("Performance statistics:", connector.get_performance_stats())
+        # Temp Table Example
+        """
+        CREATE TABLE #TempCustomers (
+            CustomerID INT,
+            CustomerName VARCHAR(100),
+            Region VARCHAR(50)
+        );
         
-    except Exception as e:
-        logger.error(f"Error in main execution: {e}")
-    finally:
-        connector.close_pool()
+        INSERT INTO #TempCustomers VALUES (1, 'John Doe', 'North');
+        INSERT INTO #TempCustomers VALUES (2, 'Jane Smith', 'South');
+        
+        SELECT * FROM #TempCustomers WHERE Region = 'North';
+        
+        DROP TABLE #TempCustomers;
+        """,
+        
+        # Variable Declaration and Usage
+        """
+        DECLARE @MinSales INT = 50000;
+        DECLARE @Region VARCHAR(20) = 'West';
+        
+        SELECT CustomerID, TotalSales
+        FROM CustomerSummary
+        WHERE TotalSales > @MinSales AND Region = @Region;
+        """,
+        
+        # UPDATE and DELETE
+        """
+        UPDATE Products
+        SET Price = Price * 1.1
+        WHERE Category = 'Electronics';
+        
+        DELETE FROM Orders
+        WHERE OrderDate < '2023-01-01';
+        
+        TRUNCATE TABLE TempLog;
+        """
+    ]
+    
+    print("Enhanced T-SQL to Pandas Converter - Test Results")
+    print("=" * 60)
+    
+    for i, query in enumerate(test_queries, 1):
+        print(f"\n--- Test Query {i} ---")
+        print("Original SQL:")
+        print(query.strip())
+        print("\nConverted Pandas Code:")
+        print(converter.convert_sql_to_pandas(query))
+        print("-" * 40)
 
 if __name__ == "__main__":
-    main()
+    test_enhanced_converter()
