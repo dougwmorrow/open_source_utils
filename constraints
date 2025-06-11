@@ -1,196 +1,296 @@
 #!/usr/bin/env python3
 """
-Optimized Oracle Database Query Script - Function-based
+Enhanced Oracle Database Query Script with SQL-to-Pandas Conversion
 Handles large datasets (1.5-3M rows/day) with performance optimizations
+Includes SQL-to-Pandas conversion utilities
 """
 
 import oracledb
 import pandas as pd
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 import time
 from contextlib import contextmanager
 import os
+import logging
+import re
+import sqlparse
+from dataclasses import dataclass
+from pathlib import Path
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-def create_connection_pool(username: str, password: str, dsn: str, 
-                          pool_size: int = 10, pool_increment: int = 5, 
-                          pool_max: int = 20):
-    """
-    Create Oracle connection pool for better performance
+@dataclass
+class QueryConfig:
+    """Configuration for query execution"""
+    chunk_hours: int = 6
+    max_workers: int = 4
+    array_size: int = 50000
+    pool_size: int = 10
+    pool_max: int = 20
+    sort_area_size: int = 67108864  # 64MB
+    hash_area_size: int = 67108864  # 64MB
+
+class SQLToPandasConverter:
+    """Converts SQL queries to equivalent Pandas operations"""
     
-    Args:
-        username: Oracle username
-        password: Oracle password
-        dsn: Data Source Name (host:port/service_name)
-        pool_size: Initial pool size
-        pool_increment: Pool increment size
-        pool_max: Maximum pool size
-    
-    Returns:
-        Connection pool object
-    """
-    pool = oracledb.create_pool(
-        user=username,
-        password=password,
-        dsn=dsn,
-        min=pool_size,
-        max=pool_max,
-        increment=pool_increment,
-        threaded=True,
-        getmode=oracledb.POOL_GETMODE_WAIT
-    )
-    return pool
-
-
-@contextmanager
-def get_connection(pool):
-    """Context manager for getting connections from pool"""
-    connection = None
-    try:
-        connection = pool.acquire()
-        yield connection
-    finally:
-        if connection:
-            pool.release(connection)
-
-
-def optimize_session(connection):
-    """Apply session-level optimizations"""
-    cursor = connection.cursor()
-    try:
-        # Increase array fetch size for bulk operations
-        cursor.arraysize = 10000
-        
-        # Optimize for bulk operations
-        cursor.execute("ALTER SESSION SET OPTIMIZER_MODE = FIRST_ROWS_100000")
-        cursor.execute("ALTER SESSION SET CURSOR_SHARING = FORCE")
-        cursor.execute("ALTER SESSION SET DB_FILE_MULTIBLOCK_READ_COUNT = 128")
-        
-        # Increase sort area size for better performance
-        cursor.execute("ALTER SESSION SET SORT_AREA_SIZE = 67108864")  # 64MB
-        cursor.execute("ALTER SESSION SET HASH_AREA_SIZE = 67108864")   # 64MB
-        
-    except Exception:
-        pass  # Some session optimizations may fail, continue anyway
-    finally:
-        cursor.close()
-
-
-def generate_time_chunks(start_date: datetime, end_date: datetime, 
-                        chunk_hours: int) -> List[Tuple[datetime, datetime]]:
-    """Generate time-based chunks for parallel processing"""
-    chunks = []
-    current = start_date
-    
-    while current < end_date:
-        chunk_end = min(current + timedelta(hours=chunk_hours), end_date)
-        chunks.append((current, chunk_end))
-        current = chunk_end
-        
-    return chunks
-
-
-def execute_chunk(pool, base_query: str, chunk: Tuple[datetime, datetime], 
-                 date_column: str) -> pd.DataFrame:
-    """Execute query for a single time chunk"""
-    start_time, end_time = chunk
-    
-    # Format query with time parameters
-    query = base_query.format(
-        start_time=start_time.strftime('%Y-%m-%d %H:%M:%S'),
-        end_time=end_time.strftime('%Y-%m-%d %H:%M:%S'),
-        date_column=date_column
-    )
-    
-    with get_connection(pool) as connection:
-        optimize_session(connection)
-        
-        cursor = connection.cursor()
-        cursor.arraysize = 50000  # Large fetch size for bulk data
-        
-        try:
-            cursor.execute(query)
-            
-            # Fetch all results efficiently
-            columns = [desc[0] for desc in cursor.description]
-            rows = cursor.fetchall()
-            
-            return pd.DataFrame(rows, columns=columns)
-            
-        finally:
-            cursor.close()
-
-
-def execute_chunked_query(pool, base_query: str, date_column: str,
-                         start_date: datetime, end_date: datetime,
-                         chunk_hours: int = 6, max_workers: int = 4) -> pd.DataFrame:
-    """
-    Execute query in time-based chunks with parallel processing
-    
-    Args:
-        pool: Oracle connection pool
-        base_query: SQL query with {start_time} and {end_time} placeholders
-        date_column: Column name for date filtering
-        start_date: Start datetime
-        end_date: End datetime
-        chunk_hours: Hours per chunk
-        max_workers: Maximum parallel workers
-    
-    Returns:
-        Combined DataFrame with all results
-    """
-    # Generate time chunks
-    chunks = generate_time_chunks(start_date, end_date, chunk_hours)
-    
-    results = []
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all chunk queries
-        future_to_chunk = {
-            executor.submit(execute_chunk, pool, base_query, chunk, date_column): chunk
-            for chunk in chunks
+    def __init__(self):
+        self.supported_functions = {
+            'COUNT': 'count',
+            'SUM': 'sum',
+            'AVG': 'mean',
+            'MIN': 'min',
+            'MAX': 'max',
+            'STDDEV': 'std',
+            'VARIANCE': 'var'
         }
         
-        # Collect results as they complete
-        for future in as_completed(future_to_chunk):
-            chunk = future_to_chunk[future]
+    def parse_sql_file(self, file_path: str) -> List[str]:
+        """Parse SQL file and extract individual queries"""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Split by semicolon but be careful with strings
+        queries = sqlparse.split(content)
+        return [q.strip() for q in queries if q.strip()]
+    
+    def convert_select_query(self, sql: str) -> str:
+        """Convert SELECT query to Pandas operations"""
+        parsed = sqlparse.parse(sql)[0]
+        
+        # Extract components
+        select_clause = self._extract_select_clause(parsed)
+        from_clause = self._extract_from_clause(parsed)
+        where_clause = self._extract_where_clause(parsed)
+        group_by_clause = self._extract_group_by_clause(parsed)
+        order_by_clause = self._extract_order_by_clause(parsed)
+        
+        # Build Pandas code
+        pandas_code = []
+        
+        # Start with DataFrame
+        pandas_code.append(f"# Original SQL: {sql.strip()}")
+        pandas_code.append(f"df = {from_clause}")
+        
+        # Apply WHERE conditions
+        if where_clause:
+            pandas_code.append(f"df = df.query('{where_clause}')")
+        
+        # Apply GROUP BY and aggregations
+        if group_by_clause:
+            agg_code = self._convert_aggregations(select_clause, group_by_clause)
+            pandas_code.append(agg_code)
+        else:
+            # Simple SELECT
+            if select_clause != '*':
+                pandas_code.append(f"df = df[{select_clause}]")
+        
+        # Apply ORDER BY
+        if order_by_clause:
+            pandas_code.append(f"df = df.sort_values({order_by_clause})")
+        
+        return '\n'.join(pandas_code)
+    
+    def _extract_select_clause(self, parsed) -> str:
+        """Extract SELECT clause columns"""
+        # Simplified implementation - would need more robust parsing
+        tokens = list(parsed.flatten())
+        select_found = False
+        columns = []
+        
+        for token in tokens:
+            if token.ttype is sqlparse.tokens.Keyword and token.value.upper() == 'SELECT':
+                select_found = True
+                continue
+            elif token.ttype is sqlparse.tokens.Keyword and token.value.upper() == 'FROM':
+                break
+            elif select_found and token.ttype not in (sqlparse.tokens.Whitespace, sqlparse.tokens.Punctuation):
+                if token.value != ',':
+                    columns.append(f"'{token.value}'")
+        
+        return '[' + ', '.join(columns) + ']' if columns else "'*'"
+    
+    def _extract_from_clause(self, parsed) -> str:
+        """Extract FROM clause table name"""
+        tokens = list(parsed.flatten())
+        from_found = False
+        
+        for token in tokens:
+            if token.ttype is sqlparse.tokens.Keyword and token.value.upper() == 'FROM':
+                from_found = True
+                continue
+            elif from_found and token.ttype not in (sqlparse.tokens.Whitespace, sqlparse.tokens.Punctuation):
+                if token.ttype is sqlparse.tokens.Keyword:
+                    break
+                return f"load_table('{token.value}')"  # Placeholder function
+        
+        return "df"
+    
+    def _extract_where_clause(self, parsed) -> Optional[str]:
+        """Extract WHERE clause conditions"""
+        # Simplified - would need proper condition parsing
+        sql_str = str(parsed)
+        where_match = re.search(r'WHERE\s+(.+?)(?:\s+GROUP\s+BY|\s+ORDER\s+BY|\s*$)', sql_str, re.IGNORECASE)
+        if where_match:
+            condition = where_match.group(1).strip()
+            # Convert SQL operators to Python
+            condition = condition.replace('=', '==')
+            condition = condition.replace('AND', '&')
+            condition = condition.replace('OR', '|')
+            return condition
+        return None
+    
+    def _extract_group_by_clause(self, parsed) -> Optional[List[str]]:
+        """Extract GROUP BY columns"""
+        sql_str = str(parsed)
+        group_match = re.search(r'GROUP\s+BY\s+(.+?)(?:\s+ORDER\s+BY|\s*$)', sql_str, re.IGNORECASE)
+        if group_match:
+            columns = [col.strip().strip("'\"") for col in group_match.group(1).split(',')]
+            return columns
+        return None
+    
+    def _extract_order_by_clause(self, parsed) -> Optional[str]:
+        """Extract ORDER BY clause"""
+        sql_str = str(parsed)
+        order_match = re.search(r'ORDER\s+BY\s+(.+)$', sql_str, re.IGNORECASE)
+        if order_match:
+            order_clause = order_match.group(1).strip()
+            # Convert to Pandas format
+            columns = []
+            ascending = []
+            for col in order_clause.split(','):
+                col = col.strip()
+                if 'DESC' in col.upper():
+                    columns.append(f"'{col.replace('DESC', '').strip()}'")
+                    ascending.append('False')
+                else:
+                    columns.append(f"'{col.replace('ASC', '').strip()}'")
+                    ascending.append('True')
+            
+            return f"[{', '.join(columns)}], ascending=[{', '.join(ascending)}]"
+        return None
+    
+    def _convert_aggregations(self, select_clause: str, group_by_columns: List[str]) -> str:
+        """Convert aggregation functions to Pandas"""
+        # Simplified aggregation conversion
+        return f"df = df.groupby({group_by_columns}).agg({select_clause})"
+    
+    def convert_sql_file(self, input_file: str, output_file: str):
+        """Convert entire SQL file to Pandas operations"""
+        queries = self.parse_sql_file(input_file)
+        pandas_code = []
+        
+        pandas_code.append("import pandas as pd")
+        pandas_code.append("import numpy as np")
+        pandas_code.append("from datetime import datetime")
+        pandas_code.append("")
+        
+        for i, query in enumerate(queries):
+            pandas_code.append(f"# Query {i + 1}")
+            converted = self.convert_select_query(query)
+            pandas_code.append(converted)
+            pandas_code.append("")
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(pandas_code))
+        
+        logger.info(f"Converted {len(queries)} queries to {output_file}")
+
+class EnhancedOracleConnector:
+    """Enhanced Oracle connector with improved error handling and monitoring"""
+    
+    def __init__(self, config: QueryConfig = None):
+        self.config = config or QueryConfig()
+        self.pool = None
+        self.stats = {
+            'queries_executed': 0,
+            'total_rows_fetched': 0,
+            'total_execution_time': 0,
+            'errors': 0
+        }
+    
+    def create_connection_pool(self, username: str, password: str, dsn: str):
+        """Create Oracle connection pool with enhanced configuration"""
+        try:
+            self.pool = oracledb.create_pool(
+                user=username,
+                password=password,
+                dsn=dsn,
+                min=self.config.pool_size,
+                max=self.config.pool_max,
+                increment=5,
+                threaded=True,
+                getmode=oracledb.POOL_GETMODE_WAIT,
+                timeout=300,  # 5 minutes
+                max_lifetime_session=3600,  # 1 hour
+                retry_count=3,
+                retry_delay=1
+            )
+            logger.info(f"Created connection pool: {self.config.pool_size}-{self.config.pool_max} connections")
+            return self.pool
+        except Exception as e:
+            logger.error(f"Failed to create connection pool: {e}")
+            raise
+    
+    @contextmanager
+    def get_connection(self):
+        """Enhanced context manager with retry logic"""
+        connection = None
+        max_retries = 3
+        
+        for attempt in range(max_retries):
             try:
-                df_chunk = future.result()
-                if not df_chunk.empty:
-                    results.append(df_chunk)
-            except Exception:
-                pass  # Skip failed chunks
+                connection = self.pool.acquire()
+                yield connection
+                break
+            except Exception as e:
+                self.stats['errors'] += 1
+                if attempt == max_retries - 1:
+                    logger.error(f"Failed to acquire connection after {max_retries} attempts: {e}")
+                    raise
+                else:
+                    logger.warning(f"Connection attempt {attempt + 1} failed, retrying: {e}")
+                    time.sleep(2 ** attempt)  # Exponential backoff
+            finally:
+                if connection:
+                    self.pool.release(connection)
     
-    # Combine all results
-    if results:
-        final_df = pd.concat(results, ignore_index=True)
-        return final_df
-    else:
-        return pd.DataFrame()
-
-
-def execute_single_optimized_query(pool, query: str, bind_vars: Dict = None) -> pd.DataFrame:
-    """
-    Execute a single optimized query for large datasets
-    
-    Args:
-        pool: Oracle connection pool
-        query: SQL query string
-        bind_vars: Dictionary of bind variables
-    
-    Returns:
-        DataFrame with query results
-    """
-    with get_connection(pool) as connection:
-        optimize_session(connection)
+    def optimize_session(self, connection):
+        """Apply comprehensive session-level optimizations"""
+        optimizations = [
+            f"ALTER SESSION SET OPTIMIZER_MODE = FIRST_ROWS_{self.config.array_size}",
+            "ALTER SESSION SET CURSOR_SHARING = FORCE",
+            "ALTER SESSION SET DB_FILE_MULTIBLOCK_READ_COUNT = 128",
+            f"ALTER SESSION SET SORT_AREA_SIZE = {self.config.sort_area_size}",
+            f"ALTER SESSION SET HASH_AREA_SIZE = {self.config.hash_area_size}",
+            "ALTER SESSION SET WORKAREA_SIZE_POLICY = AUTO",
+            "ALTER SESSION SET PGA_AGGREGATE_TARGET = 1G",
+            "ALTER SESSION SET PARALLEL_DEGREE_POLICY = AUTO"
+        ]
         
         cursor = connection.cursor()
+        try:
+            cursor.arraysize = self.config.array_size
+            
+            for opt in optimizations:
+                try:
+                    cursor.execute(opt)
+                except Exception as e:
+                    logger.debug(f"Optimization failed (continuing): {opt} - {e}")
+                    
+        finally:
+            cursor.close()
+    
+    def execute_with_metrics(self, connection, query: str, bind_vars: Dict = None) -> Tuple[pd.DataFrame, Dict]:
+        """Execute query with performance metrics"""
+        start_time = time.time()
         
-        # Optimize cursor for large result sets
-        cursor.arraysize = 100000  # Very large fetch size
-        cursor.prefetchrows = 100000
+        cursor = connection.cursor()
+        cursor.arraysize = self.config.array_size
+        cursor.prefetchrows = self.config.array_size
         
         try:
             if bind_vars:
@@ -198,279 +298,209 @@ def execute_single_optimized_query(pool, query: str, bind_vars: Dict = None) -> 
             else:
                 cursor.execute(query)
             
-            # Get column names
             columns = [desc[0] for desc in cursor.description]
             
-            # Fetch data in chunks to manage memory
+            # Fetch data efficiently
             all_rows = []
+            fetch_count = 0
+            
             while True:
-                rows = cursor.fetchmany(100000)
+                rows = cursor.fetchmany(self.config.array_size)
                 if not rows:
                     break
                 all_rows.extend(rows)
+                fetch_count += 1
             
-            return pd.DataFrame(all_rows, columns=columns)
+            df = pd.DataFrame(all_rows, columns=columns)
             
-        finally:
-            cursor.close()
-
-
-def execute_streaming_query(pool, query: str, chunk_size: int = 100000, 
-                           callback=None):
-    """
-    Execute query with streaming results to handle very large datasets
-    
-    Args:
-        pool: Oracle connection pool
-        query: SQL query string
-        chunk_size: Number of rows per chunk
-        callback: Function to process each chunk
-    """
-    with get_connection(pool) as connection:
-        optimize_session(connection)
-        
-        cursor = connection.cursor()
-        cursor.arraysize = chunk_size
-        
-        try:
-            cursor.execute(query)
-            columns = [desc[0] for desc in cursor.description]
+            # Update statistics
+            execution_time = time.time() - start_time
+            self.stats['queries_executed'] += 1
+            self.stats['total_rows_fetched'] += len(df)
+            self.stats['total_execution_time'] += execution_time
             
-            chunk_num = 0
-            total_rows = 0
+            metrics = {
+                'execution_time': execution_time,
+                'rows_fetched': len(df),
+                'fetch_operations': fetch_count,
+                'rows_per_second': len(df) / execution_time if execution_time > 0 else 0
+            }
             
-            while True:
-                rows = cursor.fetchmany(chunk_size)
-                if not rows:
-                    break
-                
-                chunk_num += 1
-                total_rows += len(rows)
-                
-                df_chunk = pd.DataFrame(rows, columns=columns)
-                
-                if callback:
-                    callback(df_chunk, chunk_num)
+            logger.info(f"Query executed: {len(df)} rows in {execution_time:.2f}s "
+                       f"({metrics['rows_per_second']:.0f} rows/sec)")
             
-            return total_rows
+            return df, metrics
             
         finally:
             cursor.close()
-
-
-def get_table_stats(pool, table_name: str) -> Dict[str, Any]:
-    """Get table statistics for query optimization"""
-    query = """
-    SELECT 
-        num_rows,
-        blocks,
-        avg_row_len,
-        last_analyzed
-    FROM user_tables 
-    WHERE table_name = UPPER(:table_name)
-    """
     
-    with get_connection(pool) as connection:
-        cursor = connection.cursor()
-        try:
-            cursor.execute(query, {'table_name': table_name})
-            result = cursor.fetchone()
+    def execute_chunked_query_enhanced(self, base_query: str, date_column: str,
+                                     start_date: datetime, end_date: datetime,
+                                     chunk_hours: int = None, max_workers: int = None) -> pd.DataFrame:
+        """Enhanced chunked query execution with better error handling"""
+        chunk_hours = chunk_hours or self.config.chunk_hours
+        max_workers = max_workers or self.config.max_workers
+        
+        chunks = self._generate_time_chunks(start_date, end_date, chunk_hours)
+        results = []
+        failed_chunks = []
+        
+        logger.info(f"Executing query in {len(chunks)} chunks with {max_workers} workers")
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_chunk = {
+                executor.submit(self._execute_chunk_safe, base_query, chunk, date_column): chunk
+                for chunk in chunks
+            }
             
-            if result:
-                return {
-                    'num_rows': result[0],
-                    'blocks': result[1],
-                    'avg_row_len': result[2],
-                    'last_analyzed': result[3]
-                }
-            return {}
-        finally:
-            cursor.close()
-
-
-def close_connection_pool(pool):
-    """Close the connection pool"""
-    if pool:
-        pool.close()
-
-
-def process_chunk_callback(df_chunk: pd.DataFrame, chunk_num: int):
-    """Example callback for processing streaming data chunks"""
-    # Process each chunk (e.g., save to file, transform data, etc.)
-    filename = f"data_chunk_{chunk_num:04d}.parquet"
-    df_chunk.to_parquet(filename, compression='snappy')
-    print(f"Saved chunk {chunk_num} to {filename}")
-
-
-def query_large_dataset_by_date(username: str, password: str, dsn: str,
-                               table_name: str, date_column: str,
-                               start_date: datetime, end_date: datetime,
-                               columns: List[str] = None,
-                               where_conditions: str = "",
-                               chunk_hours: int = 6,
-                               max_workers: int = 4) -> pd.DataFrame:
-    """
-    High-level function to query large dataset by date range
-    
-    Args:
-        username: Oracle username
-        password: Oracle password
-        dsn: Data Source Name
-        table_name: Table to query
-        date_column: Date column for filtering
-        start_date: Start datetime
-        end_date: End datetime
-        columns: List of columns to select (None for all)
-        where_conditions: Additional WHERE conditions
-        chunk_hours: Hours per chunk for parallel processing
-        max_workers: Number of parallel workers
-    
-    Returns:
-        DataFrame with query results
-    """
-    # Create connection pool
-    pool = create_connection_pool(username, password, dsn)
-    
-    try:
-        # Build query
-        col_str = "*" if not columns else ", ".join(columns)
-        where_clause = f"AND {where_conditions}" if where_conditions else ""
+            for future in as_completed(future_to_chunk):
+                chunk = future_to_chunk[future]
+                try:
+                    df_chunk = future.result()
+                    if not df_chunk.empty:
+                        results.append(df_chunk)
+                        logger.debug(f"Chunk {chunk} completed: {len(df_chunk)} rows")
+                except Exception as e:
+                    failed_chunks.append(chunk)
+                    logger.error(f"Chunk {chunk} failed: {e}")
         
-        base_query = f"""
-        SELECT {col_str}
-        FROM {table_name} 
-        WHERE {{date_column}} BETWEEN 
-            TO_TIMESTAMP('{{start_time}}', 'YYYY-MM-DD HH24:MI:SS') 
-            AND TO_TIMESTAMP('{{end_time}}', 'YYYY-MM-DD HH24:MI:SS')
-        {where_clause}
-        ORDER BY {{date_column}}
-        """
+        if failed_chunks:
+            logger.warning(f"{len(failed_chunks)} chunks failed out of {len(chunks)}")
         
-        # Execute chunked query
-        result_df = execute_chunked_query(
-            pool=pool,
-            base_query=base_query,
-            date_column=date_column,
-            start_date=start_date,
-            end_date=end_date,
-            chunk_hours=chunk_hours,
-            max_workers=max_workers
+        if results:
+            final_df = pd.concat(results, ignore_index=True)
+            logger.info(f"Total rows retrieved: {len(final_df)}")
+            return final_df
+        else:
+            logger.warning("No data retrieved from any chunks")
+            return pd.DataFrame()
+    
+    def _execute_chunk_safe(self, base_query: str, chunk: Tuple[datetime, datetime], 
+                           date_column: str) -> pd.DataFrame:
+        """Safely execute a single chunk with error handling"""
+        start_time, end_time = chunk
+        
+        query = base_query.format(
+            start_time=start_time.strftime('%Y-%m-%d %H:%M:%S'),
+            end_time=end_time.strftime('%Y-%m-%d %H:%M:%S'),
+            date_column=date_column
         )
         
-        return result_df
+        with self.get_connection() as connection:
+            self.optimize_session(connection)
+            df, metrics = self.execute_with_metrics(connection, query)
+            return df
+    
+    def _generate_time_chunks(self, start_date: datetime, end_date: datetime, 
+                            chunk_hours: int) -> List[Tuple[datetime, datetime]]:
+        """Generate time-based chunks for parallel processing"""
+        chunks = []
+        current = start_date
         
-    finally:
-        close_connection_pool(pool)
-
-
-def query_with_streaming(username: str, password: str, dsn: str,
-                        query: str, chunk_size: int = 100000,
-                        callback=None) -> int:
-    """
-    High-level function for streaming large queries
+        while current < end_date:
+            chunk_end = min(current + timedelta(hours=chunk_hours), end_date)
+            chunks.append((current, chunk_end))
+            current = chunk_end
+            
+        return chunks
     
-    Args:
-        username: Oracle username
-        password: Oracle password
-        dsn: Data Source Name
-        query: SQL query string
-        chunk_size: Rows per chunk
-        callback: Function to process each chunk
-    
-    Returns:
-        Total number of rows processed
-    """
-    pool = create_connection_pool(username, password, dsn)
-    
-    try:
-        total_rows = execute_streaming_query(
-            pool=pool,
-            query=query,
-            chunk_size=chunk_size,
-            callback=callback
-        )
-        return total_rows
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get performance statistics"""
+        if self.stats['queries_executed'] > 0:
+            avg_execution_time = self.stats['total_execution_time'] / self.stats['queries_executed']
+            avg_rows_per_query = self.stats['total_rows_fetched'] / self.stats['queries_executed']
+        else:
+            avg_execution_time = 0
+            avg_rows_per_query = 0
         
-    finally:
-        close_connection_pool(pool)
+        return {
+            **self.stats,
+            'avg_execution_time': avg_execution_time,
+            'avg_rows_per_query': avg_rows_per_query,
+            'success_rate': (self.stats['queries_executed'] - self.stats['errors']) / max(1, self.stats['queries_executed'])
+        }
+    
+    def close_pool(self):
+        """Close connection pool and log final statistics"""
+        if self.pool:
+            self.pool.close()
+            stats = self.get_performance_stats()
+            logger.info(f"Connection pool closed. Final stats: {stats}")
 
+def convert_tsql_to_pandas(sql_file: str, output_file: str):
+    """High-level function to convert T-SQL file to Pandas"""
+    converter = SQLToPandasConverter()
+    converter.convert_sql_file(sql_file, output_file)
 
 def main():
-    """Example usage of the Oracle query functions"""
+    """Enhanced main function with SQL conversion demo"""
     
     # Configuration
+    config = QueryConfig(
+        chunk_hours=4,
+        max_workers=6,
+        array_size=100000,
+        pool_size=15,
+        pool_max=25
+    )
+    
+    # Database credentials
     username = os.getenv('ORACLE_USER', 'your_username')
     password = os.getenv('ORACLE_PASSWORD', 'your_password')
     dsn = os.getenv('ORACLE_DSN', 'localhost:1521/xe')
     
-    # Example 1: Query large dataset by date range
-    start_date = datetime(2024, 1, 1)
-    end_date = datetime(2024, 1, 2)  # One day
-    
-    print("Executing chunked parallel query...")
-    df_result = query_large_dataset_by_date(
-        username=username,
-        password=password,
-        dsn=dsn,
-        table_name='your_large_table',
-        date_column='timestamp_col',
-        start_date=start_date,
-        end_date=end_date,
-        columns=['id', 'timestamp_col', 'data_column1', 'data_column2'],
-        where_conditions="status = 'ACTIVE'",
-        chunk_hours=4,
-        max_workers=6
-    )
-    
-    print(f"Retrieved {len(df_result)} rows")
-    
-    # Example 2: Streaming query
-    streaming_query = """
-    SELECT * FROM your_large_table 
-    WHERE date_col >= TO_DATE('2024-01-01', 'YYYY-MM-DD')
-    ORDER BY date_col
+    # Example 1: SQL to Pandas conversion
+    print("=== SQL to Pandas Conversion Demo ===")
+    sample_sql = """
+    SELECT customer_id, product_name, SUM(quantity) as total_qty, AVG(price) as avg_price
+    FROM sales_data 
+    WHERE sale_date >= '2024-01-01' AND status = 'COMPLETE'
+    GROUP BY customer_id, product_name
+    ORDER BY total_qty DESC;
     """
     
-    print("Executing streaming query...")
-    total_rows = query_with_streaming(
-        username=username,
-        password=password,
-        dsn=dsn,
-        query=streaming_query,
-        chunk_size=50000,
-        callback=process_chunk_callback
-    )
+    # Create sample SQL file
+    with open('sample_queries.sql', 'w') as f:
+        f.write(sample_sql)
     
-    print(f"Processed {total_rows} total rows")
+    convert_tsql_to_pandas('sample_queries.sql', 'converted_pandas.py')
+    print("SQL converted to Pandas operations in 'converted_pandas.py'")
     
-    # Example 3: Using individual functions with custom logic
-    pool = create_connection_pool(username, password, dsn)
+    # Example 2: Enhanced Oracle querying
+    print("\n=== Enhanced Oracle Querying Demo ===")
+    connector = EnhancedOracleConnector(config)
     
     try:
-        # Get table statistics
-        stats = get_table_stats(pool, 'your_large_table')
-        print(f"Table stats: {stats}")
+        connector.create_connection_pool(username, password, dsn)
         
-        # Execute single optimized query
-        single_query = """
-        SELECT * FROM your_large_table 
-        WHERE date_col >= :start_date 
-        AND date_col < :end_date
-        AND status = :status
+        # Query with enhanced monitoring
+        start_date = datetime(2024, 1, 1)
+        end_date = datetime(2024, 1, 2)
+        
+        base_query = """
+        SELECT id, timestamp_col, data_column1, data_column2
+        FROM your_large_table 
+        WHERE {date_column} BETWEEN 
+            TO_TIMESTAMP('{start_time}', 'YYYY-MM-DD HH24:MI:SS') 
+            AND TO_TIMESTAMP('{end_time}', 'YYYY-MM-DD HH24:MI:SS')
+        AND status = 'ACTIVE'
+        ORDER BY {date_column}
         """
         
-        bind_vars = {
-            'start_date': start_date,
-            'end_date': end_date,
-            'status': 'ACTIVE'
-        }
+        df_result = connector.execute_chunked_query_enhanced(
+            base_query=base_query,
+            date_column='timestamp_col',
+            start_date=start_date,
+            end_date=end_date
+        )
         
-        df_single = execute_single_optimized_query(pool, single_query, bind_vars)
-        print(f"Single query retrieved {len(df_single)} rows")
+        print(f"Retrieved {len(df_result)} rows")
+        print("Performance statistics:", connector.get_performance_stats())
         
+    except Exception as e:
+        logger.error(f"Error in main execution: {e}")
     finally:
-        close_connection_pool(pool)
-
+        connector.close_pool()
 
 if __name__ == "__main__":
     main()
