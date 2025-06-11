@@ -1,239 +1,476 @@
--- Main conversion procedure that can be called from anywhere
-CREATE OR ALTER PROCEDURE [dbo].[sp_ConvertXMLToNVarchar]
-    @LinkedServerName NVARCHAR(128),
-    @DatabaseName NVARCHAR(128),
-    @SchemaName NVARCHAR(128),
-    @TableName NVARCHAR(128),
-    @OutputTable NVARCHAR(128) = NULL,  -- Optional: store results in a table
-    @Debug BIT = 0
-AS
-BEGIN
-    SET NOCOUNT ON;
-    
-    DECLARE @SQL NVARCHAR(MAX);
-    DECLARE @ColumnList NVARCHAR(MAX) = '';
-    DECLARE @ErrorMessage NVARCHAR(4000);
-    DECLARE @ErrorSeverity INT;
-    DECLARE @ErrorState INT;
-    
-    BEGIN TRY
-        -- Step 1: Get column information from linked server
-        CREATE TABLE #ColumnInfo (
-            COLUMN_NAME NVARCHAR(128),
-            DATA_TYPE NVARCHAR(128),
-            IS_XML BIT DEFAULT 0
-        );
-        
-        -- Query the linked server's information schema
-        SET @SQL = N'
-        INSERT INTO #ColumnInfo (COLUMN_NAME, DATA_TYPE)
-        SELECT COLUMN_NAME, DATA_TYPE
-        FROM OPENQUERY(' + QUOTENAME(@LinkedServerName) + ', 
-            ''SELECT COLUMN_NAME, DATA_TYPE 
-             FROM ' + @DatabaseName + '.INFORMATION_SCHEMA.COLUMNS 
-             WHERE TABLE_SCHEMA = ''''' + @SchemaName + ''''' 
-             AND TABLE_NAME = ''''' + @TableName + ''''''')';
-        
-        IF @Debug = 1
-            PRINT 'Getting column info: ' + @SQL;
-            
-        EXEC sp_executesql @SQL;
-        
-        -- Mark XML columns
-        UPDATE #ColumnInfo 
-        SET IS_XML = 1 
-        WHERE DATA_TYPE = 'xml';
-        
-        -- Step 2: Build dynamic column list with XML conversion
-        SELECT @ColumnList = @ColumnList + 
-            CASE 
-                WHEN IS_XML = 1 THEN 
-                    'CAST(' + QUOTENAME(COLUMN_NAME) + ' AS NVARCHAR(MAX)) AS ' + QUOTENAME(COLUMN_NAME)
-                ELSE 
-                    QUOTENAME(COLUMN_NAME)
-            END + ', '
-        FROM #ColumnInfo;
-        
-        -- Remove trailing comma
-        SET @ColumnList = LEFT(@ColumnList, LEN(@ColumnList) - 1);
-        
-        IF @Debug = 1
-        BEGIN
-            PRINT 'Column list generated: ' + @ColumnList;
-            SELECT * FROM #ColumnInfo;
-        END
-        
-        -- Step 3: Execute the query with converted columns
-        IF @OutputTable IS NOT NULL
-        BEGIN
-            -- Drop temp table if exists
-            SET @SQL = 'IF OBJECT_ID(''' + @OutputTable + ''', ''U'') IS NOT NULL DROP TABLE ' + @OutputTable;
-            EXEC sp_executesql @SQL;
-            
-            -- Create and populate output table
-            SET @SQL = N'
-            SELECT ' + @ColumnList + '
-            INTO ' + @OutputTable + '
-            FROM OPENQUERY(' + QUOTENAME(@LinkedServerName) + ', 
-                ''SELECT ' + @ColumnList + '
-                 FROM ' + @DatabaseName + '.' + @SchemaName + '.' + @TableName + ''')';
-        END
-        ELSE
-        BEGIN
-            -- Just select the data
-            SET @SQL = N'
-            SELECT *
-            FROM OPENQUERY(' + QUOTENAME(@LinkedServerName) + ', 
-                ''SELECT ' + @ColumnList + '
-                 FROM ' + @DatabaseName + '.' + @SchemaName + '.' + @TableName + ''')';
-        END
-        
-        IF @Debug = 1
-            PRINT 'Final query: ' + @SQL;
-            
-        EXEC sp_executesql @SQL;
-        
-        -- Cleanup
-        DROP TABLE #ColumnInfo;
-        
-    END TRY
-    BEGIN CATCH
-        -- Capture error details
-        SET @ErrorMessage = ERROR_MESSAGE();
-        SET @ErrorSeverity = ERROR_SEVERITY();
-        SET @ErrorState = ERROR_STATE();
-        
-        -- Cleanup if needed
-        IF OBJECT_ID('tempdb..#ColumnInfo') IS NOT NULL
-            DROP TABLE #ColumnInfo;
-        
-        -- Log error (optional - create error log table if needed)
-        IF OBJECT_ID('dbo.XMLConversionErrors', 'U') IS NOT NULL
-        BEGIN
-            INSERT INTO dbo.XMLConversionErrors (
-                ErrorDate, LinkedServer, DatabaseName, SchemaName, TableName,
-                ErrorMessage, ErrorSeverity, ErrorState
-            )
-            VALUES (
-                GETDATE(), @LinkedServerName, @DatabaseName, @SchemaName, @TableName,
-                @ErrorMessage, @ErrorSeverity, @ErrorState
-            );
-        END
-        
-        -- Re-raise the error
-        RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);
-    END CATCH
-END
-GO
+#!/usr/bin/env python3
+"""
+Optimized Oracle Database Query Script - Function-based
+Handles large datasets (1.5-3M rows/day) with performance optimizations
+"""
 
--- Helper procedure for single column conversion
-CREATE OR ALTER PROCEDURE [dbo].[sp_ConvertSingleXMLColumn]
-    @LinkedServerName NVARCHAR(128),
-    @FullTablePath NVARCHAR(500),  -- Format: Database.Schema.Table
-    @XMLColumnName NVARCHAR(128),
-    @WhereClause NVARCHAR(MAX) = '',
-    @ResultSet BIT = 1  -- 0 = Return as output parameter, 1 = Return as result set
-AS
-BEGIN
-    SET NOCOUNT ON;
-    
-    DECLARE @SQL NVARCHAR(MAX);
-    DECLARE @ConvertedXML NVARCHAR(MAX);
-    
-    BEGIN TRY
-        IF @ResultSet = 1
-        BEGIN
-            -- Return as result set
-            SET @SQL = N'
-            SELECT CAST(' + QUOTENAME(@XMLColumnName) + ' AS NVARCHAR(MAX)) AS ConvertedXML
-            FROM OPENQUERY(' + QUOTENAME(@LinkedServerName) + ', 
-                ''SELECT CAST(' + @XMLColumnName + ' AS NVARCHAR(MAX)) AS ' + @XMLColumnName + '
-                 FROM ' + @FullTablePath + 
-                 CASE WHEN @WhereClause <> '' THEN ' WHERE ' + @WhereClause ELSE '' END + ''')';
-            
-            EXEC sp_executesql @SQL;
-        END
-        ELSE
-        BEGIN
-            -- Return as output parameter (for single row)
-            SET @SQL = N'
-            SELECT @ConvertedXML = ConvertedXML
-            FROM OPENQUERY(' + QUOTENAME(@LinkedServerName) + ', 
-                ''SELECT TOP 1 CAST(' + @XMLColumnName + ' AS NVARCHAR(MAX)) AS ConvertedXML
-                 FROM ' + @FullTablePath + 
-                 CASE WHEN @WhereClause <> '' THEN ' WHERE ' + @WhereClause ELSE '' END + ''')';
-            
-            EXEC sp_executesql @SQL, N'@ConvertedXML NVARCHAR(MAX) OUTPUT', @ConvertedXML OUTPUT;
-            
-            SELECT @ConvertedXML AS ConvertedXML;
-        END
-    END TRY
-    BEGIN CATCH
-        DECLARE @ErrorMessage NVARCHAR(4000) = ERROR_MESSAGE();
-        RAISERROR('Error converting XML column: %s', 16, 1, @ErrorMessage);
-    END CATCH
-END
-GO
+import oracledb
+import pandas as pd
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any, Optional, Tuple
+import time
+from contextlib import contextmanager
+import os
 
--- Create error logging table
-IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[XMLConversionErrors]') AND type in (N'U'))
-BEGIN
-    CREATE TABLE [dbo].[XMLConversionErrors](
-        [ErrorID] [int] IDENTITY(1,1) NOT NULL,
-        [ErrorDate] [datetime] NOT NULL,
-        [LinkedServer] [nvarchar](128) NULL,
-        [DatabaseName] [nvarchar](128) NULL,
-        [SchemaName] [nvarchar](128) NULL,
-        [TableName] [nvarchar](128) NULL,
-        [ErrorMessage] [nvarchar](4000) NULL,
-        [ErrorSeverity] [int] NULL,
-        [ErrorState] [int] NULL,
-        CONSTRAINT [PK_XMLConversionErrors] PRIMARY KEY CLUSTERED ([ErrorID] ASC)
-    );
-END
-GO
 
--- Example usage procedure that calls the conversion procedure
-CREATE OR ALTER PROCEDURE [dbo].[sp_ProcessLinkedServerData]
-    @LinkedServerName NVARCHAR(128),
-    @ProcessingType NVARCHAR(50)
-AS
-BEGIN
-    SET NOCOUNT ON;
+def create_connection_pool(username: str, password: str, dsn: str, 
+                          pool_size: int = 10, pool_increment: int = 5, 
+                          pool_max: int = 20):
+    """
+    Create Oracle connection pool for better performance
     
-    DECLARE @TempTableName NVARCHAR(128) = '##XMLConverted_' + REPLACE(NEWID(), '-', '');
+    Args:
+        username: Oracle username
+        password: Oracle password
+        dsn: Data Source Name (host:port/service_name)
+        pool_size: Initial pool size
+        pool_increment: Pool increment size
+        pool_max: Maximum pool size
     
-    BEGIN TRY
-        -- Call the XML conversion procedure at any point
-        EXEC [dbo].[sp_ConvertXMLToNVarchar] 
-            @LinkedServerName = @LinkedServerName,
-            @DatabaseName = 'YourDatabase',
-            @SchemaName = 'dbo',
-            @TableName = 'YourTableWithXML',
-            @OutputTable = @TempTableName,
-            @Debug = 0;
+    Returns:
+        Connection pool object
+    """
+    pool = oracledb.create_pool(
+        user=username,
+        password=password,
+        dsn=dsn,
+        min=pool_size,
+        max=pool_max,
+        increment=pool_increment,
+        threaded=True,
+        getmode=oracledb.POOL_GETMODE_WAIT
+    )
+    return pool
+
+
+@contextmanager
+def get_connection(pool):
+    """Context manager for getting connections from pool"""
+    connection = None
+    try:
+        connection = pool.acquire()
+        yield connection
+    finally:
+        if connection:
+            pool.release(connection)
+
+
+def optimize_session(connection):
+    """Apply session-level optimizations"""
+    cursor = connection.cursor()
+    try:
+        # Increase array fetch size for bulk operations
+        cursor.arraysize = 10000
         
-        -- Now process the converted data
-        DECLARE @SQL NVARCHAR(MAX);
-        SET @SQL = 'SELECT * FROM ' + @TempTableName + ' WHERE ProcessingType = @ProcessingType';
+        # Optimize for bulk operations
+        cursor.execute("ALTER SESSION SET OPTIMIZER_MODE = FIRST_ROWS_100000")
+        cursor.execute("ALTER SESSION SET CURSOR_SHARING = FORCE")
+        cursor.execute("ALTER SESSION SET DB_FILE_MULTIBLOCK_READ_COUNT = 128")
         
-        EXEC sp_executesql @SQL, N'@ProcessingType NVARCHAR(50)', @ProcessingType;
+        # Increase sort area size for better performance
+        cursor.execute("ALTER SESSION SET SORT_AREA_SIZE = 67108864")  # 64MB
+        cursor.execute("ALTER SESSION SET HASH_AREA_SIZE = 67108864")   # 64MB
         
-        -- Cleanup
-        SET @SQL = 'DROP TABLE ' + @TempTableName;
-        EXEC sp_executesql @SQL;
+    except Exception:
+        pass  # Some session optimizations may fail, continue anyway
+    finally:
+        cursor.close()
+
+
+def generate_time_chunks(start_date: datetime, end_date: datetime, 
+                        chunk_hours: int) -> List[Tuple[datetime, datetime]]:
+    """Generate time-based chunks for parallel processing"""
+    chunks = []
+    current = start_date
+    
+    while current < end_date:
+        chunk_end = min(current + timedelta(hours=chunk_hours), end_date)
+        chunks.append((current, chunk_end))
+        current = chunk_end
         
-    END TRY
-    BEGIN CATCH
-        -- Cleanup on error
-        IF OBJECT_ID(@TempTableName) IS NOT NULL
-        BEGIN
-            SET @SQL = 'DROP TABLE ' + @TempTableName;
-            EXEC sp_executesql @SQL;
-        END
+    return chunks
+
+
+def execute_chunk(pool, base_query: str, chunk: Tuple[datetime, datetime], 
+                 date_column: str) -> pd.DataFrame:
+    """Execute query for a single time chunk"""
+    start_time, end_time = chunk
+    
+    # Format query with time parameters
+    query = base_query.format(
+        start_time=start_time.strftime('%Y-%m-%d %H:%M:%S'),
+        end_time=end_time.strftime('%Y-%m-%d %H:%M:%S'),
+        date_column=date_column
+    )
+    
+    with get_connection(pool) as connection:
+        optimize_session(connection)
         
-        -- Re-raise error
-        THROW;
-    END CATCH
-END
-GO
+        cursor = connection.cursor()
+        cursor.arraysize = 50000  # Large fetch size for bulk data
+        
+        try:
+            cursor.execute(query)
+            
+            # Fetch all results efficiently
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+            
+            return pd.DataFrame(rows, columns=columns)
+            
+        finally:
+            cursor.close()
+
+
+def execute_chunked_query(pool, base_query: str, date_column: str,
+                         start_date: datetime, end_date: datetime,
+                         chunk_hours: int = 6, max_workers: int = 4) -> pd.DataFrame:
+    """
+    Execute query in time-based chunks with parallel processing
+    
+    Args:
+        pool: Oracle connection pool
+        base_query: SQL query with {start_time} and {end_time} placeholders
+        date_column: Column name for date filtering
+        start_date: Start datetime
+        end_date: End datetime
+        chunk_hours: Hours per chunk
+        max_workers: Maximum parallel workers
+    
+    Returns:
+        Combined DataFrame with all results
+    """
+    # Generate time chunks
+    chunks = generate_time_chunks(start_date, end_date, chunk_hours)
+    
+    results = []
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all chunk queries
+        future_to_chunk = {
+            executor.submit(execute_chunk, pool, base_query, chunk, date_column): chunk
+            for chunk in chunks
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_chunk):
+            chunk = future_to_chunk[future]
+            try:
+                df_chunk = future.result()
+                if not df_chunk.empty:
+                    results.append(df_chunk)
+            except Exception:
+                pass  # Skip failed chunks
+    
+    # Combine all results
+    if results:
+        final_df = pd.concat(results, ignore_index=True)
+        return final_df
+    else:
+        return pd.DataFrame()
+
+
+def execute_single_optimized_query(pool, query: str, bind_vars: Dict = None) -> pd.DataFrame:
+    """
+    Execute a single optimized query for large datasets
+    
+    Args:
+        pool: Oracle connection pool
+        query: SQL query string
+        bind_vars: Dictionary of bind variables
+    
+    Returns:
+        DataFrame with query results
+    """
+    with get_connection(pool) as connection:
+        optimize_session(connection)
+        
+        cursor = connection.cursor()
+        
+        # Optimize cursor for large result sets
+        cursor.arraysize = 100000  # Very large fetch size
+        cursor.prefetchrows = 100000
+        
+        try:
+            if bind_vars:
+                cursor.execute(query, bind_vars)
+            else:
+                cursor.execute(query)
+            
+            # Get column names
+            columns = [desc[0] for desc in cursor.description]
+            
+            # Fetch data in chunks to manage memory
+            all_rows = []
+            while True:
+                rows = cursor.fetchmany(100000)
+                if not rows:
+                    break
+                all_rows.extend(rows)
+            
+            return pd.DataFrame(all_rows, columns=columns)
+            
+        finally:
+            cursor.close()
+
+
+def execute_streaming_query(pool, query: str, chunk_size: int = 100000, 
+                           callback=None):
+    """
+    Execute query with streaming results to handle very large datasets
+    
+    Args:
+        pool: Oracle connection pool
+        query: SQL query string
+        chunk_size: Number of rows per chunk
+        callback: Function to process each chunk
+    """
+    with get_connection(pool) as connection:
+        optimize_session(connection)
+        
+        cursor = connection.cursor()
+        cursor.arraysize = chunk_size
+        
+        try:
+            cursor.execute(query)
+            columns = [desc[0] for desc in cursor.description]
+            
+            chunk_num = 0
+            total_rows = 0
+            
+            while True:
+                rows = cursor.fetchmany(chunk_size)
+                if not rows:
+                    break
+                
+                chunk_num += 1
+                total_rows += len(rows)
+                
+                df_chunk = pd.DataFrame(rows, columns=columns)
+                
+                if callback:
+                    callback(df_chunk, chunk_num)
+            
+            return total_rows
+            
+        finally:
+            cursor.close()
+
+
+def get_table_stats(pool, table_name: str) -> Dict[str, Any]:
+    """Get table statistics for query optimization"""
+    query = """
+    SELECT 
+        num_rows,
+        blocks,
+        avg_row_len,
+        last_analyzed
+    FROM user_tables 
+    WHERE table_name = UPPER(:table_name)
+    """
+    
+    with get_connection(pool) as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(query, {'table_name': table_name})
+            result = cursor.fetchone()
+            
+            if result:
+                return {
+                    'num_rows': result[0],
+                    'blocks': result[1],
+                    'avg_row_len': result[2],
+                    'last_analyzed': result[3]
+                }
+            return {}
+        finally:
+            cursor.close()
+
+
+def close_connection_pool(pool):
+    """Close the connection pool"""
+    if pool:
+        pool.close()
+
+
+def process_chunk_callback(df_chunk: pd.DataFrame, chunk_num: int):
+    """Example callback for processing streaming data chunks"""
+    # Process each chunk (e.g., save to file, transform data, etc.)
+    filename = f"data_chunk_{chunk_num:04d}.parquet"
+    df_chunk.to_parquet(filename, compression='snappy')
+    print(f"Saved chunk {chunk_num} to {filename}")
+
+
+def query_large_dataset_by_date(username: str, password: str, dsn: str,
+                               table_name: str, date_column: str,
+                               start_date: datetime, end_date: datetime,
+                               columns: List[str] = None,
+                               where_conditions: str = "",
+                               chunk_hours: int = 6,
+                               max_workers: int = 4) -> pd.DataFrame:
+    """
+    High-level function to query large dataset by date range
+    
+    Args:
+        username: Oracle username
+        password: Oracle password
+        dsn: Data Source Name
+        table_name: Table to query
+        date_column: Date column for filtering
+        start_date: Start datetime
+        end_date: End datetime
+        columns: List of columns to select (None for all)
+        where_conditions: Additional WHERE conditions
+        chunk_hours: Hours per chunk for parallel processing
+        max_workers: Number of parallel workers
+    
+    Returns:
+        DataFrame with query results
+    """
+    # Create connection pool
+    pool = create_connection_pool(username, password, dsn)
+    
+    try:
+        # Build query
+        col_str = "*" if not columns else ", ".join(columns)
+        where_clause = f"AND {where_conditions}" if where_conditions else ""
+        
+        base_query = f"""
+        SELECT {col_str}
+        FROM {table_name} 
+        WHERE {{date_column}} BETWEEN 
+            TO_TIMESTAMP('{{start_time}}', 'YYYY-MM-DD HH24:MI:SS') 
+            AND TO_TIMESTAMP('{{end_time}}', 'YYYY-MM-DD HH24:MI:SS')
+        {where_clause}
+        ORDER BY {{date_column}}
+        """
+        
+        # Execute chunked query
+        result_df = execute_chunked_query(
+            pool=pool,
+            base_query=base_query,
+            date_column=date_column,
+            start_date=start_date,
+            end_date=end_date,
+            chunk_hours=chunk_hours,
+            max_workers=max_workers
+        )
+        
+        return result_df
+        
+    finally:
+        close_connection_pool(pool)
+
+
+def query_with_streaming(username: str, password: str, dsn: str,
+                        query: str, chunk_size: int = 100000,
+                        callback=None) -> int:
+    """
+    High-level function for streaming large queries
+    
+    Args:
+        username: Oracle username
+        password: Oracle password
+        dsn: Data Source Name
+        query: SQL query string
+        chunk_size: Rows per chunk
+        callback: Function to process each chunk
+    
+    Returns:
+        Total number of rows processed
+    """
+    pool = create_connection_pool(username, password, dsn)
+    
+    try:
+        total_rows = execute_streaming_query(
+            pool=pool,
+            query=query,
+            chunk_size=chunk_size,
+            callback=callback
+        )
+        return total_rows
+        
+    finally:
+        close_connection_pool(pool)
+
+
+def main():
+    """Example usage of the Oracle query functions"""
+    
+    # Configuration
+    username = os.getenv('ORACLE_USER', 'your_username')
+    password = os.getenv('ORACLE_PASSWORD', 'your_password')
+    dsn = os.getenv('ORACLE_DSN', 'localhost:1521/xe')
+    
+    # Example 1: Query large dataset by date range
+    start_date = datetime(2024, 1, 1)
+    end_date = datetime(2024, 1, 2)  # One day
+    
+    print("Executing chunked parallel query...")
+    df_result = query_large_dataset_by_date(
+        username=username,
+        password=password,
+        dsn=dsn,
+        table_name='your_large_table',
+        date_column='timestamp_col',
+        start_date=start_date,
+        end_date=end_date,
+        columns=['id', 'timestamp_col', 'data_column1', 'data_column2'],
+        where_conditions="status = 'ACTIVE'",
+        chunk_hours=4,
+        max_workers=6
+    )
+    
+    print(f"Retrieved {len(df_result)} rows")
+    
+    # Example 2: Streaming query
+    streaming_query = """
+    SELECT * FROM your_large_table 
+    WHERE date_col >= TO_DATE('2024-01-01', 'YYYY-MM-DD')
+    ORDER BY date_col
+    """
+    
+    print("Executing streaming query...")
+    total_rows = query_with_streaming(
+        username=username,
+        password=password,
+        dsn=dsn,
+        query=streaming_query,
+        chunk_size=50000,
+        callback=process_chunk_callback
+    )
+    
+    print(f"Processed {total_rows} total rows")
+    
+    # Example 3: Using individual functions with custom logic
+    pool = create_connection_pool(username, password, dsn)
+    
+    try:
+        # Get table statistics
+        stats = get_table_stats(pool, 'your_large_table')
+        print(f"Table stats: {stats}")
+        
+        # Execute single optimized query
+        single_query = """
+        SELECT * FROM your_large_table 
+        WHERE date_col >= :start_date 
+        AND date_col < :end_date
+        AND status = :status
+        """
+        
+        bind_vars = {
+            'start_date': start_date,
+            'end_date': end_date,
+            'status': 'ACTIVE'
+        }
+        
+        df_single = execute_single_optimized_query(pool, single_query, bind_vars)
+        print(f"Single query retrieved {len(df_single)} rows")
+        
+    finally:
+        close_connection_pool(pool)
+
+
+if __name__ == "__main__":
+    main()
