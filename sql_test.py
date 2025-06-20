@@ -1,394 +1,368 @@
 #!/usr/bin/env python3
 """
-libtdsodbc.so Library Finder for Red Hat Linux Server
-Searches the entire filesystem for FreeTDS ODBC driver library
+Oracle to Data Lake ETL Script
+Extracts data from Oracle database and stores in partitioned parquet format
 """
 
 import os
 import sys
-import time
-import subprocess
+import logging
+import configparser
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional, Dict, Any
+import gc
 
-def print_banner():
-    """Print script banner"""
-    print("=" * 60)
-    print("libtdsodbc.so Library Finder - Red Hat Linux")
-    print("=" * 60)
-    print("🔍 Searching for FreeTDS ODBC driver library")
-    print()
+import cx_Oracle
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from tqdm import tqdm
 
-def check_system_info():
-    """Display system information"""
-    try:
-        # Get OS information
-        with open('/etc/redhat-release', 'r') as f:
-            os_info = f.read().strip()
-        print(f"🖥️  System: {os_info}")
-    except:
-        print("🖥️  System: Linux (Red Hat compatible)")
-    
-    try:
-        # Get architecture
-        arch = subprocess.run(['uname', '-m'], capture_output=True, text=True)
-        if arch.returncode == 0:
-            print(f"🏗️  Architecture: {arch.stdout.strip()}")
-    except:
-        pass
-    
-    print()
-
-def check_common_locations() -> List[Path]:
-    """Check common library locations first"""
-    print("🔍 Checking common library locations...")
-    
-    common_paths = [
-        # Standard library directories
-        "/usr/lib64/libtdsodbc.so",
-        "/usr/lib/libtdsodbc.so",
-        "/usr/lib/x86_64-linux-gnu/libtdsodbc.so",
-        "/lib64/libtdsodbc.so",
-        "/lib/libtdsodbc.so",
-        
-        # FreeTDS specific locations
-        "/usr/lib64/freetds/libtdsodbc.so",
-        "/usr/lib/freetds/libtdsodbc.so",
-        "/usr/local/lib64/libtdsodbc.so",
-        "/usr/local/lib/libtdsodbc.so",
-        "/usr/local/freetds/lib/libtdsodbc.so",
-        
-        # ODBC specific locations
-        "/usr/lib64/odbc/libtdsodbc.so",
-        "/usr/lib/odbc/libtdsodbc.so",
-        "/usr/local/lib/odbc/libtdsodbc.so",
-        
-        # Alternative package manager locations
-        "/opt/freetds/lib/libtdsodbc.so",
-        "/opt/mssql-tools/lib/libtdsodbc.so",
-        
-        # Versioned variants
-        "/usr/lib64/libtdsodbc.so.0",
-        "/usr/lib/libtdsodbc.so.0",
-        "/usr/lib64/libtdsodbc.so.1",
-        "/usr/lib/libtdsodbc.so.1",
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('oracle_etl.log'),
+        logging.StreamHandler(sys.stdout)
     ]
-    
-    found_libraries = []
-    
-    for path_str in common_paths:
-        path = Path(path_str)
-        if path.exists() and path.is_file():
-            print(f"✅ Found: {path}")
-            found_libraries.append(path)
-        else:
-            print(f"❌ Not found: {path}")
-    
-    return found_libraries
+)
+logger = logging.getLogger(__name__)
 
-def search_using_find_command() -> List[Path]:
-    """Use Linux 'find' command to locate libtdsodbc.so"""
-    print("\n🔍 Using 'find' command to search filesystem...")
+class OracleDataLakeETL:
+    """ETL pipeline for Oracle to Data Lake extraction"""
     
-    found_libraries = []
-    
-    try:
-        # Search for exact filename
-        result = subprocess.run(
-            ['find', '/', '-name', 'libtdsodbc.so', '-type', 'f', '2>/dev/null'],
-            capture_output=True,
-            text=True,
-            timeout=300,  # 5 minute timeout
-            shell=True
-        )
+    def __init__(self, config_file: str = 'config.ini'):
+        """Initialize ETL with configuration"""
+        self.config = self._load_config(config_file)
+        self.base_path = Path(self.config['storage']['base_path'])
+        self.chunk_size = int(self.config['processing']['chunk_size'])
+        self.connection_pool = None
         
-        if result.returncode == 0 and result.stdout.strip():
-            paths = result.stdout.strip().split('\n')
-            for path_str in paths:
-                path_str = path_str.strip()
-                if path_str:
-                    path = Path(path_str)
-                    if path.exists():
-                        print(f"✅ Found: {path}")
-                        found_libraries.append(path)
-        
-        # Also search for versioned variants
-        print("\n🔍 Searching for versioned variants...")
-        result2 = subprocess.run(
-            ['find', '/', '-name', 'libtdsodbc.so.*', '-type', 'f', '2>/dev/null'],
-            capture_output=True,
-            text=True,
-            timeout=180,
-            shell=True
-        )
-        
-        if result2.returncode == 0 and result2.stdout.strip():
-            paths = result2.stdout.strip().split('\n')
-            for path_str in paths:
-                path_str = path_str.strip()
-                if path_str:
-                    path = Path(path_str)
-                    if path.exists():
-                        print(f"✅ Found versioned: {path}")
-                        found_libraries.append(path)
-        
-        if not found_libraries:
-            print("❌ No libtdsodbc.so files found using 'find' command")
+    def _load_config(self, config_file: str) -> Dict[str, Dict[str, Any]]:
+        """Load configuration from INI file"""
+        if not os.path.exists(config_file):
+            self._create_default_config(config_file)
+            logger.info(f"Created default config file: {config_file}")
+            logger.info("Please update the configuration and run again.")
+            sys.exit(0)
             
-    except subprocess.TimeoutExpired:
-        print("⚠️ Search timeout - 'find' command took too long")
-    except Exception as e:
-        print(f"⚠️ Error using 'find' command: {e}")
+        config = configparser.ConfigParser()
+        config.read(config_file)
+        return config
     
-    return found_libraries
-
-def search_using_locate() -> List[Path]:
-    """Use 'locate' command if available"""
-    print("\n🔍 Trying 'locate' command...")
+    def _create_default_config(self, config_file: str):
+        """Create default configuration file"""
+        config = configparser.ConfigParser()
+        
+        config['oracle'] = {
+            'host': 'oracle_host',
+            'port': '1521',
+            'service_name': 'service_name',
+            'username': 'username',
+            'password': 'password',
+            'encoding': 'UTF-8'
+        }
+        
+        config['storage'] = {
+            'base_path': '/data-lake',
+            'file_format': 'parquet',
+            'compression': 'gzip'
+        }
+        
+        config['processing'] = {
+            'chunk_size': '50000',
+            'array_size': '10000',
+            'prefetch_rows': '10000'
+        }
+        
+        config['extraction'] = {
+            'table_name': 'your_table_name',
+            'datetime_column': 'DATETIME',
+            'category_column': 'CATEGORY',
+            'additional_columns': 'col1,col2,col3'
+        }
+        
+        with open(config_file, 'w') as f:
+            config.write(f)
     
-    found_libraries = []
-    
-    try:
-        # Update locate database first (may require sudo)
-        print("📊 Updating locate database...")
+    def _init_connection_pool(self):
+        """Initialize Oracle connection pool"""
         try:
-            subprocess.run(['updatedb'], check=False, capture_output=True, timeout=60)
-        except:
-            print("⚠️ Could not update locate database (may need sudo)")
-        
-        # Search using locate
-        result = subprocess.run(
-            ['locate', 'libtdsodbc.so'],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        
-        if result.returncode == 0 and result.stdout.strip():
-            paths = result.stdout.strip().split('\n')
-            for path_str in paths:
-                path_str = path_str.strip()
-                if path_str:
-                    path = Path(path_str)
-                    if path.exists() and path.is_file():
-                        print(f"✅ Found: {path}")
-                        found_libraries.append(path)
-        else:
-            print("❌ No results from 'locate' command")
-            
-    except FileNotFoundError:
-        print("⚠️ 'locate' command not available")
-    except Exception as e:
-        print(f"⚠️ Error using 'locate' command: {e}")
-    
-    return found_libraries
-
-def manual_filesystem_search(mount_points: List[str] = None) -> List[Path]:
-    """Perform manual filesystem search"""
-    if mount_points is None:
-        mount_points = ['/']
-    
-    print(f"\n🔍 Manual filesystem search on: {', '.join(mount_points)}")
-    print("⚠️ This may take several minutes...")
-    
-    found_libraries = []
-    searched_dirs = 0
-    start_time = time.time()
-    
-    for mount_point in mount_points:
-        print(f"\n📁 Searching: {mount_point}")
-        
-        try:
-            for root, dirs, files in os.walk(mount_point):
-                searched_dirs += 1
-                
-                # Print progress every 2000 directories
-                if searched_dirs % 2000 == 0:
-                    elapsed = time.time() - start_time
-                    print(f"⏳ Searched {searched_dirs} directories... ({elapsed:.1f}s)")
-                
-                # Skip certain directories to speed up search
-                dirs_to_skip = [
-                    'proc', 'sys', 'dev', 'run', 'tmp', 'var/cache',
-                    'var/log', 'var/tmp', '.git', '__pycache__', 'node_modules'
-                ]
-                
-                # Filter out directories to skip
-                dirs[:] = [d for d in dirs if d not in dirs_to_skip and not d.startswith('.')]
-                
-                # Look for libtdsodbc.so files
-                for file in files:
-                    if file == 'libtdsodbc.so' or file.startswith('libtdsodbc.so.'):
-                        lib_path = Path(root) / file
-                        if lib_path.exists() and lib_path.is_file():
-                            print(f"✅ Found: {lib_path}")
-                            found_libraries.append(lib_path)
-                
-        except PermissionError:
-            print(f"⚠️ Permission denied accessing some directories in {mount_point}")
-        except Exception as e:
-            print(f"⚠️ Error searching {mount_point}: {e}")
-    
-    elapsed = time.time() - start_time
-    print(f"\n📊 Manual search completed in {elapsed:.1f} seconds")
-    print(f"📊 Searched {searched_dirs} directories")
-    
-    return found_libraries
-
-def get_library_info(lib_path: Path) -> dict:
-    """Get detailed information about the library file"""
-    info = {}
-    
-    try:
-        # File size
-        stat = lib_path.stat()
-        info['size'] = f"{stat.st_size / 1024:.1f} KB"
-        info['modified'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime))
-        info['permissions'] = oct(stat.st_mode)[-3:]
-        
-        # Try to get version information using strings command
-        try:
-            result = subprocess.run(
-                ['strings', str(lib_path)],
-                capture_output=True,
-                text=True,
-                timeout=10
+            dsn = cx_Oracle.makedsn(
+                self.config['oracle']['host'],
+                self.config['oracle']['port'],
+                service_name=self.config['oracle']['service_name']
             )
-            if result.returncode == 0:
-                lines = result.stdout.split('\n')
-                for line in lines:
-                    if 'freetds' in line.lower() or 'version' in line.lower():
-                        info['version_info'] = line.strip()[:100]
-                        break
-        except:
-            pass
-        
-        # Check if it's a symbolic link
-        if lib_path.is_symlink():
-            info['symlink_target'] = str(lib_path.resolve())
-        
-    except Exception as e:
-        info['error'] = str(e)
-    
-    return info
-
-def display_results(libraries: List[Path]):
-    """Display found libraries with detailed information"""
-    if not libraries:
-        print("\n❌ libtdsodbc.so library not found!")
-        print("\n💡 Installation suggestions:")
-        print("   Red Hat/CentOS/RHEL 7/8:")
-        print("     sudo yum install freetds freetds-devel")
-        print("   Red Hat/CentOS/RHEL 9+ / Fedora:")
-        print("     sudo dnf install freetds freetds-devel")
-        print("   From source:")
-        print("     wget http://www.freetds.org/files/stable/freetds-X.X.tar.gz")
-        print("     tar -xzf freetds-X.X.tar.gz && cd freetds-X.X")
-        print("     ./configure --with-unixodbc && make && sudo make install")
-        return
-    
-    print(f"\n✅ Found {len(libraries)} libtdsodbc.so library/libraries:")
-    print("=" * 60)
-    
-    for i, lib_path in enumerate(libraries, 1):
-        print(f"\n{i}. {lib_path}")
-        
-        info = get_library_info(lib_path)
-        
-        if 'size' in info:
-            print(f"   📏 Size: {info['size']}")
-        if 'modified' in info:
-            print(f"   📅 Modified: {info['modified']}")
-        if 'permissions' in info:
-            print(f"   🔒 Permissions: {info['permissions']}")
-        if 'symlink_target' in info:
-            print(f"   🔗 Symlink to: {info['symlink_target']}")
-        if 'version_info' in info:
-            print(f"   📋 Version info: {info['version_info']}")
-        if 'error' in info:
-            print(f"   ⚠️ Info error: {info['error']}")
-
-def get_mount_points() -> List[str]:
-    """Get available mount points for search"""
-    mount_points = ['/']
-    
-    try:
-        result = subprocess.run(['mount'], capture_output=True, text=True)
-        if result.returncode == 0:
-            lines = result.stdout.split('\n')
-            mounts = []
-            for line in lines:
-                if ' on ' in line and ' type ' in line:
-                    parts = line.split(' on ')
-                    if len(parts) > 1:
-                        mount_point = parts[1].split(' type ')[0]
-                        if mount_point.startswith('/') and mount_point not in ['/', '/boot', '/proc', '/sys', '/dev']:
-                            mounts.append(mount_point)
             
-            if mounts:
-                print(f"📁 Additional mount points found: {', '.join(mounts)}")
-                mount_points.extend(mounts)
-    except:
-        pass
+            self.connection_pool = cx_Oracle.SessionPool(
+                user=self.config['oracle']['username'],
+                password=self.config['oracle']['password'],
+                dsn=dsn,
+                min=2,
+                max=5,
+                increment=1,
+                encoding=self.config['oracle']['encoding']
+            )
+            logger.info("Oracle connection pool initialized successfully")
+        except cx_Oracle.Error as e:
+            logger.error(f"Failed to create connection pool: {e}")
+            raise
     
-    return mount_points
+    def _get_connection(self):
+        """Get connection from pool"""
+        if not self.connection_pool:
+            self._init_connection_pool()
+        return self.connection_pool.acquire()
+    
+    def _create_directory_structure(self, category: str, date: datetime) -> Path:
+        """Create data lake directory structure"""
+        dir_path = self.base_path / 'raw' / category / f'year={date.year}' / \
+                   f'month={date.month:02d}' / f'day={date.day:02d}'
+        dir_path.mkdir(parents=True, exist_ok=True)
+        return dir_path
+    
+    def _generate_filename(self, timestamp: datetime) -> str:
+        """Generate filename with timestamp"""
+        timestamp_str = timestamp.strftime('%Y%m%d_%H%M%S')
+        return f"{timestamp_str}_data.parquet.gz"
+    
+    def _build_query(self, start_date: datetime, end_date: datetime) -> str:
+        """Build extraction query with date range"""
+        table_name = self.config['extraction']['table_name']
+        datetime_col = self.config['extraction']['datetime_column']
+        category_col = self.config['extraction']['category_column']
+        
+        # Get additional columns
+        additional_cols = self.config['extraction'].get('additional_columns', '')
+        if additional_cols:
+            columns = f"{datetime_col}, {category_col}, {additional_cols}"
+        else:
+            columns = f"{datetime_col}, {category_col}, *"
+        
+        query = f"""
+        SELECT {columns}
+        FROM {table_name}
+        WHERE {datetime_col} >= :start_date
+          AND {datetime_col} < :end_date
+        ORDER BY {datetime_col}, {category_col}
+        """
+        return query
+    
+    def _process_chunk(self, df_chunk: pd.DataFrame, processed_categories: Dict[str, Path]):
+        """Process a chunk of data and write to appropriate files"""
+        datetime_col = self.config['extraction']['datetime_column']
+        category_col = self.config['extraction']['category_column']
+        
+        # Group by date and category
+        for (date, category), group_df in df_chunk.groupby([
+            pd.Grouper(key=datetime_col, freq='D'), category_col
+        ]):
+            # Create directory structure
+            dir_path = self._create_directory_structure(category, date)
+            
+            # Generate filename
+            key = f"{category}_{date.strftime('%Y%m%d')}"
+            if key not in processed_categories:
+                filename = self._generate_filename(date)
+                file_path = dir_path / filename
+                processed_categories[key] = file_path
+            else:
+                file_path = processed_categories[key]
+            
+            # Convert to Arrow Table for efficient writing
+            table = pa.Table.from_pandas(group_df, preserve_index=False)
+            
+            # Write or append to parquet file
+            if file_path.exists():
+                # Read existing data and append
+                existing_table = pq.read_table(file_path)
+                combined_table = pa.concat_tables([existing_table, table])
+                pq.write_table(
+                    combined_table,
+                    file_path,
+                    compression='gzip',
+                    use_dictionary=True,
+                    compression_level=6
+                )
+            else:
+                pq.write_table(
+                    table,
+                    file_path,
+                    compression='gzip',
+                    use_dictionary=True,
+                    compression_level=6
+                )
+    
+    def extract_date_range(self, start_date: datetime, end_date: datetime):
+        """Extract data for a date range"""
+        logger.info(f"Starting extraction from {start_date} to {end_date}")
+        
+        connection = None
+        cursor = None
+        processed_categories = {}
+        total_rows = 0
+        
+        try:
+            connection = self._get_connection()
+            cursor = connection.cursor()
+            
+            # Set array size for better performance
+            cursor.arraysize = int(self.config['processing']['array_size'])
+            cursor.prefetchrows = int(self.config['processing']['prefetch_rows'])
+            
+            # Build and execute query
+            query = self._build_query(start_date, end_date)
+            logger.info(f"Executing query for date range: {start_date} to {end_date}")
+            
+            cursor.execute(query, start_date=start_date, end_date=end_date)
+            
+            # Get column names
+            columns = [desc[0] for desc in cursor.description]
+            
+            # Process in chunks
+            with tqdm(desc="Processing rows", unit="rows") as pbar:
+                while True:
+                    rows = cursor.fetchmany(self.chunk_size)
+                    if not rows:
+                        break
+                    
+                    # Convert to DataFrame
+                    df_chunk = pd.DataFrame(rows, columns=columns)
+                    
+                    # Ensure datetime column is datetime type
+                    datetime_col = self.config['extraction']['datetime_column']
+                    df_chunk[datetime_col] = pd.to_datetime(df_chunk[datetime_col])
+                    
+                    # Process chunk
+                    self._process_chunk(df_chunk, processed_categories)
+                    
+                    # Update progress
+                    rows_processed = len(rows)
+                    total_rows += rows_processed
+                    pbar.update(rows_processed)
+                    
+                    # Force garbage collection to free memory
+                    del df_chunk
+                    gc.collect()
+            
+            logger.info(f"Successfully processed {total_rows:,} rows")
+            
+        except cx_Oracle.Error as e:
+            logger.error(f"Oracle error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Processing error: {e}")
+            raise
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                self.connection_pool.release(connection)
+    
+    def extract_daily_batch(self, num_days: int = 1, start_date: Optional[datetime] = None):
+        """Extract data for specified number of days"""
+        if start_date is None:
+            start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        logger.info(f"Starting daily batch extraction for {num_days} day(s)")
+        
+        for day_offset in range(num_days):
+            current_date = start_date - timedelta(days=day_offset)
+            next_date = current_date + timedelta(days=1)
+            
+            logger.info(f"Processing day: {current_date.strftime('%Y-%m-%d')}")
+            
+            try:
+                self.extract_date_range(current_date, next_date)
+                logger.info(f"Completed processing for {current_date.strftime('%Y-%m-%d')}")
+            except Exception as e:
+                logger.error(f"Failed to process {current_date.strftime('%Y-%m-%d')}: {e}")
+                continue
+    
+    def extract_historical_data(self, start_date: datetime, end_date: datetime, 
+                              batch_days: int = 7):
+        """Extract historical data in batches"""
+        logger.info(f"Starting historical extraction from {start_date} to {end_date}")
+        
+        current_date = start_date
+        while current_date < end_date:
+            batch_end = min(current_date + timedelta(days=batch_days), end_date)
+            
+            logger.info(f"Processing batch: {current_date} to {batch_end}")
+            
+            try:
+                self.extract_date_range(current_date, batch_end)
+            except Exception as e:
+                logger.error(f"Failed to process batch: {e}")
+                # Continue with next batch
+            
+            current_date = batch_end
+            
+            # Force garbage collection between batches
+            gc.collect()
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        if self.connection_pool:
+            self.connection_pool.close()
+            logger.info("Connection pool closed")
 
 def main():
-    """Main function"""
-    print_banner()
-    check_system_info()
+    """Main entry point"""
+    import argparse
     
-    # Check if running on Linux
-    if sys.platform != 'linux':
-        print("❌ This script is designed for Linux systems only!")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description='Oracle to Data Lake ETL')
+    parser.add_argument('--config', default='config.ini', help='Configuration file path')
+    parser.add_argument('--mode', choices=['daily', 'historical', 'range'], 
+                       default='daily', help='Extraction mode')
+    parser.add_argument('--days', type=int, default=1, 
+                       help='Number of days to extract (for daily mode)')
+    parser.add_argument('--start-date', type=str, 
+                       help='Start date (YYYY-MM-DD)')
+    parser.add_argument('--end-date', type=str, 
+                       help='End date (YYYY-MM-DD)')
+    parser.add_argument('--batch-days', type=int, default=7,
+                       help='Batch size in days for historical mode')
     
-    all_libraries = []
+    args = parser.parse_args()
     
-    # Step 1: Check common locations
-    common_libraries = check_common_locations()
-    all_libraries.extend(common_libraries)
+    # Initialize ETL
+    etl = OracleDataLakeETL(args.config)
     
-    # Step 2: Use 'find' command
-    if not all_libraries:
-        find_libraries = search_using_find_command()
-        all_libraries.extend(find_libraries)
-    
-    # Step 3: Try 'locate' command
-    if not all_libraries:
-        locate_libraries = search_using_locate()
-        all_libraries.extend(locate_libraries)
-    
-    # Step 4: Manual filesystem search if still nothing found
-    if not all_libraries:
-        print("\n❓ libtdsodbc.so not found using quick methods.")
-        response = input("Perform manual filesystem search? This may take 10+ minutes (y/N): ")
-        
-        if response.lower() in ['y', 'yes']:
-            mount_points = get_mount_points()
-            manual_libraries = manual_filesystem_search(mount_points)
-            all_libraries.extend(manual_libraries)
-    
-    # Remove duplicates while preserving order
-    unique_libraries = []
-    seen = set()
-    for lib in all_libraries:
-        if lib not in seen:
-            unique_libraries.append(lib)
-            seen.add(lib)
-    
-    # Display results
-    display_results(unique_libraries)
-    
-    # Show configuration suggestions if libraries found
-    if unique_libraries:
-        print(f"\n🔧 Configuration suggestions:")
-        print("   1. Check ODBC configuration: /etc/odbcinst.ini")
-        print("   2. Verify FreeTDS configuration: /etc/freetds/freetds.conf")
-        print("   3. Test ODBC connection: isql -v")
-        print("   4. Set LD_LIBRARY_PATH if needed:")
-        for lib in unique_libraries:
-            print(f"      export LD_LIBRARY_PATH={lib.parent}:$LD_LIBRARY_PATH")
+    try:
+        if args.mode == 'daily':
+            start_date = None
+            if args.start_date:
+                start_date = datetime.strptime(args.start_date, '%Y-%m-%d')
+            etl.extract_daily_batch(args.days, start_date)
+            
+        elif args.mode == 'historical':
+            if not args.start_date or not args.end_date:
+                logger.error("Historical mode requires --start-date and --end-date")
+                sys.exit(1)
+            
+            start_date = datetime.strptime(args.start_date, '%Y-%m-%d')
+            end_date = datetime.strptime(args.end_date, '%Y-%m-%d')
+            etl.extract_historical_data(start_date, end_date, args.batch_days)
+            
+        elif args.mode == 'range':
+            if not args.start_date or not args.end_date:
+                logger.error("Range mode requires --start-date and --end-date")
+                sys.exit(1)
+            
+            start_date = datetime.strptime(args.start_date, '%Y-%m-%d')
+            end_date = datetime.strptime(args.end_date, '%Y-%m-%d')
+            etl.extract_date_range(start_date, end_date)
+            
+    except KeyboardInterrupt:
+        logger.info("ETL interrupted by user")
+    except Exception as e:
+        logger.error(f"ETL failed: {e}")
+        raise
+    finally:
+        etl.cleanup()
 
 if __name__ == "__main__":
     main()
