@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 import gc
 
-import cx_Oracle
+import oracledb
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -90,23 +90,24 @@ class OracleDataLakeETL:
     def _init_connection_pool(self):
         """Initialize Oracle connection pool"""
         try:
-            dsn = cx_Oracle.makedsn(
-                self.config['oracle']['host'],
-                self.config['oracle']['port'],
+            # Create connection parameters
+            params = oracledb.ConnectParams(
+                host=self.config['oracle']['host'],
+                port=int(self.config['oracle']['port']),
                 service_name=self.config['oracle']['service_name']
             )
             
-            self.connection_pool = cx_Oracle.SessionPool(
+            self.connection_pool = oracledb.create_pool(
                 user=self.config['oracle']['username'],
                 password=self.config['oracle']['password'],
-                dsn=dsn,
+                params=params,
                 min=2,
                 max=5,
                 increment=1,
                 encoding=self.config['oracle']['encoding']
             )
             logger.info("Oracle connection pool initialized successfully")
-        except cx_Oracle.Error as e:
+        except oracledb.Error as e:
             logger.error(f"Failed to create connection pool: {e}")
             raise
     
@@ -249,7 +250,7 @@ class OracleDataLakeETL:
             
             logger.info(f"Successfully processed {total_rows:,} rows")
             
-        except cx_Oracle.Error as e:
+        except oracledb.Error as e:
             logger.error(f"Oracle error: {e}")
             raise
         except Exception as e:
