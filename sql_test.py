@@ -699,23 +699,28 @@ class OptimizedOracleJoinETL:
                         df[col_name] = df[col_name].astype(np.int32)
                     elif pa.types.is_int64(field.type):
                         df[col_name] = df[col_name].astype(np.int64)
-                    
+                        
             elif pa.types.is_floating(field.type):
                 # Float types can handle NaN
                 if pa.types.is_float32(field.type):
                     df[col_name] = df[col_name].astype(np.float32)
                 else:
                     df[col_name] = df[col_name].astype(np.float64)
-                    
+                        
             # Handle dictionary (categorical) types
             elif pa.types.is_dictionary(field.type):
-                df[col_name] = df[col_name].astype('category')
-                
+                # FIXED: Only convert to category if no nulls
+                if not df[col_name].isnull().any():
+                    df[col_name] = df[col_name].astype('category')
+                # Otherwise keep as string
+                    
             # Handle string types
             elif pa.types.is_string(field.type) or pa.types.is_large_string(field.type):
-                if df[col_name].dtype.name == 'category':
+                # Keep as string, don't convert to category if it has one
+                if df[col_name].dtype.name == 'category' and df[col_name].isnull().any():
+                    # Convert back to string if category with nulls
                     df[col_name] = df[col_name].astype(str)
-                    
+                        
         return df
     
     def _optimize_dataframe_memory(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -763,16 +768,19 @@ class OptimizedOracleJoinETL:
             else:
                 # Convert 999_categories column to categorical
                 if col == '999_categories' or col == 'tb2_999_categories':
-                    df[col] = df[col].astype('category')
+                    # Only convert to category if no nulls or handle nulls first
+                    if not df[col].isnull().any():
+                        df[col] = df[col].astype('category')
+                    # If there are nulls, keep as string for now
                 
                 # Convert other string columns with low cardinality
                 elif df[col].nunique() < 50:
-                    # Check for nulls in string columns too
-                    if df[col].isnull().any():
-                        # Categories can handle NaN values
+                    # FIXED: Don't convert to category if column has nulls
+                    # PyArrow has issues with null values in categorical columns
+                    if not df[col].isnull().any():
                         df[col] = df[col].astype('category')
-                    else:
-                        df[col] = df[col].astype('category')
+                    # If there are nulls, keep as string type
+                    # This avoids the NumpyConverter error
         
         return df
     
