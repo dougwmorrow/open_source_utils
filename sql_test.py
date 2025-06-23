@@ -853,7 +853,7 @@ class OptimizedOracleJoinETL:
                 # Increase parallel degree if working well
                 self.parallel_degree = min(self.parallel_degree + 2, self.parallel_degree_range[1])
                 logger.info(f"Increased parallel degree to {self.parallel_degree} (success rate: {success_rate:.1%})")
-    
+        
     def process_partition(self, partition_id: str, 
                          date_range: Tuple[datetime, datetime],
                          partition_value: Optional[Any] = None) -> Dict[str, Any]:
@@ -882,13 +882,18 @@ class OptimizedOracleJoinETL:
         
         # Get last processed ID from checkpoint
         last_id = None
-        if checkpoint and partition_id in checkpoint.get('partitions', {}):
+        if checkpoint and 'partitions' in checkpoint and partition_id in checkpoint['partitions']:
             last_id = checkpoint['partitions'][partition_id].get('last_id')
             logger.info(f"Resuming partition {partition_id} from ID: {last_id}")
         
-        # Process data in chunks
-        rows_processed = checkpoint.get('partitions', {}).get(partition_id, {}).get('rows_processed', 0)
-        files_written = checkpoint.get('partitions', {}).get(partition_id, {}).get('files_written', [])
+        # Process data in chunks - FIXED SECTION
+        if checkpoint and 'partitions' in checkpoint and partition_id in checkpoint['partitions']:
+            partition_checkpoint = checkpoint['partitions'][partition_id]
+            rows_processed = partition_checkpoint.get('rows_processed', 0)
+            files_written = partition_checkpoint.get('files_written', [])
+        else:
+            rows_processed = 0
+            files_written = []
         chunk_num = len(files_written)
         
         logger.info(f"Processing partition {partition_id} with parallel degree {self.parallel_degree}")
@@ -1137,7 +1142,7 @@ class OptimizedOracleJoinETL:
                     'total_collections': self.gc_stats.get('collection_count', 0),
                     'total_gc_time': self.gc_stats.get('total_time', 0),
                     'total_collected': self.gc_stats.get('total_collected', 0)
-                } if self.monitor_gc else None,
+                } if self.monitor_gc and hasattr(self, 'gc_stats') else None,
                 'partitions': completed_partitions
             }
             
