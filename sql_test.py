@@ -673,19 +673,35 @@ class OptimizedOracleJoinETL:
             col_name = field.name
             if col_name not in df.columns:
                 continue
-                
+            
+            # Skip if column has nulls and target type can't handle them
+            has_nulls = df[col_name].isnull().any()
+            
             # Handle numeric types
             if pa.types.is_integer(field.type):
-                if pa.types.is_int8(field.type):
-                    df[col_name] = df[col_name].astype(np.int8)
-                elif pa.types.is_int16(field.type):
-                    df[col_name] = df[col_name].astype(np.int16)
-                elif pa.types.is_int32(field.type):
-                    df[col_name] = df[col_name].astype(np.int32)
-                elif pa.types.is_int64(field.type):
-                    df[col_name] = df[col_name].astype(np.int64)
+                if has_nulls:
+                    # Use nullable integer types
+                    if pa.types.is_int8(field.type):
+                        df[col_name] = df[col_name].astype('Int8')
+                    elif pa.types.is_int16(field.type):
+                        df[col_name] = df[col_name].astype('Int16')
+                    elif pa.types.is_int32(field.type):
+                        df[col_name] = df[col_name].astype('Int32')
+                    elif pa.types.is_int64(field.type):
+                        df[col_name] = df[col_name].astype('Int64')
+                else:
+                    # Regular integer types
+                    if pa.types.is_int8(field.type):
+                        df[col_name] = df[col_name].astype(np.int8)
+                    elif pa.types.is_int16(field.type):
+                        df[col_name] = df[col_name].astype(np.int16)
+                    elif pa.types.is_int32(field.type):
+                        df[col_name] = df[col_name].astype(np.int32)
+                    elif pa.types.is_int64(field.type):
+                        df[col_name] = df[col_name].astype(np.int64)
                     
             elif pa.types.is_floating(field.type):
+                # Float types can handle NaN
                 if pa.types.is_float32(field.type):
                     df[col_name] = df[col_name].astype(np.float32)
                 else:
@@ -712,141 +728,53 @@ class OptimizedOracleJoinETL:
             
             if col_type != 'object':
                 if col_type.name.startswith('int'):
-                    # Determine optimal int type
-                    c_min = df[col].min()
-                    c_max = df[col].max()
-                    if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
-                        df[col] = df[col].astype(np.int8)
-                    elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
-                        df[col] = df[col].astype(np.int16)
-                    elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
-                        df[col] = df[col].astype(np.int32)
+                    # Check for nulls before optimization
+                    if df[col].isnull().any():
+                        # Use nullable integer types for columns with nulls
+                        c_min = df[col].min()
+                        c_max = df[col].max()
+                        if pd.isna(c_min) or pd.isna(c_max):
+                            # Skip optimization if all values are null
+                            continue
+                        
+                        if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                            df[col] = df[col].astype('Int8')  # Nullable int8
+                        elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                            df[col] = df[col].astype('Int16')  # Nullable int16
+                        elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                            df[col] = df[col].astype('Int32')  # Nullable int32
+                        else:
+                            df[col] = df[col].astype('Int64')  # Nullable int64
+                    else:
+                        # No nulls, use regular integer types
+                        c_min = df[col].min()
+                        c_max = df[col].max()
+                        if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                            df[col] = df[col].astype(np.int8)
+                        elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                            df[col] = df[col].astype(np.int16)
+                        elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                            df[col] = df[col].astype(np.int32)
                 
                 elif col_type.name.startswith('float'):
+                    # Float types can handle NaN, so this is safe
                     df[col] = pd.to_numeric(df[col], downcast='float')
             
             else:
                 # Convert 999_categories column to categorical
-                if col == '999_categories':
+                if col == '999_categories' or col == 'tb2_999_categories':
                     df[col] = df[col].astype('category')
                 
                 # Convert other string columns with low cardinality
                 elif df[col].nunique() < 50:
-                    df[col] = df[col].astype('category')
+                    # Check for nulls in string columns too
+                    if df[col].isnull().any():
+                        # Categories can handle NaN values
+                        df[col] = df[col].astype('category')
+                    else:
+                        df[col] = df[col].astype('category')
         
         return df
-    
-    def stream_extract_to_parquet_dataset(self, query: str, params: Dict, 
-                                         output_path: str) -> Tuple[int, int]:
-        """
-        ALTERNATIVE: Use PyArrow Dataset API for better memory management
-        This method can be used instead of stream_extract_to_parquet for very large datasets
-        """
-        connection = self.pool.acquire()
-        rows_written = 0
-        last_id = None
-        
-        try:
-            # Enable parallel execution
-            self.enable_parallel_session(connection)
-            
-            cursor = connection.cursor()
-            cursor.arraysize = 10000
-            cursor.prefetchrows = cursor.arraysize + 1
-            
-            # Execute query
-            start_time = time.time()
-            cursor.execute(query, params)
-            
-            # Get column info
-            columns = [desc[0] for desc in cursor.description]
-            
-            # Process in larger batches for dataset API
-            batch_rows = []
-            batch_size = self.chunk_size  # Use full chunk size
-            file_counter = 0
-            
-            # Ensure output directory exists
-            os.makedirs(output_path, exist_ok=True)
-            
-            for row in cursor:
-                if self.shutdown:
-                    break
-                    
-                batch_rows.append(row)
-                last_id = row[0]
-                
-                if len(batch_rows) >= batch_size:
-                    # Check memory
-                    if not self.check_memory():
-                        logger.error("Memory limit exceeded, stopping batch")
-                        break
-                    
-                    # Convert to DataFrame
-                    df = pd.DataFrame(batch_rows, columns=columns)
-                    df = self._optimize_dataframe_memory(df)
-                    
-                    # Convert to PyArrow Table
-                    table = pa.Table.from_pandas(df)
-                    
-                    # Write using dataset API
-                    file_path = os.path.join(output_path, f"data_{file_counter:06d}.parquet")
-                    
-                    # ENHANCED: Use dataset write with compression options
-                    pq.write_table(
-                        table,
-                        file_path,
-                        compression=self.parquet_compression,
-                        compression_level=self.parquet_compression_level if self.parquet_compression in ['zstd', 'gzip', 'brotli'] else None,
-                        use_dictionary=self.parquet_use_dictionary,
-                        write_statistics=self.parquet_write_statistics,
-                        # row_group_size is a parameter of write_table, not ParquetWriter
-                        row_group_size=self.parquet_row_group_size
-                    )
-                    
-                    rows_written += len(df)
-                    file_counter += 1
-                    
-                    # Clear memory
-                    del df, table
-                    batch_rows = []
-                    
-                    if rows_written % 100000 == 0:
-                        elapsed = time.time() - start_time
-                        rate = rows_written / elapsed
-                        logger.info(f"Written {rows_written:,} rows at {rate:,.0f} rows/sec")
-            
-            # Write final batch
-            if batch_rows and not self.shutdown:
-                df = pd.DataFrame(batch_rows, columns=columns)
-                df = self._optimize_dataframe_memory(df)
-                table = pa.Table.from_pandas(df)
-                
-                file_path = os.path.join(output_path, f"data_{file_counter:06d}.parquet")
-                pq.write_table(
-                    table,
-                    file_path,
-                    compression=self.parquet_compression,
-                    compression_level=self.parquet_compression_level if self.parquet_compression in ['zstd', 'gzip', 'brotli'] else None,
-                    use_dictionary=self.parquet_use_dictionary,
-                    write_statistics=self.parquet_write_statistics,
-                    row_group_size=self.parquet_row_group_size
-                )
-                
-                rows_written += len(df)
-            
-            cursor.close()
-            
-            elapsed = time.time() - start_time
-            logger.info(f"Dataset written: {rows_written:,} rows in {file_counter + 1} files at {rows_written/elapsed:.0f} rows/sec")
-            
-            return rows_written, last_id
-            
-        except Exception as e:
-            logger.error(f"Error in dataset extraction: {str(e)}")
-            raise
-        finally:
-            self.pool.release(connection)
     
     def get_adaptive_date_ranges(self) -> List[Tuple[datetime, datetime]]:
         """
