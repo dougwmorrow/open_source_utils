@@ -384,7 +384,7 @@ class OptimizedOracleJoinETL:
                 return False
                 
         return True
-    
+        
     def build_optimized_query(self, date_range: Optional[Tuple[datetime, datetime]] = None,
                             last_id: Optional[int] = None,
                             partition_value: Optional[str] = None,
@@ -400,17 +400,21 @@ class OptimizedOracleJoinETL:
             f"PARALLEL(tb2, {self.parallel_degree})",
             "USE_HASH(tb1 tb2)",
             "PQ_DISTRIBUTE(tb2 HASH HASH)",
-            "NO_PARALLEL_INDEX(tb1)",  # Force full table scan for parallel
+            "NO_PARALLEL_INDEX(tb1)",
             "NO_PARALLEL_INDEX(tb2)"
         ]
         
         # Add statement-level parallel hint
         hints = f"/*+ {' '.join(parallel_hints)} */"
         
-        # Build column list: all from table_1, specific 17 from table_2
-        # Handle id column overlap by aliasing
-        table2_column_list = ', '.join([f'tb2."{col}" as "tb2_{col}"' if col == 'id' else f'tb2."{col}"' 
-                                       for col in self.table2_columns])
+        # Build column list with comprehensive aliasing to avoid any ambiguity
+        # Always alias table2 columns with tb2_ prefix
+        table2_column_list = []
+        for col in self.table2_columns:
+            # Always use tb2_ prefix for clarity and to avoid any conflicts
+            table2_column_list.append(f'tb2."{col}" as "tb2_{col}"')
+        
+        table2_columns_str = ', '.join(table2_column_list)
         
         # For parallel pipelined table function (if available in your Oracle version)
         if use_parallel_pipelined and hasattr(self, 'pipelined_function_name'):
@@ -418,7 +422,7 @@ class OptimizedOracleJoinETL:
             SELECT {hints} *
             FROM TABLE({self.pipelined_function_name}(
                 CURSOR(
-                    SELECT tb1.*, {table2_column_list}
+                    SELECT tb1.*, {table2_columns_str}
                     FROM table_1 tb1
                     JOIN table_2 tb2 ON tb1.id = tb2.id
                     WHERE 1=1
@@ -428,7 +432,7 @@ class OptimizedOracleJoinETL:
             query = f"""
             SELECT {hints}
                 tb1.*,
-                {table2_column_list}
+                {table2_columns_str}
             FROM table_1 tb1
             JOIN table_2 tb2 ON tb1.id = tb2.id
             WHERE 1=1
@@ -492,8 +496,8 @@ class OptimizedOracleJoinETL:
             # Set parallel degree policy
             cursor.execute("ALTER SESSION SET parallel_degree_policy = 'MANUAL'")
             
-            # Increase parallel execution memory
-            cursor.execute("ALTER SESSION SET pga_aggregate_target = 2G")
+            # Use workarea_size_policy instead of pga_aggregate_target
+            cursor.execute("ALTER SESSION SET workarea_size_policy = 'AUTO'")
             
             cursor.close()
             logger.info(f"Enabled parallel execution with degree {self.parallel_degree}")
