@@ -504,30 +504,31 @@ class OptimizedOracleJoinETL:
             
         except Exception as e:
             logger.warning(f"Could not set all parallel options: {str(e)}")
-    
+        
     def _get_parquet_compression_args(self) -> Dict[str, Any]:
         """Get compression arguments for Parquet writer"""
-        compression_args = {
+        # Arguments for ParquetWriter constructor
+        writer_args = {
             'compression': self.parquet_compression,
             'use_dictionary': self.parquet_use_dictionary,
             'write_statistics': self.parquet_write_statistics,
-            'row_group_size': self.parquet_row_group_size
         }
         
         # Add compression level for algorithms that support it
         if self.parquet_compression in ['zstd', 'gzip', 'brotli']:
-            compression_args['compression_level'] = self.parquet_compression_level
+            writer_args['compression_level'] = self.parquet_compression_level
         
         # Add page index if supported (PyArrow 6.0+)
         try:
             import pyarrow
             major_version = int(pyarrow.__version__.split('.')[0])
             if major_version >= 6 and self.parquet_write_page_index:
-                compression_args['write_page_index'] = True
+                writer_args['write_page_index'] = True
         except:
             pass
         
-        return compression_args
+        # Note: row_group_size is handled separately in write_table()
+        return writer_args
     
     def stream_extract_to_parquet(self, query: str, params: Dict, 
                                  output_path: str) -> Tuple[int, int]:
@@ -576,7 +577,7 @@ class OptimizedOracleJoinETL:
             # Use temp file to avoid network I/O during write
             temp_file = os.path.join(self.temp_dir, f"temp_{os.getpid()}_{time.time()}.parquet")
             
-            # Get compression arguments
+            # Get compression arguments (without row_group_size)
             compression_args = self._get_parquet_compression_args()
             
             for row in cursor:
@@ -602,7 +603,7 @@ class OptimizedOracleJoinETL:
                         # Create schema from first batch
                         table = pa.Table.from_pandas(df)
                         
-                        # ENHANCED: Create writer with optimized settings
+                        # FIXED: Create writer with only valid arguments
                         writer = pq.ParquetWriter(
                             temp_file,
                             table.schema,
@@ -611,9 +612,9 @@ class OptimizedOracleJoinETL:
                         
                         logger.debug(f"Created Parquet writer with {self.parquet_compression} compression")
                     
-                    # Write batch
+                    # FIXED: Write batch with row_group_size parameter
                     table = pa.Table.from_pandas(df)
-                    writer.write_table(table)
+                    writer.write_table(table, row_group_size=self.parquet_row_group_size)
                     rows_written += len(df)
                     
                     # Clear memory explicitly
@@ -639,7 +640,7 @@ class OptimizedOracleJoinETL:
                     )
                 
                 table = pa.Table.from_pandas(df)
-                writer.write_table(table)
+                writer.write_table(table, row_group_size=self.parquet_row_group_size)
                 rows_written += len(df)
             
             cursor.close()
@@ -770,6 +771,7 @@ class OptimizedOracleJoinETL:
                         compression_level=self.parquet_compression_level if self.parquet_compression in ['zstd', 'gzip', 'brotli'] else None,
                         use_dictionary=self.parquet_use_dictionary,
                         write_statistics=self.parquet_write_statistics,
+                        # row_group_size is a parameter of write_table, not ParquetWriter
                         row_group_size=self.parquet_row_group_size
                     )
                     
