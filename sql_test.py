@@ -540,23 +540,15 @@ class OptimizedOracleJoinETL:
         temp_file = None
         rows_written = 0
         last_id = None
+        schema = None  # Store the schema from first batch
         
         try:
             # Enable parallel execution for this session
             self.enable_parallel_session(connection)
             
             cursor = connection.cursor()
-            cursor.arraysize = 5000  # Increased for parallel processing
+            cursor.arraysize = 5000
             cursor.prefetchrows = cursor.arraysize + 1
-            
-            # Log query execution plan (optional)
-            if logger.isEnabledFor(logging.DEBUG):
-                explain_cursor = connection.cursor()
-                explain_cursor.execute(f"EXPLAIN PLAN FOR {query}", params)
-                explain_cursor.execute("SELECT * FROM table(DBMS_XPLAN.DISPLAY())")
-                for row in explain_cursor:
-                    logger.debug(f"Plan: {row[0]}")
-                explain_cursor.close()
             
             # Execute query
             start_time = time.time()
@@ -572,12 +564,12 @@ class OptimizedOracleJoinETL:
             # Set up Parquet writer
             writer = None
             batch_rows = []
-            batch_size = 5000  # Increased batch size
+            batch_size = 5000
             
             # Use temp file to avoid network I/O during write
             temp_file = os.path.join(self.temp_dir, f"temp_{os.getpid()}_{time.time()}.parquet")
             
-            # Get compression arguments (without row_group_size)
+            # Get compression arguments
             compression_args = self._get_parquet_compression_args()
             
             for row in cursor:
@@ -585,7 +577,7 @@ class OptimizedOracleJoinETL:
                     break
                     
                 batch_rows.append(row)
-                last_id = row[0]  # Assuming first column is ID
+                last_id = row[0]
                 
                 if len(batch_rows) >= batch_size:
                     # Check memory before processing
@@ -593,31 +585,32 @@ class OptimizedOracleJoinETL:
                         logger.error("Memory limit exceeded, stopping batch")
                         break
                     
-                    # Convert to DataFrame with minimal memory footprint
+                    # Convert to DataFrame
                     df = pd.DataFrame(batch_rows, columns=columns)
                     
-                    # Optimize dtypes immediately
-                    df = self._optimize_dataframe_memory(df)
-                    
                     if writer is None:
-                        # Create schema from first batch
+                        # First batch: optimize and create schema
+                        df = self._optimize_dataframe_memory(df)
                         table = pa.Table.from_pandas(df)
+                        schema = table.schema
                         
-                        # FIXED: Create writer with only valid arguments
                         writer = pq.ParquetWriter(
                             temp_file,
-                            table.schema,
+                            schema,
                             **compression_args
                         )
                         
                         logger.debug(f"Created Parquet writer with {self.parquet_compression} compression")
+                    else:
+                        # Subsequent batches: ensure schema consistency
+                        df = self._apply_consistent_schema(df, schema)
+                        table = pa.Table.from_pandas(df, schema=schema)
                     
-                    # FIXED: Write batch with row_group_size parameter
-                    table = pa.Table.from_pandas(df)
+                    # Write batch
                     writer.write_table(table, row_group_size=self.parquet_row_group_size)
                     rows_written += len(df)
                     
-                    # Clear memory explicitly
+                    # Clear memory
                     del df, table
                     batch_rows = []
                     
@@ -629,32 +622,33 @@ class OptimizedOracleJoinETL:
             # Write final batch
             if batch_rows and not self.shutdown:
                 df = pd.DataFrame(batch_rows, columns=columns)
-                df = self._optimize_dataframe_memory(df)
                 
                 if writer is None:
+                    df = self._optimize_dataframe_memory(df)
                     table = pa.Table.from_pandas(df)
+                    schema = table.schema
                     writer = pq.ParquetWriter(
                         temp_file,
-                        table.schema,
+                        schema,
                         **compression_args
                     )
+                else:
+                    df = self._apply_consistent_schema(df, schema)
+                    table = pa.Table.from_pandas(df, schema=schema)
                 
-                table = pa.Table.from_pandas(df)
                 writer.write_table(table, row_group_size=self.parquet_row_group_size)
                 rows_written += len(df)
             
             cursor.close()
             
-            # Close writer
+            # Close writer and move file
             if writer:
                 writer.close()
                 
-                # Log file size for compression monitoring
                 if os.path.exists(temp_file):
                     file_size_mb = os.path.getsize(temp_file) / (1024 * 1024)
                     logger.info(f"Temporary Parquet file size: {file_size_mb:.2f} MB ({self.parquet_compression} compression)")
             
-            # Move temp file to final location (network drive)
             if rows_written > 0 and os.path.exists(temp_file):
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
                 shutil.move(temp_file, output_path)
@@ -672,6 +666,41 @@ class OptimizedOracleJoinETL:
             raise
         finally:
             self.pool.release(connection)
+    
+    def _apply_consistent_schema(self, df: pd.DataFrame, schema: pa.Schema) -> pd.DataFrame:
+        """Apply consistent schema to DataFrame based on PyArrow schema"""
+        for i, field in enumerate(schema):
+            col_name = field.name
+            if col_name not in df.columns:
+                continue
+                
+            # Handle numeric types
+            if pa.types.is_integer(field.type):
+                if pa.types.is_int8(field.type):
+                    df[col_name] = df[col_name].astype(np.int8)
+                elif pa.types.is_int16(field.type):
+                    df[col_name] = df[col_name].astype(np.int16)
+                elif pa.types.is_int32(field.type):
+                    df[col_name] = df[col_name].astype(np.int32)
+                elif pa.types.is_int64(field.type):
+                    df[col_name] = df[col_name].astype(np.int64)
+                    
+            elif pa.types.is_floating(field.type):
+                if pa.types.is_float32(field.type):
+                    df[col_name] = df[col_name].astype(np.float32)
+                else:
+                    df[col_name] = df[col_name].astype(np.float64)
+                    
+            # Handle dictionary (categorical) types
+            elif pa.types.is_dictionary(field.type):
+                df[col_name] = df[col_name].astype('category')
+                
+            # Handle string types
+            elif pa.types.is_string(field.type) or pa.types.is_large_string(field.type):
+                if df[col_name].dtype.name == 'category':
+                    df[col_name] = df[col_name].astype(str)
+                    
+        return df
     
     def _optimize_dataframe_memory(self, df: pd.DataFrame) -> pd.DataFrame:
         """
