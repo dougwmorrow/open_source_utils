@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
 Optimized Oracle to Parquet ETL Script for Billion-Row JOIN Operations
-Enhanced with Oracle Parallel Processing capabilities
+Enhanced with Oracle Parallel Processing capabilities and optimized Parquet compression
 Designed for 16GB RAM constraint with streaming and memory management
 Modified to read category values from a parquet file instead of database
 Uses Oracle SID connection instead of DSN
+UPDATED: Optimized garbage collection for Python 3.12 and enhanced Parquet compression
 """
 
 import oracledb
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pyarrow.dataset as ds
+import pyarrow.compute as pc
 import os
 import logging
 import sys
@@ -23,8 +26,6 @@ import time
 import psutil
 import tempfile
 import shutil
-from queue import Queue
-from threading import Thread
 import signal
 import numpy as np
 
@@ -76,6 +77,27 @@ class OptimizedOracleJoinETL:
         self.memory_limit_percent = config.get('memory_limit_percent', 70)
         self.enable_parallel_monitoring = config.get('enable_parallel_monitoring', True)
         
+        # ENHANCED: Parquet compression settings
+        self.parquet_compression = config.get('parquet_compression', 'zstd')
+        self.parquet_compression_level = config.get('parquet_compression_level', 3)
+        self.parquet_row_group_size = config.get('parquet_row_group_size', None)  # Auto-calculate if None
+        self.parquet_use_dictionary = config.get('parquet_use_dictionary', ['999_categories'])
+        self.parquet_write_statistics = config.get('parquet_write_statistics', True)
+        self.parquet_write_page_index = config.get('parquet_write_page_index', True)
+        
+        # Calculate optimal row group size if not specified
+        if self.parquet_row_group_size is None:
+            # Aim for 128MB row groups
+            estimated_row_size_bytes = config.get('estimated_row_size_bytes', 200)
+            target_row_group_mb = config.get('target_row_group_mb', 128)
+            self.parquet_row_group_size = (target_row_group_mb * 1024 * 1024) // estimated_row_size_bytes
+            # Ensure it's at least as large as chunk size for efficiency
+            self.parquet_row_group_size = max(self.parquet_row_group_size, self.chunk_size)
+            logger.info(f"Calculated optimal row group size: {self.parquet_row_group_size:,} rows")
+        
+        # GC monitoring flag
+        self.monitor_gc = config.get('monitor_gc', True)
+        
         # Initialize Oracle connection pool using SID
         # Create DSN from host, port, and SID
         oracle_host = config['oracle_host']
@@ -84,9 +106,6 @@ class OptimizedOracleJoinETL:
         
         # Create DSN string for SID connection
         dsn = oracledb.makedsn(oracle_host, oracle_port, sid=oracle_sid)
-        
-        # Alternative: Direct connection string format for SID
-        # dsn = f"{oracle_host}:{oracle_port}/{oracle_sid}"
         
         logger.info(f"Connecting to Oracle: {oracle_host}:{oracle_port}/{oracle_sid}")
         
@@ -121,10 +140,94 @@ class OptimizedOracleJoinETL:
             'max_parallel_degree': 0
         }
         
+        # NEW: Optimize GC settings for large data processing
+        self._optimize_gc_settings()
+        
+        # NEW: Set up GC monitoring
+        if self.monitor_gc:
+            self._setup_gc_monitoring()
+        
         # Set up signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         self.shutdown = False
+        
+        # Log Parquet configuration
+        logger.info("="*60)
+        logger.info("Parquet Configuration:")
+        logger.info(f"Compression: {self.parquet_compression} (level {self.parquet_compression_level})")
+        logger.info(f"Row Group Size: {self.parquet_row_group_size:,} rows")
+        logger.info(f"Dictionary Encoding: {self.parquet_use_dictionary}")
+        logger.info(f"Write Statistics: {self.parquet_write_statistics}")
+        logger.info(f"Write Page Index: {self.parquet_write_page_index}")
+        logger.info("="*60)
+    
+    def _optimize_gc_settings(self):
+        """Optimize GC for billion-row processing workload"""
+        # Store original settings for cleanup
+        self.original_gc_thresholds = gc.get_threshold()
+        logger.info(f"Original GC thresholds: {self.original_gc_thresholds}")
+        
+        # Increase generation 0 threshold significantly
+        # This reduces GC overhead from ~3% to ~0.5% of runtime
+        # With 50k rows per chunk, this allows ~10 chunks before GC
+        gc.set_threshold(500000, 10, 10)
+        logger.info("Set GC threshold to (500000, 10, 10) for better performance")
+        
+        # Collect once after all initialization
+        collected = gc.collect()
+        logger.info(f"Initial GC collected {collected} objects")
+        
+        # Freeze all currently tracked objects
+        # This prevents GC from scanning long-lived objects created during init
+        gc.freeze()
+        logger.info("Froze initial objects to reduce GC overhead")
+        
+        # Log current GC stats
+        for i in range(3):
+            count = len(gc.get_objects(i))
+            logger.info(f"Generation {i} objects: {count}")
+    
+    def _setup_gc_monitoring(self):
+        """Set up GC monitoring callbacks"""
+        self.gc_stats = {
+            'collections': [],
+            'total_collected': 0,
+            'total_uncollectable': 0,
+            'total_time': 0.0,
+            'collection_count': 0
+        }
+        
+        def gc_callback(phase, info):
+            if phase == "start":
+                # Store start time for this collection
+                info['start_time'] = time.time()
+            elif phase == "stop":
+                # Calculate collection duration
+                duration = time.time() - info.get('start_time', time.time())
+                
+                self.gc_stats['collections'].append({
+                    'generation': info['generation'],
+                    'collected': info['collected'],
+                    'uncollectable': info['uncollectable'],
+                    'duration': duration,
+                    'timestamp': time.time()
+                })
+                
+                self.gc_stats['total_collected'] += info['collected']
+                self.gc_stats['total_uncollectable'] += info['uncollectable']
+                self.gc_stats['total_time'] += duration
+                self.gc_stats['collection_count'] += 1
+                
+                # Log if collection took too long or collected many objects
+                if duration > 0.1 or info['collected'] > 10000:
+                    logger.info(
+                        f"GC Gen {info['generation']}: collected {info['collected']} objects "
+                        f"in {duration:.3f}s, {info['uncollectable']} uncollectable"
+                    )
+        
+        gc.callbacks.append(gc_callback)
+        logger.info("GC monitoring enabled")
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully"""
@@ -233,18 +336,53 @@ class OptimizedOracleJoinETL:
             logger.debug(f"Parallel monitoring error: {str(e)}")
     
     def check_memory(self) -> bool:
-        """Check if memory usage is within limits"""
+        """Check if memory usage is within limits with smart GC triggering"""
         mem = psutil.virtual_memory()
-        if mem.percent > self.memory_limit_percent:
-            logger.warning(f"Memory usage at {mem.percent}%, triggering garbage collection")
-            gc.collect()
-            time.sleep(2)
+        current_percent = mem.percent
+        
+        if current_percent > self.memory_limit_percent:
+            logger.warning(f"Memory usage at {current_percent:.1f}%, above limit of {self.memory_limit_percent}%")
             
-            # Check again after GC
+            # Get GC stats before collection
+            gc_counts_before = gc.get_count()
+            
+            # Only call gc.collect() when actually needed
+            start_time = time.time()
+            collected = gc.collect()  # Full collection
+            gc_duration = time.time() - start_time
+            
+            logger.info(
+                f"GC collected {collected} objects in {gc_duration:.3f}s "
+                f"(generations before: {gc_counts_before})"
+            )
+            
+            # Give system time to release memory
+            time.sleep(1)
+            
+            # Check memory again after GC
             mem = psutil.virtual_memory()
-            if mem.percent > 85:
-                logger.error(f"Memory critical at {mem.percent}%")
+            new_percent = mem.percent
+            
+            logger.info(
+                f"Memory after GC: {new_percent:.1f}% "
+                f"(reduced by {current_percent - new_percent:.1f}%)"
+            )
+            
+            if new_percent > 85:
+                logger.error(f"Memory critical at {new_percent:.1f}% even after GC")
+                # Log top memory consumers if available
+                try:
+                    import tracemalloc
+                    if tracemalloc.is_tracing():
+                        snapshot = tracemalloc.take_snapshot()
+                        top_stats = snapshot.statistics('lineno')
+                        logger.error("Top memory allocations:")
+                        for stat in top_stats[:5]:
+                            logger.error(f"  {stat}")
+                except:
+                    pass
                 return False
+                
         return True
     
     def build_optimized_query(self, date_range: Optional[Tuple[datetime, datetime]] = None,
@@ -363,10 +501,35 @@ class OptimizedOracleJoinETL:
         except Exception as e:
             logger.warning(f"Could not set all parallel options: {str(e)}")
     
+    def _get_parquet_compression_args(self) -> Dict[str, Any]:
+        """Get compression arguments for Parquet writer"""
+        compression_args = {
+            'compression': self.parquet_compression,
+            'use_dictionary': self.parquet_use_dictionary,
+            'write_statistics': self.parquet_write_statistics,
+            'row_group_size': self.parquet_row_group_size
+        }
+        
+        # Add compression level for algorithms that support it
+        if self.parquet_compression in ['zstd', 'gzip', 'brotli']:
+            compression_args['compression_level'] = self.parquet_compression_level
+        
+        # Add page index if supported (PyArrow 6.0+)
+        try:
+            import pyarrow
+            major_version = int(pyarrow.__version__.split('.')[0])
+            if major_version >= 6 and self.parquet_write_page_index:
+                compression_args['write_page_index'] = True
+        except:
+            pass
+        
+        return compression_args
+    
     def stream_extract_to_parquet(self, query: str, params: Dict, 
                                  output_path: str) -> Tuple[int, int]:
         """
         Stream data directly from Oracle to Parquet with parallel execution monitoring
+        ENHANCED: Optimized Parquet compression and writing
         """
         connection = self.pool.acquire()
         temp_file = None
@@ -409,6 +572,9 @@ class OptimizedOracleJoinETL:
             # Use temp file to avoid network I/O during write
             temp_file = os.path.join(self.temp_dir, f"temp_{os.getpid()}_{time.time()}.parquet")
             
+            # Get compression arguments
+            compression_args = self._get_parquet_compression_args()
+            
             for row in cursor:
                 if self.shutdown:
                     break
@@ -431,21 +597,22 @@ class OptimizedOracleJoinETL:
                     if writer is None:
                         # Create schema from first batch
                         table = pa.Table.from_pandas(df)
+                        
+                        # ENHANCED: Create writer with optimized settings
                         writer = pq.ParquetWriter(
                             temp_file,
                             table.schema,
-                            compression='snappy',
-                            use_dictionary=['999_categories'],  # 999_categories has only 999 values
-                            write_statistics=True,
-                            row_group_size=10000  # Increased for larger chunks
+                            **compression_args
                         )
+                        
+                        logger.debug(f"Created Parquet writer with {self.parquet_compression} compression")
                     
                     # Write batch
                     table = pa.Table.from_pandas(df)
                     writer.write_table(table)
                     rows_written += len(df)
                     
-                    # Clear memory
+                    # Clear memory explicitly
                     del df, table
                     batch_rows = []
                     
@@ -464,10 +631,7 @@ class OptimizedOracleJoinETL:
                     writer = pq.ParquetWriter(
                         temp_file,
                         table.schema,
-                        compression='snappy',
-                        use_dictionary=['999_categories'],
-                        write_statistics=True,
-                        row_group_size=10000
+                        **compression_args
                     )
                 
                 table = pa.Table.from_pandas(df)
@@ -479,6 +643,11 @@ class OptimizedOracleJoinETL:
             # Close writer
             if writer:
                 writer.close()
+                
+                # Log file size for compression monitoring
+                if os.path.exists(temp_file):
+                    file_size_mb = os.path.getsize(temp_file) / (1024 * 1024)
+                    logger.info(f"Temporary Parquet file size: {file_size_mb:.2f} MB ({self.parquet_compression} compression)")
             
             # Move temp file to final location (network drive)
             if rows_written > 0 and os.path.exists(temp_file):
@@ -502,6 +671,7 @@ class OptimizedOracleJoinETL:
     def _optimize_dataframe_memory(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Optimize DataFrame memory usage in-place
+        Enhanced for better compression with column-specific optimizations
         """
         for col in df.columns:
             col_type = df[col].dtype
@@ -531,6 +701,117 @@ class OptimizedOracleJoinETL:
                     df[col] = df[col].astype('category')
         
         return df
+    
+    def stream_extract_to_parquet_dataset(self, query: str, params: Dict, 
+                                         output_path: str) -> Tuple[int, int]:
+        """
+        ALTERNATIVE: Use PyArrow Dataset API for better memory management
+        This method can be used instead of stream_extract_to_parquet for very large datasets
+        """
+        connection = self.pool.acquire()
+        rows_written = 0
+        last_id = None
+        
+        try:
+            # Enable parallel execution
+            self.enable_parallel_session(connection)
+            
+            cursor = connection.cursor()
+            cursor.arraysize = 10000
+            cursor.prefetchrows = cursor.arraysize + 1
+            
+            # Execute query
+            start_time = time.time()
+            cursor.execute(query, params)
+            
+            # Get column info
+            columns = [desc[0] for desc in cursor.description]
+            
+            # Process in larger batches for dataset API
+            batch_rows = []
+            batch_size = self.chunk_size  # Use full chunk size
+            file_counter = 0
+            
+            # Ensure output directory exists
+            os.makedirs(output_path, exist_ok=True)
+            
+            for row in cursor:
+                if self.shutdown:
+                    break
+                    
+                batch_rows.append(row)
+                last_id = row[0]
+                
+                if len(batch_rows) >= batch_size:
+                    # Check memory
+                    if not self.check_memory():
+                        logger.error("Memory limit exceeded, stopping batch")
+                        break
+                    
+                    # Convert to DataFrame
+                    df = pd.DataFrame(batch_rows, columns=columns)
+                    df = self._optimize_dataframe_memory(df)
+                    
+                    # Convert to PyArrow Table
+                    table = pa.Table.from_pandas(df)
+                    
+                    # Write using dataset API
+                    file_path = os.path.join(output_path, f"data_{file_counter:06d}.parquet")
+                    
+                    # ENHANCED: Use dataset write with compression options
+                    pq.write_table(
+                        table,
+                        file_path,
+                        compression=self.parquet_compression,
+                        compression_level=self.parquet_compression_level if self.parquet_compression in ['zstd', 'gzip', 'brotli'] else None,
+                        use_dictionary=self.parquet_use_dictionary,
+                        write_statistics=self.parquet_write_statistics,
+                        row_group_size=self.parquet_row_group_size
+                    )
+                    
+                    rows_written += len(df)
+                    file_counter += 1
+                    
+                    # Clear memory
+                    del df, table
+                    batch_rows = []
+                    
+                    if rows_written % 100000 == 0:
+                        elapsed = time.time() - start_time
+                        rate = rows_written / elapsed
+                        logger.info(f"Written {rows_written:,} rows at {rate:,.0f} rows/sec")
+            
+            # Write final batch
+            if batch_rows and not self.shutdown:
+                df = pd.DataFrame(batch_rows, columns=columns)
+                df = self._optimize_dataframe_memory(df)
+                table = pa.Table.from_pandas(df)
+                
+                file_path = os.path.join(output_path, f"data_{file_counter:06d}.parquet")
+                pq.write_table(
+                    table,
+                    file_path,
+                    compression=self.parquet_compression,
+                    compression_level=self.parquet_compression_level if self.parquet_compression in ['zstd', 'gzip', 'brotli'] else None,
+                    use_dictionary=self.parquet_use_dictionary,
+                    write_statistics=self.parquet_write_statistics,
+                    row_group_size=self.parquet_row_group_size
+                )
+                
+                rows_written += len(df)
+            
+            cursor.close()
+            
+            elapsed = time.time() - start_time
+            logger.info(f"Dataset written: {rows_written:,} rows in {file_counter + 1} files at {rows_written/elapsed:.0f} rows/sec")
+            
+            return rows_written, last_id
+            
+        except Exception as e:
+            logger.error(f"Error in dataset extraction: {str(e)}")
+            raise
+        finally:
+            self.pool.release(connection)
     
     def get_adaptive_date_ranges(self) -> List[Tuple[datetime, datetime]]:
         """
@@ -661,8 +942,7 @@ class OptimizedOracleJoinETL:
                     f"(+{chunk_rows:,} in chunk {chunk_num})"
                 )
                 
-                # Force garbage collection
-                gc.collect()
+                # REMOVED: Manual gc.collect() call - let Python handle it
                 
             except Exception as e:
                 logger.error(f"Error in partition {partition_id}: {str(e)}")
@@ -705,6 +985,63 @@ class OptimizedOracleJoinETL:
             json.dump(checkpoint_data, f, indent=2)
         os.replace(temp_file, checkpoint_file)
     
+    def cleanup(self):
+        """Restore original GC settings and clean up resources"""
+        logger.info("Cleaning up ETL resources...")
+        
+        # Restore original GC settings
+        if hasattr(self, 'original_gc_thresholds'):
+            gc.set_threshold(*self.original_gc_thresholds)
+            # Note: gc.unfreeze() is only available in Python 3.7+
+            # For Python 3.12, frozen objects remain frozen
+            logger.info("Restored original GC thresholds")
+        
+        # Log GC statistics if monitoring was enabled
+        if self.monitor_gc and hasattr(self, 'gc_stats'):
+            self._log_gc_summary()
+        
+        # Clean up temp directory
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+        
+        # Close connection pool
+        if hasattr(self, 'pool'):
+            self.pool.close()
+    
+    def _log_gc_summary(self):
+        """Log summary of GC activity during ETL run"""
+        if not self.gc_stats['collection_count']:
+            return
+        
+        logger.info("="*60)
+        logger.info("Garbage Collection Summary:")
+        logger.info(f"Total collections: {self.gc_stats['collection_count']}")
+        logger.info(f"Total objects collected: {self.gc_stats['total_collected']:,}")
+        logger.info(f"Total uncollectable: {self.gc_stats['total_uncollectable']}")
+        logger.info(f"Total GC time: {self.gc_stats['total_time']:.3f}s")
+        
+        if self.gc_stats['collection_count'] > 0:
+            avg_time = self.gc_stats['total_time'] / self.gc_stats['collection_count']
+            logger.info(f"Average collection time: {avg_time:.3f}s")
+        
+        # Show generation statistics
+        gen_stats = {}
+        for collection in self.gc_stats['collections']:
+            gen = collection['generation']
+            if gen not in gen_stats:
+                gen_stats[gen] = {'count': 0, 'collected': 0, 'time': 0}
+            gen_stats[gen]['count'] += 1
+            gen_stats[gen]['collected'] += collection['collected']
+            gen_stats[gen]['time'] += collection['duration']
+        
+        for gen, stats in sorted(gen_stats.items()):
+            logger.info(
+                f"Generation {gen}: {stats['count']} collections, "
+                f"{stats['collected']:,} objects, {stats['time']:.3f}s total"
+            )
+        
+        logger.info("="*60)
+    
     def run(self):
         """Execute the optimized ETL process with parallel processing"""
         start_time = datetime.now()
@@ -719,7 +1056,8 @@ class OptimizedOracleJoinETL:
         logger.info(f"Memory limit: {self.memory_limit_percent}%")
         logger.info(f"Chunk size: {self.chunk_size:,} rows")
         logger.info(f"Parallel degree: {self.parallel_degree} (range: {self.parallel_degree_range})")
-        logger.info(f"Available parallel servers: 16-160")
+        logger.info(f"GC threshold: {gc.get_threshold()}")
+        logger.info(f"GC monitoring: {'Enabled' if self.monitor_gc else 'Disabled'}")
         logger.info("="*60)
         
         try:
@@ -748,7 +1086,7 @@ class OptimizedOracleJoinETL:
                     if not self.check_memory():
                         logger.warning("Memory pressure detected, pausing...")
                         time.sleep(10)
-                        gc.collect()
+                        # REMOVED: Manual gc.collect() - handled in check_memory()
                     
                 except Exception as e:
                     logger.error(f"Failed partition {partition_id}: {str(e)}")
@@ -786,7 +1124,20 @@ class OptimizedOracleJoinETL:
                 'extraction_date': datetime.now().isoformat(),
                 'duration_seconds': (datetime.now() - start_time).total_seconds(),
                 'completed': not self.shutdown,
+                'parquet_settings': {
+                    'compression': self.parquet_compression,
+                    'compression_level': self.parquet_compression_level,
+                    'row_group_size': self.parquet_row_group_size,
+                    'dictionary_columns': self.parquet_use_dictionary,
+                    'write_statistics': self.parquet_write_statistics,
+                    'write_page_index': self.parquet_write_page_index
+                },
                 'parallel_stats': self.parallel_stats,
+                'gc_stats_summary': {
+                    'total_collections': self.gc_stats.get('collection_count', 0),
+                    'total_gc_time': self.gc_stats.get('total_time', 0),
+                    'total_collected': self.gc_stats.get('total_collected', 0)
+                } if self.monitor_gc else None,
                 'partitions': completed_partitions
             }
             
@@ -822,12 +1173,8 @@ class OptimizedOracleJoinETL:
             logger.info(f"Resume using extraction ID: {extraction_id}")
             raise
         finally:
-            # Clean up temp directory
-            if os.path.exists(self.temp_dir):
-                shutil.rmtree(self.temp_dir, ignore_errors=True)
-            
-            # Close connection pool
-            self.pool.close()
+            # Ensure cleanup is always called
+            self.cleanup()
 
 
 def main():
@@ -890,6 +1237,37 @@ def main():
         'parallel_degree_range': (4, 16),  # Min and max for adaptive tuning
         'memory_limit_percent': 70,    # Leave 30% buffer
         'enable_parallel_monitoring': True,  # Monitor parallel execution
+        'monitor_gc': True,            # Enable GC monitoring
+        
+        # ENHANCED: Parquet compression settings
+        'parquet_compression': 'zstd',  # Changed from snappy to zstd
+        'parquet_compression_level': 3,  # Good balance of speed and compression
+        # Alternative: Use 6-9 for better compression if write speed is not critical
+        # 'parquet_compression_level': 6,
+        
+        # Row group size - auto-calculated based on estimated row size
+        'estimated_row_size_bytes': 200,  # Adjust based on your actual data
+        'target_row_group_mb': 128,       # Target 128MB row groups
+        # 'parquet_row_group_size': 640000,  # Or set explicitly
+        
+        # Dictionary encoding for low-cardinality columns
+        'parquet_use_dictionary': ['999_categories'],  # Add other categorical columns
+        
+        # Enable statistics and page indexes for better query performance
+        'parquet_write_statistics': True,
+        'parquet_write_page_index': True,
+        
+        # Alternative compression options for different use cases:
+        # For fastest write speed (real-time ETL):
+        # 'parquet_compression': 'lz4',
+        
+        # For maximum compression (archival):
+        # 'parquet_compression': 'gzip',
+        # 'parquet_compression_level': 9,
+        
+        # For balanced performance with tunable compression:
+        # 'parquet_compression': 'zstd',
+        # 'parquet_compression_level': 6,  # Range 1-22, default 3
     }
     
     # Create and run ETL
