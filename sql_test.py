@@ -534,7 +534,7 @@ class OptimizedOracleJoinETL:
                                  output_path: str) -> Tuple[int, int]:
         """
         Stream data directly from Oracle to Parquet with parallel execution monitoring
-        ENHANCED: Optimized Parquet compression and writing
+        ENHANCED: Optimized Parquet compression and writing with improved data cleaning
         """
         connection = self.pool.acquire()
         temp_file = None
@@ -588,23 +588,56 @@ class OptimizedOracleJoinETL:
                     # Convert to DataFrame
                     df = pd.DataFrame(batch_rows, columns=columns)
                     
+                    # NEW: Clean numeric data before optimization
+                    df = self._clean_numeric_data(df)
+                    
+                    # Debug problematic columns
+                    if 'pacnb' in df.columns and logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"pacnb dtype before optimization: {df['pacnb'].dtype}")
+                        logger.debug(f"pacnb sample values: {df['pacnb'].dropna().head()}")
+                        logger.debug(f"pacnb has inf: {np.isinf(df['pacnb'].dropna()).any() if df['pacnb'].dtype in ['float64', 'float32'] else 'N/A'}")
+                        logger.debug(f"pacnb null count: {df['pacnb'].isnull().sum()}")
+                    
                     if writer is None:
                         # First batch: optimize and create schema
                         df = self._optimize_dataframe_memory(df)
-                        table = pa.Table.from_pandas(df)
-                        schema = table.schema
                         
-                        writer = pq.ParquetWriter(
-                            temp_file,
-                            schema,
-                            **compression_args
-                        )
-                        
-                        logger.debug(f"Created Parquet writer with {self.parquet_compression} compression")
+                        try:
+                            table = pa.Table.from_pandas(df)
+                            schema = table.schema
+                            
+                            writer = pq.ParquetWriter(
+                                temp_file,
+                                schema,
+                                **compression_args
+                            )
+                            
+                            logger.debug(f"Created Parquet writer with {self.parquet_compression} compression")
+                            logger.debug(f"Schema: {schema}")
+                            
+                        except Exception as e:
+                            logger.error(f"Error creating Parquet table: {str(e)}")
+                            logger.error(f"DataFrame dtypes: {df.dtypes.to_dict()}")
+                            # Log problematic columns
+                            for col in df.columns:
+                                if df[col].dtype == 'object':
+                                    unique_types = df[col].dropna().apply(type).unique()
+                                    logger.error(f"Column {col} has mixed types: {unique_types}")
+                            raise
+                            
                     else:
                         # Subsequent batches: ensure schema consistency
                         df = self._apply_consistent_schema(df, schema)
-                        table = pa.Table.from_pandas(df, schema=schema)
+                        
+                        try:
+                            table = pa.Table.from_pandas(df, schema=schema)
+                        except Exception as e:
+                            logger.error(f"Error creating table with consistent schema: {str(e)}")
+                            logger.error(f"DataFrame dtypes: {df.dtypes.to_dict()}")
+                            # Try without enforcing schema as fallback
+                            logger.warning("Falling back to creating table without schema enforcement")
+                            df = self._optimize_dataframe_memory(df)
+                            table = pa.Table.from_pandas(df)
                     
                     # Write batch
                     writer.write_table(table, row_group_size=self.parquet_row_group_size)
@@ -623,18 +656,30 @@ class OptimizedOracleJoinETL:
             if batch_rows and not self.shutdown:
                 df = pd.DataFrame(batch_rows, columns=columns)
                 
+                # Clean numeric data
+                df = self._clean_numeric_data(df)
+                
                 if writer is None:
                     df = self._optimize_dataframe_memory(df)
-                    table = pa.Table.from_pandas(df)
-                    schema = table.schema
-                    writer = pq.ParquetWriter(
-                        temp_file,
-                        schema,
-                        **compression_args
-                    )
+                    try:
+                        table = pa.Table.from_pandas(df)
+                        schema = table.schema
+                        writer = pq.ParquetWriter(
+                            temp_file,
+                            schema,
+                            **compression_args
+                        )
+                    except Exception as e:
+                        logger.error(f"Error creating final batch table: {str(e)}")
+                        raise
                 else:
                     df = self._apply_consistent_schema(df, schema)
-                    table = pa.Table.from_pandas(df, schema=schema)
+                    try:
+                        table = pa.Table.from_pandas(df, schema=schema)
+                    except Exception as e:
+                        logger.warning(f"Schema consistency failed for final batch: {str(e)}")
+                        df = self._optimize_dataframe_memory(df)
+                        table = pa.Table.from_pandas(df)
                 
                 writer.write_table(table, row_group_size=self.parquet_row_group_size)
                 rows_written += len(df)
@@ -679,6 +724,9 @@ class OptimizedOracleJoinETL:
             
             # Handle numeric types
             if pa.types.is_integer(field.type):
+                # First ensure the column is numeric
+                df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
+                
                 if has_nulls:
                     # Use nullable integer types
                     if pa.types.is_int8(field.type):
@@ -701,10 +749,28 @@ class OptimizedOracleJoinETL:
                         df[col_name] = df[col_name].astype(np.int64)
                         
             elif pa.types.is_floating(field.type):
+                # ENHANCED: Clean float data before conversion
+                # Replace infinity values with NaN
+                df[col_name] = df[col_name].replace([np.inf, -np.inf], np.nan)
+                
+                # Ensure numeric type
+                df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
+                
+                # Handle any mixed types or string representations
+                if df[col_name].dtype == 'object':
+                    # Try to convert string representations of numbers
+                    df[col_name] = df[col_name].apply(lambda x: float(x) if isinstance(x, str) and x.strip() != '' else x)
+                    df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
+                
                 # Float types can handle NaN
-                if pa.types.is_float32(field.type):
-                    df[col_name] = df[col_name].astype(np.float32)
-                else:
+                try:
+                    if pa.types.is_float32(field.type):
+                        df[col_name] = df[col_name].astype(np.float32)
+                    else:
+                        df[col_name] = df[col_name].astype(np.float64)
+                except Exception as e:
+                    logger.warning(f"Error converting {col_name} to float: {str(e)}")
+                    # Fallback to float64
                     df[col_name] = df[col_name].astype(np.float64)
                         
             # Handle dictionary (categorical) types
@@ -720,7 +786,48 @@ class OptimizedOracleJoinETL:
                 if df[col_name].dtype.name == 'category' and df[col_name].isnull().any():
                     # Convert back to string if category with nulls
                     df[col_name] = df[col_name].astype(str)
+                elif df[col_name].dtype != 'object' and df[col_name].dtype != 'string':
+                    # Convert non-string types to string
+                    df[col_name] = df[col_name].astype(str)
                         
+        return df
+
+    def _clean_numeric_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Clean numeric data to prevent PyArrow conversion errors"""
+        for col in df.columns:
+            # Check if it's a numeric column or should be numeric
+            if df[col].dtype in ['float64', 'float32', 'float16', 'int64', 'int32', 'int16', 'int8']:
+                # Replace infinity values
+                if df[col].dtype.name.startswith('float'):
+                    df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+            
+            elif df[col].dtype == 'object':
+                # Check if this object column contains numeric data
+                # Sample first non-null value
+                sample_val = df[col].dropna().iloc[0] if len(df[col].dropna()) > 0 else None
+                
+                if sample_val is not None:
+                    # Check if it's a numeric string or actual number
+                    try:
+                        float(str(sample_val))
+                        # This column appears to contain numeric data
+                        logger.debug(f"Converting object column {col} to numeric")
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                        # Replace infinity values after conversion
+                        df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+                    except (ValueError, TypeError):
+                        # Not numeric, leave as is
+                        pass
+        
+        # Special handling for known problematic columns
+        if hasattr(self, 'config') and 'problem_columns' in self.config:
+            for col in self.config.get('problem_columns', []):
+                if col in df.columns:
+                    logger.debug(f"Special handling for problem column: {col}")
+                    # Force to clean float64
+                    df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
+                    df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+        
         return df
     
     def _optimize_dataframe_memory(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -762,8 +869,31 @@ class OptimizedOracleJoinETL:
                             df[col] = df[col].astype(np.int32)
                 
                 elif col_type.name.startswith('float'):
-                    # Float types can handle NaN, so this is safe
-                    df[col] = pd.to_numeric(df[col], downcast='float')
+                    # ENHANCED: Handle special float values before downcasting
+                    # Replace infinity values with NaN
+                    df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+                    
+                    # Only downcast if no special values that might cause issues
+                    try:
+                        # Check if downcasting is safe
+                        if df[col].isnull().sum() < len(df[col]):  # Not all nulls
+                            # First ensure it's numeric
+                            df[col] = pd.to_numeric(df[col], errors='coerce')
+                            
+                            # Try downcasting
+                            temp_col = pd.to_numeric(df[col], downcast='float', errors='coerce')
+                            
+                            # Verify no data loss
+                            if not df[col].isnull().equals(temp_col.isnull()):
+                                logger.warning(f"Skipping downcast for {col} due to potential data loss")
+                            else:
+                                df[col] = temp_col
+                                
+                    except Exception as e:
+                        logger.warning(f"Could not downcast float column {col}: {str(e)}")
+                        # Keep original dtype if downcasting fails
+                        # Ensure it's at least clean float64
+                        df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
             
             else:
                 # Convert 999_categories column to categorical
