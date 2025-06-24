@@ -840,6 +840,10 @@ class OptimizedOracleJoinETL:
         # Keep track of columns that should NOT be converted to categorical
         skip_categorical = set()
         
+        # Track number of unique values for categorical columns
+        # This helps prevent the int8 overflow issue
+        self._category_unique_counts = {}
+        
         for col in df.columns:
             col_type = df[col].dtype
             
@@ -883,16 +887,14 @@ class OptimizedOracleJoinETL:
                             df[col] = df[col].astype(np.int64)
                 
                 elif col_type.name.startswith('float'):
-                    # ENHANCED: Handle special float values before downcasting
-                    # Replace infinity values with NaN
+                    # Handle special float values before downcasting
                     df[col] = df[col].replace([np.inf, -np.inf], np.nan)
                     
                     # Skip if all nulls
                     if not has_data:
                         continue
                     
-                    # Keep as float64 for consistency unless specifically float32
-                    # This prevents schema changes between batches
+                    # Keep as float64 for consistency
                     df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
             
             else:  # object dtype
@@ -909,21 +911,31 @@ class OptimizedOracleJoinETL:
                     logger.debug(f"Column {col} has {null_ratio:.1%} nulls, keeping as object")
                     continue
                 
+                # Count unique values
+                n_unique = df[col].nunique()
+                
                 # Convert 999_categories column to categorical only if it has data
                 if col == '999_categories' or col == 'tb2_999_categories':
                     if not df[col].isnull().any():
                         df[col] = df[col].astype('category')
+                        self._category_unique_counts[col] = n_unique
                     else:
                         skip_categorical.add(col)
                 
                 # Convert other string columns with low cardinality
-                elif col not in skip_categorical and df[col].nunique() < 50:
-                    # Only convert if no nulls
-                    if not df[col].isnull().any():
+                # But also check that they don't exceed int8 range
+                elif col not in skip_categorical and n_unique < 500:  # Increased threshold
+                    # Only convert if no nulls and reasonable number of categories
+                    if not df[col].isnull().any() and n_unique < 32000:  # Safe for int16
                         df[col] = df[col].astype('category')
+                        self._category_unique_counts[col] = n_unique
+                        
+                        # Log high cardinality categorical columns
+                        if n_unique > 127:
+                            logger.info(f"Column {col} has {n_unique} categories (> int8 range)")
         
         return df
-
+    
     def _create_consistent_schema(self, df: pd.DataFrame) -> pa.Schema:
         """
         Create a PyArrow schema that will remain consistent across batches
@@ -942,8 +954,22 @@ class OptimizedOracleJoinETL:
                 schema_fields.append(pa.field(col, pa.string()))
                 
             elif dtype.name == 'category':
-                # Categories without nulls -> dictionary
-                schema_fields.append(pa.field(col, pa.dictionary(pa.int8(), pa.string())))
+                # Categories without nulls -> dictionary with appropriate index size
+                # Count unique values to determine index type
+                n_unique = df[col].nunique()
+                
+                # Choose appropriate index type based on number of categories
+                if n_unique <= 127:
+                    index_type = pa.int8()
+                elif n_unique <= 32767:
+                    index_type = pa.int16()
+                elif n_unique <= 2147483647:
+                    index_type = pa.int32()
+                else:
+                    index_type = pa.int64()
+                
+                logger.debug(f"Column {col}: {n_unique} unique values, using {index_type} for dictionary indices")
+                schema_fields.append(pa.field(col, pa.dictionary(index_type, pa.string())))
                 
             elif dtype.name.startswith('int') or dtype.name.startswith('Int'):
                 # Integer columns - use consistent sizes
@@ -977,7 +1003,7 @@ class OptimizedOracleJoinETL:
                     # If all else fails, use string
                     schema_fields.append(pa.field(col, pa.string()))
         
-        return pa.schema(schema_fields)    
+        return pa.schema(schema_fields)
     
     def get_adaptive_date_ranges(self) -> List[Tuple[datetime, datetime]]:
         """
