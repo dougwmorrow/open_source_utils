@@ -716,83 +716,69 @@ class OptimizedOracleJoinETL:
         finally:
             self.pool.release(connection)
     
-    def _apply_consistent_schema(self, df: pd.DataFrame, schema: pa.Schema) -> pd.DataFrame:
-        """Apply consistent schema to DataFrame based on PyArrow schema"""
-        for field in schema:
-            col_name = field.name
-            if col_name not in df.columns:
-                continue
-            
-            # Get current dtype
-            current_dtype = df[col_name].dtype
-            
-            # Check if column has any non-null values
-            has_data = df[col_name].notna().any()
-            
-            # Handle based on target type
-            if pa.types.is_integer(field.type):
-                # Convert to numeric first
-                df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
-                
-                # Apply appropriate integer type
-                if df[col_name].isnull().any() or not has_data:
-                    # Use nullable integers
-                    if pa.types.is_int16(field.type):
-                        df[col_name] = df[col_name].astype('Int16')
-                    elif pa.types.is_int32(field.type):
-                        df[col_name] = df[col_name].astype('Int32')
-                    elif pa.types.is_int64(field.type):
-                        df[col_name] = df[col_name].astype('Int64')
-                    else:
-                        # Default to Int32 for safety
-                        df[col_name] = df[col_name].astype('Int32')
-                else:
-                    # Regular integers
-                    if pa.types.is_int16(field.type):
-                        df[col_name] = df[col_name].astype(np.int16)
-                    elif pa.types.is_int32(field.type):
-                        df[col_name] = df[col_name].astype(np.int32)
-                    elif pa.types.is_int64(field.type):
-                        df[col_name] = df[col_name].astype(np.int64)
-                    else:
-                        df[col_name] = df[col_name].astype(np.int32)
-                        
-            elif pa.types.is_floating(field.type):
-                # Clean and convert to float
-                df[col_name] = df[col_name].replace([np.inf, -np.inf], np.nan)
-                df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
-                
-                # Always use float64 for consistency
-                df[col_name] = df[col_name].astype(np.float64)
-                        
-            elif pa.types.is_dictionary(field.type):
-                # Only convert to category if the column has data and no nulls
-                if has_data and not df[col_name].isnull().any():
-                    if current_dtype != 'category':
-                        df[col_name] = df[col_name].astype('category')
-                else:
-                    # Keep as string if nulls or no data
-                    df[col_name] = df[col_name].astype(str)
-                    # Replace 'nan' strings with actual NaN
-                    df[col_name] = df[col_name].replace(['nan', 'None', ''], np.nan)
-                    
-            elif pa.types.is_string(field.type) or pa.types.is_large_string(field.type):
-                # Ensure it's string type
-                if current_dtype == 'category':
-                    # Convert category to string if needed
-                    df[col_name] = df[col_name].astype(str)
-                elif current_dtype != 'object':
-                    df[col_name] = df[col_name].astype(str)
-                
-                # Clean up string representations of null
-                if has_data:
-                    df[col_name] = df[col_name].replace(['nan', 'None', ''], np.nan)
-                        
-            elif pa.types.is_timestamp(field.type):
-                # Ensure timestamp
-                df[col_name] = pd.to_datetime(df[col_name], errors='coerce')
+def _apply_consistent_schema(self, df: pd.DataFrame, schema: pa.Schema) -> pd.DataFrame:
+    """
+    Apply consistent schema to DataFrame based on PyArrow schema
+    UPDATED: Simplified without dictionary handling
+    """
+    for field in schema:
+        col_name = field.name
+        if col_name not in df.columns:
+            continue
         
-        return df
+        current_dtype = df[col_name].dtype
+        
+        # Convert categories back to string if present
+        if current_dtype.name == 'category':
+            df[col_name] = df[col_name].astype(str)
+            current_dtype = df[col_name].dtype
+        
+        # Handle based on target type
+        if pa.types.is_integer(field.type):
+            # Convert to numeric first
+            df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
+            
+            # Apply appropriate integer type
+            if df[col_name].isnull().any():
+                # Use nullable integers
+                if pa.types.is_int16(field.type):
+                    df[col_name] = df[col_name].astype('Int16')
+                elif pa.types.is_int32(field.type):
+                    df[col_name] = df[col_name].astype('Int32')
+                elif pa.types.is_int64(field.type):
+                    df[col_name] = df[col_name].astype('Int64')
+                else:
+                    df[col_name] = df[col_name].astype('Int32')
+            else:
+                # Regular integers
+                if pa.types.is_int16(field.type):
+                    df[col_name] = df[col_name].astype(np.int16)
+                elif pa.types.is_int32(field.type):
+                    df[col_name] = df[col_name].astype(np.int32)
+                elif pa.types.is_int64(field.type):
+                    df[col_name] = df[col_name].astype(np.int64)
+                else:
+                    df[col_name] = df[col_name].astype(np.int32)
+                    
+        elif pa.types.is_floating(field.type):
+            # Clean and convert to float
+            df[col_name] = df[col_name].replace([np.inf, -np.inf], np.nan)
+            df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
+            df[col_name] = df[col_name].astype(np.float64)
+                    
+        elif pa.types.is_string(field.type) or pa.types.is_large_string(field.type):
+            # Ensure it's string type
+            if current_dtype != 'object':
+                df[col_name] = df[col_name].astype(str)
+            
+            # Clean up string representations of null
+            df[col_name] = df[col_name].replace(['nan', 'None', '<NA>', ''], np.nan)
+                    
+        elif pa.types.is_timestamp(field.type):
+            # Ensure timestamp
+            df[col_name] = pd.to_datetime(df[col_name], errors='coerce')
+    
+    return df
 
     def _clean_numeric_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Clean numeric data to prevent PyArrow conversion errors"""
@@ -835,24 +821,21 @@ class OptimizedOracleJoinETL:
     def _optimize_dataframe_memory(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Optimize DataFrame memory usage in-place
-        Enhanced for better compression with column-specific optimizations
+        UPDATED: Removed categorical conversion to avoid schema issues
         """
-        # Keep track of columns that should NOT be converted to categorical
-        skip_categorical = set()
-        
-        # Track number of unique values for categorical columns
-        # This helps prevent the int8 overflow issue
-        self._category_unique_counts = {}
-        
         for col in df.columns:
             col_type = df[col].dtype
             
-            # Check if column has any non-null values
-            has_data = df[col].notna().any()
+            # Skip if already categorical - convert back to string
+            if col_type.name == 'category':
+                df[col] = df[col].astype(str)
+                continue
             
             if col_type != 'object':
                 if col_type.name.startswith('int'):
-                    # Skip optimization for columns with all nulls
+                    # Check if column has any non-null values
+                    has_data = df[col].notna().any()
+                    
                     if not has_data:
                         logger.debug(f"Skipping optimization for {col} - all values are null")
                         continue
@@ -863,13 +846,11 @@ class OptimizedOracleJoinETL:
                         c_min = df[col].min()
                         c_max = df[col].max()
                         if pd.isna(c_min) or pd.isna(c_max):
-                            # Skip optimization if all values are null
                             continue
                         
                         # Use consistent sizing to prevent schema changes
-                        # Always use at least Int16 to avoid schema mismatches
                         if c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
-                            df[col] = df[col].astype('Int16')  # Minimum Int16
+                            df[col] = df[col].astype('Int16')
                         elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
                             df[col] = df[col].astype('Int32')
                         else:
@@ -878,7 +859,6 @@ class OptimizedOracleJoinETL:
                         # No nulls, use regular integer types
                         c_min = df[col].min()
                         c_max = df[col].max()
-                        # Use consistent sizing - minimum int16
                         if c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
                             df[col] = df[col].astype(np.int16)
                         elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
@@ -887,60 +867,32 @@ class OptimizedOracleJoinETL:
                             df[col] = df[col].astype(np.int64)
                 
                 elif col_type.name.startswith('float'):
-                    # Handle special float values before downcasting
+                    # Handle special float values
                     df[col] = df[col].replace([np.inf, -np.inf], np.nan)
                     
-                    # Skip if all nulls
-                    if not has_data:
+                    # Check if column has data
+                    if not df[col].notna().any():
                         continue
                     
                     # Keep as float64 for consistency
                     df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
             
-            else:  # object dtype
-                # CRITICAL: Never convert columns with all nulls to categorical
-                if not has_data:
-                    skip_categorical.add(col)
-                    logger.debug(f"Column {col} has all null values, keeping as object")
-                    continue
-                
-                # Check for mixed nulls - if more than 50% nulls, don't convert
-                null_ratio = df[col].isnull().sum() / len(df)
-                if null_ratio > 0.5:
-                    skip_categorical.add(col)
-                    logger.debug(f"Column {col} has {null_ratio:.1%} nulls, keeping as object")
-                    continue
-                
-                # Count unique values
-                n_unique = df[col].nunique()
-                
-                # Convert 999_categories column to categorical only if it has data
-                if col == '999_categories' or col == 'tb2_999_categories':
-                    if not df[col].isnull().any():
-                        df[col] = df[col].astype('category')
-                        self._category_unique_counts[col] = n_unique
-                    else:
-                        skip_categorical.add(col)
-                
-                # Convert other string columns with low cardinality
-                # But also check that they don't exceed int8 range
-                elif col not in skip_categorical and n_unique < 500:  # Increased threshold
-                    # Only convert if no nulls and reasonable number of categories
-                    if not df[col].isnull().any() and n_unique < 32000:  # Safe for int16
-                        df[col] = df[col].astype('category')
-                        self._category_unique_counts[col] = n_unique
-                        
-                        # Log high cardinality categorical columns
-                        if n_unique > 127:
-                            logger.info(f"Column {col} has {n_unique} categories (> int8 range)")
+            # For object columns, just ensure they're clean strings
+            # NO categorical conversion to avoid schema issues
+            else:
+                # Clean up null representations
+                if df[col].notna().any():
+                    # Convert to string and clean
+                    df[col] = df[col].astype(str)
+                    df[col] = df[col].replace(['nan', 'None', '<NA>'], np.nan)
         
         return df
     
     def _create_consistent_schema(self, df: pd.DataFrame) -> pa.Schema:
         """
         Create a PyArrow schema that will remain consistent across batches
+        UPDATED: Avoid dictionary encoding to prevent index overflow issues
         """
-        # First, identify which columns might change types
         schema_fields = []
         
         for col in df.columns:
@@ -949,35 +901,16 @@ class OptimizedOracleJoinETL:
             # Check if column has any data
             has_data = df[col].notna().any()
             
-            if dtype == 'object' or (dtype.name == 'category' and df[col].isnull().any()):
-                # String columns or categories with nulls -> always use string
+            if dtype == 'object' or dtype.name == 'category':
+                # ALWAYS use string type to avoid dictionary index issues
+                # This is safer for columns that might have varying cardinality
                 schema_fields.append(pa.field(col, pa.string()))
-                
-            elif dtype.name == 'category':
-                # Categories without nulls -> dictionary with appropriate index size
-                # Count unique values to determine index type
-                n_unique = df[col].nunique()
-                
-                # Choose appropriate index type based on number of categories
-                if n_unique <= 127:
-                    index_type = pa.int8()
-                elif n_unique <= 32767:
-                    index_type = pa.int16()
-                elif n_unique <= 2147483647:
-                    index_type = pa.int32()
-                else:
-                    index_type = pa.int64()
-                
-                logger.debug(f"Column {col}: {n_unique} unique values, using {index_type} for dictionary indices")
-                schema_fields.append(pa.field(col, pa.dictionary(index_type, pa.string())))
                 
             elif dtype.name.startswith('int') or dtype.name.startswith('Int'):
                 # Integer columns - use consistent sizes
                 if not has_data:
-                    # If no data, default to int32
                     schema_fields.append(pa.field(col, pa.int32()))
                 elif dtype.name in ['int8', 'Int8']:
-                    # Upgrade small ints to prevent schema changes
                     schema_fields.append(pa.field(col, pa.int16()))
                 elif dtype.name in ['int16', 'Int16']:
                     schema_fields.append(pa.field(col, pa.int16()))
@@ -987,22 +920,17 @@ class OptimizedOracleJoinETL:
                     schema_fields.append(pa.field(col, pa.int64()))
                     
             elif dtype.name.startswith('float'):
-                # Always use float64 for floats to prevent downcasting issues
+                # Always use float64 for consistency
                 schema_fields.append(pa.field(col, pa.float64()))
                 
             elif dtype.name == 'datetime64[ns]':
                 schema_fields.append(pa.field(col, pa.timestamp('ns')))
                 
             else:
-                # Default case - infer from pandas
-                try:
-                    # Create a small table to infer the type
-                    temp_table = pa.Table.from_pandas(df[[col]].head(1))
-                    schema_fields.append(temp_table.schema.field(col))
-                except:
-                    # If all else fails, use string
-                    schema_fields.append(pa.field(col, pa.string()))
+                # Default to string for safety
+                schema_fields.append(pa.field(col, pa.string()))
         
+        logger.info(f"Created schema with {len(schema_fields)} fields (no dictionary encoding)")
         return pa.schema(schema_fields)
     
     def get_adaptive_date_ranges(self) -> List[Tuple[datetime, datetime]]:
