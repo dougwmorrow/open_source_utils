@@ -534,13 +534,13 @@ class OptimizedOracleJoinETL:
                                  output_path: str) -> Tuple[int, int]:
         """
         Stream data directly from Oracle to Parquet with parallel execution monitoring
-        ENHANCED: Optimized Parquet compression and writing with improved data cleaning
+        ENHANCED: Fixed schema consistency issues
         """
         connection = self.pool.acquire()
         temp_file = None
         rows_written = 0
         last_id = None
-        schema = None  # Store the schema from first batch
+        schema = None
         
         try:
             # Enable parallel execution for this session
@@ -588,23 +588,26 @@ class OptimizedOracleJoinETL:
                     # Convert to DataFrame
                     df = pd.DataFrame(batch_rows, columns=columns)
                     
-                    # NEW: Clean numeric data before optimization
+                    # Clean numeric data
                     df = self._clean_numeric_data(df)
                     
-                    # Debug problematic columns
-                    if 'pacnb' in df.columns and logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(f"pacnb dtype before optimization: {df['pacnb'].dtype}")
-                        logger.debug(f"pacnb sample values: {df['pacnb'].dropna().head()}")
-                        logger.debug(f"pacnb has inf: {np.isinf(df['pacnb'].dropna()).any() if df['pacnb'].dtype in ['float64', 'float32'] else 'N/A'}")
-                        logger.debug(f"pacnb null count: {df['pacnb'].isnull().sum()}")
-                    
                     if writer is None:
-                        # First batch: optimize and create schema
+                        # First batch: create consistent schema
+                        logger.info("Creating initial schema from first batch")
+                        
+                        # Optimize memory
                         df = self._optimize_dataframe_memory(df)
                         
+                        # Create a consistent schema
+                        schema = self._create_consistent_schema(df)
+                        
+                        logger.info(f"Initial schema created: {schema}")
+                        
+                        # Create table with explicit schema
                         try:
-                            table = pa.Table.from_pandas(df)
-                            schema = table.schema
+                            # Convert DataFrame to match schema
+                            df = self._apply_consistent_schema(df, schema)
+                            table = pa.Table.from_pandas(df, schema=schema)
                             
                             writer = pq.ParquetWriter(
                                 temp_file,
@@ -612,32 +615,40 @@ class OptimizedOracleJoinETL:
                                 **compression_args
                             )
                             
-                            logger.debug(f"Created Parquet writer with {self.parquet_compression} compression")
-                            logger.debug(f"Schema: {schema}")
+                            logger.info(f"Created Parquet writer with {self.parquet_compression} compression")
                             
                         except Exception as e:
-                            logger.error(f"Error creating Parquet table: {str(e)}")
+                            logger.error(f"Error creating initial Parquet table: {str(e)}")
                             logger.error(f"DataFrame dtypes: {df.dtypes.to_dict()}")
-                            # Log problematic columns
+                            logger.error(f"Schema: {schema}")
+                            
+                            # Log sample data for debugging
                             for col in df.columns:
-                                if df[col].dtype == 'object':
-                                    unique_types = df[col].dropna().apply(type).unique()
-                                    logger.error(f"Column {col} has mixed types: {unique_types}")
+                                logger.debug(f"Column {col}: dtype={df[col].dtype}, "
+                                           f"nulls={df[col].isnull().sum()}, "
+                                           f"sample={df[col].dropna().head(3).tolist() if len(df[col].dropna()) > 0 else 'all null'}")
                             raise
                             
                     else:
-                        # Subsequent batches: ensure schema consistency
-                        df = self._apply_consistent_schema(df, schema)
-                        
+                        # Subsequent batches: apply consistent schema
                         try:
+                            # Apply the established schema
+                            df = self._apply_consistent_schema(df, schema)
+                            
+                            # Create table with the same schema
                             table = pa.Table.from_pandas(df, schema=schema)
+                            
                         except Exception as e:
-                            logger.error(f"Error creating table with consistent schema: {str(e)}")
-                            logger.error(f"DataFrame dtypes: {df.dtypes.to_dict()}")
-                            # Try without enforcing schema as fallback
-                            logger.warning("Falling back to creating table without schema enforcement")
-                            df = self._optimize_dataframe_memory(df)
-                            table = pa.Table.from_pandas(df)
+                            logger.error(f"Error applying consistent schema: {str(e)}")
+                            logger.error(f"Batch dtypes: {df.dtypes.to_dict()}")
+                            
+                            # Log differences from expected schema
+                            for field in schema:
+                                col = field.name
+                                if col in df.columns:
+                                    logger.error(f"Column {col}: expected {field.type}, "
+                                               f"got dtype={df[col].dtype}")
+                            raise
                     
                     # Write batch
                     writer.write_table(table, row_group_size=self.parquet_row_group_size)
@@ -655,31 +666,24 @@ class OptimizedOracleJoinETL:
             # Write final batch
             if batch_rows and not self.shutdown:
                 df = pd.DataFrame(batch_rows, columns=columns)
-                
-                # Clean numeric data
                 df = self._clean_numeric_data(df)
                 
                 if writer is None:
+                    # Create schema from single batch
                     df = self._optimize_dataframe_memory(df)
-                    try:
-                        table = pa.Table.from_pandas(df)
-                        schema = table.schema
-                        writer = pq.ParquetWriter(
-                            temp_file,
-                            schema,
-                            **compression_args
-                        )
-                    except Exception as e:
-                        logger.error(f"Error creating final batch table: {str(e)}")
-                        raise
-                else:
+                    schema = self._create_consistent_schema(df)
                     df = self._apply_consistent_schema(df, schema)
-                    try:
-                        table = pa.Table.from_pandas(df, schema=schema)
-                    except Exception as e:
-                        logger.warning(f"Schema consistency failed for final batch: {str(e)}")
-                        df = self._optimize_dataframe_memory(df)
-                        table = pa.Table.from_pandas(df)
+                    table = pa.Table.from_pandas(df, schema=schema)
+                    
+                    writer = pq.ParquetWriter(
+                        temp_file,
+                        schema,
+                        **compression_args
+                    )
+                else:
+                    # Apply existing schema
+                    df = self._apply_consistent_schema(df, schema)
+                    table = pa.Table.from_pandas(df, schema=schema)
                 
                 writer.write_table(table, row_group_size=self.parquet_row_group_size)
                 rows_written += len(df)
@@ -714,82 +718,80 @@ class OptimizedOracleJoinETL:
     
     def _apply_consistent_schema(self, df: pd.DataFrame, schema: pa.Schema) -> pd.DataFrame:
         """Apply consistent schema to DataFrame based on PyArrow schema"""
-        for i, field in enumerate(schema):
+        for field in schema:
             col_name = field.name
             if col_name not in df.columns:
                 continue
             
-            # Skip if column has nulls and target type can't handle them
-            has_nulls = df[col_name].isnull().any()
+            # Get current dtype
+            current_dtype = df[col_name].dtype
             
-            # Handle numeric types
+            # Check if column has any non-null values
+            has_data = df[col_name].notna().any()
+            
+            # Handle based on target type
             if pa.types.is_integer(field.type):
-                # First ensure the column is numeric
+                # Convert to numeric first
                 df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
                 
-                if has_nulls:
-                    # Use nullable integer types
-                    if pa.types.is_int8(field.type):
-                        df[col_name] = df[col_name].astype('Int8')
-                    elif pa.types.is_int16(field.type):
+                # Apply appropriate integer type
+                if df[col_name].isnull().any() or not has_data:
+                    # Use nullable integers
+                    if pa.types.is_int16(field.type):
                         df[col_name] = df[col_name].astype('Int16')
                     elif pa.types.is_int32(field.type):
                         df[col_name] = df[col_name].astype('Int32')
                     elif pa.types.is_int64(field.type):
                         df[col_name] = df[col_name].astype('Int64')
+                    else:
+                        # Default to Int32 for safety
+                        df[col_name] = df[col_name].astype('Int32')
                 else:
-                    # Regular integer types
-                    if pa.types.is_int8(field.type):
-                        df[col_name] = df[col_name].astype(np.int8)
-                    elif pa.types.is_int16(field.type):
+                    # Regular integers
+                    if pa.types.is_int16(field.type):
                         df[col_name] = df[col_name].astype(np.int16)
                     elif pa.types.is_int32(field.type):
                         df[col_name] = df[col_name].astype(np.int32)
                     elif pa.types.is_int64(field.type):
                         df[col_name] = df[col_name].astype(np.int64)
+                    else:
+                        df[col_name] = df[col_name].astype(np.int32)
                         
             elif pa.types.is_floating(field.type):
-                # ENHANCED: Clean float data before conversion
-                # Replace infinity values with NaN
+                # Clean and convert to float
                 df[col_name] = df[col_name].replace([np.inf, -np.inf], np.nan)
-                
-                # Ensure numeric type
                 df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
                 
-                # Handle any mixed types or string representations
-                if df[col_name].dtype == 'object':
-                    # Try to convert string representations of numbers
-                    df[col_name] = df[col_name].apply(lambda x: float(x) if isinstance(x, str) and x.strip() != '' else x)
-                    df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
-                
-                # Float types can handle NaN
-                try:
-                    if pa.types.is_float32(field.type):
-                        df[col_name] = df[col_name].astype(np.float32)
-                    else:
-                        df[col_name] = df[col_name].astype(np.float64)
-                except Exception as e:
-                    logger.warning(f"Error converting {col_name} to float: {str(e)}")
-                    # Fallback to float64
-                    df[col_name] = df[col_name].astype(np.float64)
+                # Always use float64 for consistency
+                df[col_name] = df[col_name].astype(np.float64)
                         
-            # Handle dictionary (categorical) types
             elif pa.types.is_dictionary(field.type):
-                # FIXED: Only convert to category if no nulls
-                if not df[col_name].isnull().any():
-                    df[col_name] = df[col_name].astype('category')
-                # Otherwise keep as string
+                # Only convert to category if the column has data and no nulls
+                if has_data and not df[col_name].isnull().any():
+                    if current_dtype != 'category':
+                        df[col_name] = df[col_name].astype('category')
+                else:
+                    # Keep as string if nulls or no data
+                    df[col_name] = df[col_name].astype(str)
+                    # Replace 'nan' strings with actual NaN
+                    df[col_name] = df[col_name].replace(['nan', 'None', ''], np.nan)
                     
-            # Handle string types
             elif pa.types.is_string(field.type) or pa.types.is_large_string(field.type):
-                # Keep as string, don't convert to category if it has one
-                if df[col_name].dtype.name == 'category' and df[col_name].isnull().any():
-                    # Convert back to string if category with nulls
+                # Ensure it's string type
+                if current_dtype == 'category':
+                    # Convert category to string if needed
                     df[col_name] = df[col_name].astype(str)
-                elif df[col_name].dtype != 'object' and df[col_name].dtype != 'string':
-                    # Convert non-string types to string
+                elif current_dtype != 'object':
                     df[col_name] = df[col_name].astype(str)
+                
+                # Clean up string representations of null
+                if has_data:
+                    df[col_name] = df[col_name].replace(['nan', 'None', ''], np.nan)
                         
+            elif pa.types.is_timestamp(field.type):
+                # Ensure timestamp
+                df[col_name] = pd.to_datetime(df[col_name], errors='coerce')
+        
         return df
 
     def _clean_numeric_data(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -829,17 +831,28 @@ class OptimizedOracleJoinETL:
                     df[col] = df[col].replace([np.inf, -np.inf], np.nan)
         
         return df
-    
+        
     def _optimize_dataframe_memory(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Optimize DataFrame memory usage in-place
         Enhanced for better compression with column-specific optimizations
         """
+        # Keep track of columns that should NOT be converted to categorical
+        skip_categorical = set()
+        
         for col in df.columns:
             col_type = df[col].dtype
             
+            # Check if column has any non-null values
+            has_data = df[col].notna().any()
+            
             if col_type != 'object':
                 if col_type.name.startswith('int'):
+                    # Skip optimization for columns with all nulls
+                    if not has_data:
+                        logger.debug(f"Skipping optimization for {col} - all values are null")
+                        continue
+                    
                     # Check for nulls before optimization
                     if df[col].isnull().any():
                         # Use nullable integer types for columns with nulls
@@ -849,70 +862,122 @@ class OptimizedOracleJoinETL:
                             # Skip optimization if all values are null
                             continue
                         
-                        if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
-                            df[col] = df[col].astype('Int8')  # Nullable int8
-                        elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
-                            df[col] = df[col].astype('Int16')  # Nullable int16
+                        # Use consistent sizing to prevent schema changes
+                        # Always use at least Int16 to avoid schema mismatches
+                        if c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                            df[col] = df[col].astype('Int16')  # Minimum Int16
                         elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
-                            df[col] = df[col].astype('Int32')  # Nullable int32
+                            df[col] = df[col].astype('Int32')
                         else:
-                            df[col] = df[col].astype('Int64')  # Nullable int64
+                            df[col] = df[col].astype('Int64')
                     else:
                         # No nulls, use regular integer types
                         c_min = df[col].min()
                         c_max = df[col].max()
-                        if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
-                            df[col] = df[col].astype(np.int8)
-                        elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                        # Use consistent sizing - minimum int16
+                        if c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
                             df[col] = df[col].astype(np.int16)
                         elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
                             df[col] = df[col].astype(np.int32)
+                        else:
+                            df[col] = df[col].astype(np.int64)
                 
                 elif col_type.name.startswith('float'):
                     # ENHANCED: Handle special float values before downcasting
                     # Replace infinity values with NaN
                     df[col] = df[col].replace([np.inf, -np.inf], np.nan)
                     
-                    # Only downcast if no special values that might cause issues
-                    try:
-                        # Check if downcasting is safe
-                        if df[col].isnull().sum() < len(df[col]):  # Not all nulls
-                            # First ensure it's numeric
-                            df[col] = pd.to_numeric(df[col], errors='coerce')
-                            
-                            # Try downcasting
-                            temp_col = pd.to_numeric(df[col], downcast='float', errors='coerce')
-                            
-                            # Verify no data loss
-                            if not df[col].isnull().equals(temp_col.isnull()):
-                                logger.warning(f"Skipping downcast for {col} due to potential data loss")
-                            else:
-                                df[col] = temp_col
-                                
-                    except Exception as e:
-                        logger.warning(f"Could not downcast float column {col}: {str(e)}")
-                        # Keep original dtype if downcasting fails
-                        # Ensure it's at least clean float64
-                        df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
+                    # Skip if all nulls
+                    if not has_data:
+                        continue
+                    
+                    # Keep as float64 for consistency unless specifically float32
+                    # This prevents schema changes between batches
+                    df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
             
-            else:
-                # Convert 999_categories column to categorical
+            else:  # object dtype
+                # CRITICAL: Never convert columns with all nulls to categorical
+                if not has_data:
+                    skip_categorical.add(col)
+                    logger.debug(f"Column {col} has all null values, keeping as object")
+                    continue
+                
+                # Check for mixed nulls - if more than 50% nulls, don't convert
+                null_ratio = df[col].isnull().sum() / len(df)
+                if null_ratio > 0.5:
+                    skip_categorical.add(col)
+                    logger.debug(f"Column {col} has {null_ratio:.1%} nulls, keeping as object")
+                    continue
+                
+                # Convert 999_categories column to categorical only if it has data
                 if col == '999_categories' or col == 'tb2_999_categories':
-                    # Only convert to category if no nulls or handle nulls first
                     if not df[col].isnull().any():
                         df[col] = df[col].astype('category')
-                    # If there are nulls, keep as string for now
+                    else:
+                        skip_categorical.add(col)
                 
                 # Convert other string columns with low cardinality
-                elif df[col].nunique() < 50:
-                    # FIXED: Don't convert to category if column has nulls
-                    # PyArrow has issues with null values in categorical columns
+                elif col not in skip_categorical and df[col].nunique() < 50:
+                    # Only convert if no nulls
                     if not df[col].isnull().any():
                         df[col] = df[col].astype('category')
-                    # If there are nulls, keep as string type
-                    # This avoids the NumpyConverter error
         
         return df
+
+    def _create_consistent_schema(self, df: pd.DataFrame) -> pa.Schema:
+        """
+        Create a PyArrow schema that will remain consistent across batches
+        """
+        # First, identify which columns might change types
+        schema_fields = []
+        
+        for col in df.columns:
+            dtype = df[col].dtype
+            
+            # Check if column has any data
+            has_data = df[col].notna().any()
+            
+            if dtype == 'object' or (dtype.name == 'category' and df[col].isnull().any()):
+                # String columns or categories with nulls -> always use string
+                schema_fields.append(pa.field(col, pa.string()))
+                
+            elif dtype.name == 'category':
+                # Categories without nulls -> dictionary
+                schema_fields.append(pa.field(col, pa.dictionary(pa.int8(), pa.string())))
+                
+            elif dtype.name.startswith('int') or dtype.name.startswith('Int'):
+                # Integer columns - use consistent sizes
+                if not has_data:
+                    # If no data, default to int32
+                    schema_fields.append(pa.field(col, pa.int32()))
+                elif dtype.name in ['int8', 'Int8']:
+                    # Upgrade small ints to prevent schema changes
+                    schema_fields.append(pa.field(col, pa.int16()))
+                elif dtype.name in ['int16', 'Int16']:
+                    schema_fields.append(pa.field(col, pa.int16()))
+                elif dtype.name in ['int32', 'Int32']:
+                    schema_fields.append(pa.field(col, pa.int32()))
+                else:
+                    schema_fields.append(pa.field(col, pa.int64()))
+                    
+            elif dtype.name.startswith('float'):
+                # Always use float64 for floats to prevent downcasting issues
+                schema_fields.append(pa.field(col, pa.float64()))
+                
+            elif dtype.name == 'datetime64[ns]':
+                schema_fields.append(pa.field(col, pa.timestamp('ns')))
+                
+            else:
+                # Default case - infer from pandas
+                try:
+                    # Create a small table to infer the type
+                    temp_table = pa.Table.from_pandas(df[[col]].head(1))
+                    schema_fields.append(temp_table.schema.field(col))
+                except:
+                    # If all else fails, use string
+                    schema_fields.append(pa.field(col, pa.string()))
+        
+        return pa.schema(schema_fields)    
     
     def get_adaptive_date_ranges(self) -> List[Tuple[datetime, datetime]]:
         """
