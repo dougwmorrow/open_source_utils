@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
 Optimized Oracle to Parquet ETL Script for Billion-Row JOIN Operations
-Enhanced with Oracle Parallel Processing capabilities and optimized Parquet compression
-Designed for 16GB RAM constraint with streaming and memory management
-Modified to read category values from a parquet file instead of database
-Uses Oracle SID connection instead of DSN
-ENHANCED: Network optimization, parallel extraction, async writes, and memory pooling
+Version 2.0 - Enhanced with all performance optimizations
+Designed for cross-server Oracle connectivity with 16GB RAM constraint
 """
 
 import oracledb
@@ -33,13 +30,17 @@ import threading
 from queue import Queue, Empty
 from dataclasses import dataclass
 from functools import lru_cache
+import glob
+import cProfile
+import pstats
+from io import StringIO
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('oracle_etl_optimized.log'),
+        logging.FileHandler('oracle_etl_optimized_v2.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -51,57 +52,106 @@ class ExtractionTask:
     partition_id: str
     date_range: Tuple[Optional[datetime], Optional[datetime]]
     partition_value: Optional[Any]
+    rowid_range: Optional[Tuple[str, str]] = None  # NEW: ROWID range support
     last_id: Optional[int] = None
 
+class MemoryPool:
+    """Reusable memory pool for DataFrames to reduce allocation overhead"""
+    def __init__(self, pool_size: int = 10):
+        self.pool = []
+        self.pool_size = pool_size
+        self.lock = threading.Lock()
+        self.stats = {'hits': 0, 'misses': 0}
+    
+    def get_buffer(self, size: int, dtype=object) -> np.ndarray:
+        """Get a reusable buffer"""
+        with self.lock:
+            for i, (buf_size, buf_dtype, buf) in enumerate(self.pool):
+                if buf_size >= size and buf_dtype == dtype:
+                    self.pool.pop(i)
+                    self.stats['hits'] += 1
+                    return buf[:size]
+            
+            # Create new buffer
+            self.stats['misses'] += 1
+            return np.empty(size, dtype=dtype)
+    
+    def return_buffer(self, buf: np.ndarray):
+        """Return buffer to pool"""
+        with self.lock:
+            if len(self.pool) < self.pool_size:
+                self.pool.append((len(buf), buf.dtype, buf))
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get pool statistics"""
+        return self.stats.copy()
+
 class AsyncParquetWriter:
-    """Asynchronous Parquet writer with connection pooling"""
-    def __init__(self, compression_args: Dict[str, Any], max_writers: int = 5):
+    """Enhanced asynchronous Parquet writer with parallel writing support"""
+    def __init__(self, compression_args: Dict[str, Any], max_writers: int = 4, use_direct_io: bool = False):
         self.compression_args = compression_args
-        self.write_queue = Queue(maxsize=20)
-        self.writer_pool = {}
         self.max_writers = max_writers
-        self.writer_thread = None
+        self.use_direct_io = use_direct_io
+        
+        # Create multiple write queues for parallel writing
+        self.write_queues = [Queue(maxsize=5) for _ in range(max_writers)]
+        self.writer_threads = []
         self.shutdown = False
-        self.write_lock = threading.Lock()
+        self.write_stats = {'files_written': 0, 'bytes_written': 0, 'write_time': 0.0}
         
     def start(self):
-        """Start the async writer thread"""
-        self.writer_thread = threading.Thread(target=self._writer_loop)
-        self.writer_thread.daemon = True
-        self.writer_thread.start()
-        logger.info("Started async Parquet writer thread")
+        """Start the async writer threads"""
+        for i in range(self.max_writers):
+            thread = threading.Thread(
+                target=self._writer_loop, 
+                args=(i, self.write_queues[i]),
+                daemon=True
+            )
+            thread.start()
+            self.writer_threads.append(thread)
+        logger.info(f"Started {self.max_writers} async Parquet writer threads")
         
-    def _writer_loop(self):
-        """Main writer loop"""
+    def _writer_loop(self, writer_id: int, write_queue: Queue):
+        """Main writer loop for each thread"""
         while not self.shutdown:
             try:
-                # Get write task with timeout
-                task = self.write_queue.get(timeout=1)
-                if task is None:  # Shutdown signal
+                task = write_queue.get(timeout=1)
+                if task is None:
                     break
                     
                 path, df, schema = task
+                start_time = time.time()
                 self._write_to_parquet(path, df, schema)
-                self.write_queue.task_done()
+                write_time = time.time() - start_time
+                
+                # Update stats
+                self.write_stats['files_written'] += 1
+                self.write_stats['bytes_written'] += os.path.getsize(path)
+                self.write_stats['write_time'] += write_time
+                
+                write_queue.task_done()
                 
             except Empty:
                 continue
             except Exception as e:
-                logger.error(f"Error in writer thread: {str(e)}")
+                logger.error(f"Error in writer thread {writer_id}: {str(e)}")
     
     def _write_to_parquet(self, path: str, df: pd.DataFrame, schema: pa.Schema):
-        """Write DataFrame to Parquet with writer pooling"""
+        """Write DataFrame to Parquet with optimal settings"""
         try:
-            # Create table
             table = pa.Table.from_pandas(df, schema=schema)
             
-            # Write with optimal settings
-            pq.write_table(
-                table,
-                path,
-                row_group_size=len(df),  # Single row group per file
-                **self.compression_args
-            )
+            if self.use_direct_io and sys.platform == 'linux':
+                # Use O_DIRECT for Linux (bypass OS cache)
+                self._write_direct_io(path, table)
+            else:
+                # Standard write
+                pq.write_table(
+                    table,
+                    path,
+                    row_group_size=len(df),
+                    **self.compression_args
+                )
             
             logger.debug(f"Wrote {len(df):,} rows to {path}")
             
@@ -109,28 +159,60 @@ class AsyncParquetWriter:
             logger.error(f"Error writing to {path}: {str(e)}")
             raise
     
+    def _write_direct_io(self, path: str, table: pa.Table):
+        """Write with O_DIRECT flag on Linux"""
+        import fcntl
+        
+        # Create directory if needed
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        
+        # Open with O_DIRECT
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_DIRECT, 0o644)
+        
+        try:
+            # Write using file descriptor
+            with os.fdopen(fd, 'wb', buffering=0) as f:
+                pq.write_table(table, f, **self.compression_args)
+        except:
+            os.close(fd)
+            raise
+    
     def submit(self, path: str, df: pd.DataFrame, schema: pa.Schema):
-        """Submit write task"""
-        self.write_queue.put((path, df, schema))
+        """Submit write task to least loaded queue"""
+        # Find queue with minimum size
+        min_size = float('inf')
+        selected_queue = None
+        
+        for queue in self.write_queues:
+            size = queue.qsize()
+            if size < min_size:
+                min_size = size
+                selected_queue = queue
+        
+        selected_queue.put((path, df, schema))
     
     def shutdown_writer(self):
-        """Shutdown the writer thread"""
+        """Shutdown all writer threads"""
         self.shutdown = True
-        self.write_queue.put(None)
-        if self.writer_thread:
-            self.writer_thread.join()
-        logger.info("Shut down async writer thread")
+        
+        # Send shutdown signal to all queues
+        for queue in self.write_queues:
+            queue.put(None)
+        
+        # Wait for all threads
+        for thread in self.writer_threads:
+            thread.join()
+        
+        logger.info(f"Shut down async writer threads. Stats: {self.write_stats}")
 
 class OptimizedOracleJoinETL:
     def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize optimized ETL processor with memory-aware settings
-        """
+        """Initialize optimized ETL processor with enhanced settings"""
         self.config = config
         
-        # Enhanced chunk size based on row group calculation
-        self.chunk_size = config.get('chunk_size', 100000)  # Increased
-        self.max_workers = config.get('max_workers', 4)  # Increased for parallelism
+        # Performance settings
+        self.chunk_size = config.get('chunk_size', 200000)
+        self.max_workers = config.get('max_workers', 6)
         
         self.data_lake_path = config['data_lake_path']
         self.output_table_name = config.get('output_table_name', 'joined_data')
@@ -153,63 +235,84 @@ class OptimizedOracleJoinETL:
         self.end_date = config.get('end_date')
         
         # Enhanced performance options
-        self.parallel_degree = config.get('parallel_degree', 8)
-        self.parallel_degree_range = config.get('parallel_degree_range', (4, 16))
+        self.parallel_degree = config.get('parallel_degree', 16)
         self.memory_limit_percent = config.get('memory_limit_percent', 75)
         self.enable_parallel_monitoring = config.get('enable_parallel_monitoring', True)
         
-        # Network optimization settings
-        self.oracle_fetch_size = config.get('oracle_fetch_size', 10000)
-        self.oracle_prefetch_rows = config.get('oracle_prefetch_rows', 20000)
-        self.use_connection_multiplexing = config.get('use_connection_multiplexing', True)
+        # Enhanced network optimization settings
+        self.oracle_fetch_size = config.get('oracle_fetch_size', 50000)
+        self.oracle_prefetch_rows = config.get('oracle_prefetch_rows', 100000)
+        self.use_network_compression = config.get('use_network_compression', True)
+        self.network_buffer_size = config.get('network_buffer_size', 1048576)
         
-        # ENHANCED: Parquet compression settings
-        self.parquet_compression = config.get('parquet_compression', 'zstd')
-        self.parquet_compression_level = config.get('parquet_compression_level', 6)
-        self.parquet_row_group_size = config.get('parquet_row_group_size', 671000)  # From your logs
+        # ROWID splitting
+        self.use_rowid_splitting = config.get('use_rowid_splitting', True)
+        
+        # Parquet compression settings
+        self.parquet_compression = config.get('parquet_compression', 'snappy')
+        self.parquet_compression_level = config.get('parquet_compression_level', None)
+        self.parquet_row_group_size = config.get('parquet_row_group_size', 1000000)
         self.parquet_use_dictionary = config.get('parquet_use_dictionary', ['999_categories'])
         self.parquet_write_statistics = config.get('parquet_write_statistics', True)
         self.parquet_write_page_index = config.get('parquet_write_page_index', True)
         
+        # Direct I/O
+        self.use_direct_io = config.get('use_direct_io', sys.platform == 'linux')
+        
+        # Number of parallel Parquet writers
+        self.parallel_parquet_writers = config.get('parallel_parquet_writers', 4)
+        
         logger.info(f"Using row group size: {self.parquet_row_group_size:,} rows")
+        logger.info(f"Using compression: {self.parquet_compression}")
         
         # GC monitoring flag
         self.monitor_gc = config.get('monitor_gc', True)
         
-        # Initialize Oracle connection pool with enhanced settings
+        # Initialize Oracle client if needed (for thick mode)
+        if 'oracle_lib_dir' in config:
+            oracledb.init_oracle_client(lib_dir=config['oracle_lib_dir'])
+            logger.info(f"Initialized Oracle client from {config['oracle_lib_dir']}")
+        
+        # Set TNS_ADMIN if sqlnet.ora directory is provided
+        if 'tns_admin' in config:
+            os.environ['TNS_ADMIN'] = config['tns_admin']
+            logger.info(f"Set TNS_ADMIN to {config['tns_admin']}")
+        
+        # Initialize Oracle connection with enhanced settings
         oracle_host = config['oracle_host']
         oracle_port = config['oracle_port']
         oracle_sid = config['oracle_sid']
         
-        # Create DSN with network optimization
-        dsn = oracledb.makedsn(
-            oracle_host, 
-            oracle_port, 
-            sid=oracle_sid,
-            tcp_connect_timeout=10,
-            transport_connect_timeout=3,
-            sdu=65535  # Max SDU for better network throughput
-        )
+        logger.info(f"Connecting to Oracle: {oracle_host}:{oracle_port}/{oracle_sid} with enhanced network settings")
         
-        logger.info(f"Connecting to Oracle: {oracle_host}:{oracle_port}/{oracle_sid} with SDU=65535")
+        # Try multiple connection methods
+        self.pool = None
+        connection_methods = [
+            self._create_pool_with_params,
+            self._create_pool_with_connect_string,
+            self._create_pool_with_dsn
+        ]
         
-        # Enhanced connection pool settings
-        self.pool = oracledb.create_pool(
-            user=config['oracle_user'],
-            password=config['oracle_password'],
-            dsn=dsn,
-            min=2,
-            max=max(self.max_workers + 2, 6),  # Extra connections for parallel ops
-            increment=1,
-            threaded=True,
-            getmode=oracledb.POOL_GETMODE_WAIT,
-            timeout=30,
-            ping_interval=60  # Keep connections alive
-        )
+        for method in connection_methods:
+            try:
+                self.pool = method(config)
+                if self.pool:
+                    logger.info(f"Successfully created connection pool using {method.__name__}")
+                    break
+            except Exception as e:
+                logger.warning(f"Failed to create pool with {method.__name__}: {str(e)}")
         
-        # Initialize Oracle client if needed
-        if 'oracle_lib_dir' in config:
-            oracledb.init_oracle_client(lib_dir=config['oracle_lib_dir'])
+        if not self.pool:
+            raise Exception("Failed to create connection pool with any method")
+        
+        # Test the pool
+        try:
+            test_conn = self.acquire_connection_with_retry()
+            self.pool.release(test_conn)
+            logger.info("Connection pool test successful")
+        except Exception as e:
+            logger.error(f"Connection pool test failed: {str(e)}")
+            raise
         
         # Create directories
         os.makedirs(self.checkpoint_dir, exist_ok=True)
@@ -219,17 +322,28 @@ class OptimizedOracleJoinETL:
         self.valid_categories = None
         self._initialize_categories_from_parquet_optimized()
         
+        # Initialize memory pool
+        self.memory_pool = MemoryPool(pool_size=20)
+        
         # Initialize parallel monitoring
         self.parallel_stats = {
             'queries_executed': 0,
             'parallel_executions': 0,
             'avg_parallel_degree': 0,
-            'max_parallel_degree': 0
+            'max_parallel_degree': 0,
+            'network_latency_ms': 0,
+            'compression_ratio': 0,
+            'connection_retries': 0,
+            'connection_failures': 0
         }
         
         # Initialize async writer
         compression_args = self._get_parquet_compression_args()
-        self.async_writer = AsyncParquetWriter(compression_args)
+        self.async_writer = AsyncParquetWriter(
+            compression_args, 
+            max_writers=self.parallel_parquet_writers,
+            use_direct_io=self.use_direct_io
+        )
         self.async_writer.start()
         
         # Initialize extraction executor
@@ -238,16 +352,22 @@ class OptimizedOracleJoinETL:
             thread_name_prefix='oracle_extract'
         )
         
-        # Memory pool for DataFrame creation
-        self.df_memory_pool = []
-        self.pool_lock = threading.Lock()
-        
         # Optimize GC settings
         self._optimize_gc_settings()
         
         # Set up GC monitoring
         if self.monitor_gc:
             self._setup_gc_monitoring()
+        
+        # Monitor initial network latency
+        self._monitor_network_latency()
+        
+        # Start pool monitoring thread
+        self.pool_monitor_thread = threading.Thread(
+            target=self._pool_monitor_loop,
+            daemon=True
+        )
+        self.pool_monitor_thread.start()
         
         # Set up signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -259,15 +379,482 @@ class OptimizedOracleJoinETL:
         logger.info("ETL Configuration:")
         logger.info(f"Chunk size: {self.chunk_size:,} rows")
         logger.info(f"Max workers: {self.max_workers}")
-        logger.info(f"Connection pool size: {self.pool.max}")
+        logger.info(f"Connection pool size: {self.pool.min}-{self.pool.max}")
         logger.info(f"Oracle fetch size: {self.oracle_fetch_size:,}")
         logger.info(f"Oracle prefetch rows: {self.oracle_prefetch_rows:,}")
-        logger.info(f"Parquet compression: {self.parquet_compression} (level {self.parquet_compression_level})")
+        logger.info(f"Network compression: {self.use_network_compression}")
+        logger.info(f"ROWID splitting: {self.use_rowid_splitting}")
+        logger.info(f"Parquet compression: {self.parquet_compression}")
         logger.info(f"Row group size: {self.parquet_row_group_size:,} rows")
+        logger.info(f"Direct I/O: {self.use_direct_io}")
+        logger.info(f"Parallel Parquet writers: {self.parallel_parquet_writers}")
         logger.info("="*60)
     
+    def _create_pool_with_params(self, config: Dict[str, Any]) -> Any:
+        """Create connection pool using ConnectParams (preferred method)"""
+        # Create connection parameters with all optimizations
+        conn_params = oracledb.ConnectParams(
+            host=config['oracle_host'],
+            port=config['oracle_port'],
+            sid=config['oracle_sid'],
+            tcp_connect_timeout=10.0,
+            expire_time=5,
+            sdu=65535,
+            events=False,
+            threaded=True
+        )
+        
+        # Create pool with parameters
+        return oracledb.create_pool(
+            user=config['oracle_user'],
+            password=config['oracle_password'],
+            params=conn_params,
+            min=2,
+            max=max(self.max_workers * 2, 8),
+            increment=1,
+            getmode=oracledb.POOL_GETMODE_WAIT,
+            timeout=30,
+            ping_interval=0,
+            stmtcachesize=50,
+            homogeneous=True
+        )
+    
+    def _create_pool_with_connect_string(self, config: Dict[str, Any]) -> Any:
+        """Create connection pool using Easy Connect string with parameters"""
+        # Build connection string with network optimization parameters
+        connect_string = self._build_optimized_connect_string(config)
+        
+        return oracledb.create_pool(
+            user=config['oracle_user'],
+            password=config['oracle_password'],
+            dsn=connect_string,
+            min=2,
+            max=max(self.max_workers * 2, 8),
+            increment=1,
+            threaded=True,
+            getmode=oracledb.POOL_GETMODE_WAIT,
+            timeout=30,
+            stmtcachesize=50,
+            homogeneous=True
+        )
+    
+    def _create_pool_with_dsn(self, config: Dict[str, Any]) -> Any:
+        """Create connection pool using basic DSN (fallback method)"""
+        # Create basic DSN
+        dsn = oracledb.makedsn(
+            host=config['oracle_host'],
+            port=config['oracle_port'],
+            sid=config['oracle_sid']
+        )
+        
+        return oracledb.create_pool(
+            user=config['oracle_user'],
+            password=config['oracle_password'],
+            dsn=dsn,
+            min=2,
+            max=max(self.max_workers * 2, 8),
+            increment=1,
+            threaded=True,
+            getmode=oracledb.POOL_GETMODE_WAIT,
+            timeout=30,
+            stmtcachesize=50,
+            homogeneous=True
+        )
+    
+    def _build_optimized_connect_string(self, config: Dict[str, Any]) -> str:
+        """Build an optimized connection string with network parameters"""
+        host = config['oracle_host']
+        port = config['oracle_port']
+        sid = config['oracle_sid']
+        
+        # Build connection descriptor with optimizations
+        connect_string = f"""(DESCRIPTION=
+            (FAILOVER=ON)
+            (CONNECT_TIMEOUT=10)
+            (RETRY_COUNT=3)
+            (RETRY_DELAY=1)
+            (TRANSPORT_CONNECT_TIMEOUT=3)
+            (ADDRESS_LIST=
+                (ADDRESS=(PROTOCOL=TCP)(HOST={host})(PORT={port})(SDU=65535))
+            )
+            (CONNECT_DATA=
+                (SID={sid})
+                (SERVER=DEDICATED)
+            )
+        )"""
+        
+        # Remove extra whitespace
+        connect_string = ' '.join(connect_string.split())
+        
+        return connect_string
+
+    def acquire_connection_with_retry(self, max_retries: int = 3) -> Any:
+        """Acquire connection with retry logic for network issues"""
+        retry_delay = 1
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                # Acquire connection from pool
+                connection = self.pool.acquire()
+                
+                # Test connection health
+                cursor = connection.cursor()
+                cursor.execute("SELECT 1 FROM DUAL")
+                cursor.fetchone()
+                cursor.close()
+                
+                # Configure session optimizations on first successful connection
+                self.configure_session_optimizations(connection)
+                
+                # Success
+                return connection
+                
+            except oracledb.Error as e:
+                last_error = e
+                self.parallel_stats['connection_retries'] += 1
+                
+                # Extract error code
+                error_code = 0
+                if hasattr(e, 'args') and e.args:
+                    if hasattr(e.args[0], 'code'):
+                        error_code = e.args[0].code
+                    elif isinstance(e.args[0], int):
+                        error_code = e.args[0]
+                
+                # Check for recoverable errors
+                recoverable_errors = [
+                    3113,   # ORA-03113: end-of-file on communication channel
+                    3114,   # ORA-03114: not connected to ORACLE
+                    3135,   # ORA-03135: connection lost contact
+                    12170,  # ORA-12170: TNS:Connect timeout occurred
+                    12571,  # ORA-12571: TNS:packet writer failure
+                    12560,  # ORA-12560: TNS:protocol adapter error
+                    12537,  # ORA-12537: TNS:connection closed
+                    12541,  # ORA-12541: TNS:no listener
+                    12543,  # ORA-12543: TNS:destination host unreachable
+                    12152,  # ORA-12152: TNS:unable to send break message
+                    1033,   # ORA-01033: ORACLE initialization or shutdown in progress
+                    1034,   # ORA-01034: ORACLE not available
+                    1089,   # ORA-01089: immediate shutdown in progress
+                    28,     # ORA-00028: your session has been killed
+                    31,     # ORA-00031: session marked for kill
+                ]
+                
+                if error_code in recoverable_errors and attempt < max_retries - 1:
+                    logger.warning(
+                        f"Connection error (attempt {attempt + 1}/{max_retries}): "
+                        f"ORA-{error_code:05d} - {str(e)}. Retrying in {retry_delay}s..."
+                    )
+                    
+                    # Release the bad connection if we got one
+                    try:
+                        if 'connection' in locals():
+                            self.pool.release(connection)
+                    except:
+                        pass
+                    
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 10)  # Exponential backoff with cap
+                    
+                    # Try to recover the pool
+                    try:
+                        self.pool.reconfigure(min=self.pool.min, max=self.pool.max)
+                    except:
+                        pass
+                else:
+                    self.parallel_stats['connection_failures'] += 1
+                    raise
+            
+            except Exception as e:
+                last_error = e
+                self.parallel_stats['connection_failures'] += 1
+                logger.error(f"Unexpected error acquiring connection: {str(e)}")
+                raise
+        
+        # All retries exhausted
+        self.parallel_stats['connection_failures'] += 1
+        raise last_error or Exception("Failed to acquire connection after all retries")
+
+    def configure_session_optimizations(self, connection):
+        """Configure comprehensive session-level optimizations"""
+        try:
+            cursor = connection.cursor()
+            
+            # Core performance optimizations
+            optimization_statements = [
+                # Memory and processing
+                ("ALTER SESSION SET workarea_size_policy = 'AUTO'", "workarea sizing"),
+                ("ALTER SESSION SET SORT_AREA_SIZE = 104857600", "sort area (100MB)"),
+                ("ALTER SESSION SET HASH_AREA_SIZE = 104857600", "hash area (100MB)"),
+                
+                # Parallel execution
+                ("ALTER SESSION ENABLE PARALLEL DML", "parallel DML"),
+                (f"ALTER SESSION FORCE PARALLEL QUERY PARALLEL {self.parallel_degree}", "parallel query"),
+                ("ALTER SESSION SET parallel_degree_policy = 'MANUAL'", "parallel degree policy"),
+                
+                # Network optimizations
+                ("ALTER SESSION SET SDU_SIZE = 65535", "SDU size"),
+                ("ALTER SESSION SET TDU_SIZE = 65535", "TDU size"),
+                
+                # Cursor and fetch optimizations
+                ("ALTER SESSION SET CURSOR_SHARING = FORCE", "cursor sharing"),
+                ("ALTER SESSION SET \"_serial_direct_read\" = TRUE", "serial direct read"),
+                
+                # Statistics and monitoring
+                ("ALTER SESSION SET STATISTICS_LEVEL = TYPICAL", "statistics level"),
+                ("ALTER SESSION SET SQL_TRACE = FALSE", "SQL trace off"),
+                ("ALTER SESSION SET TIMED_STATISTICS = FALSE", "timed statistics off"),
+                
+                # Read optimizations
+                ("ALTER SESSION SET DB_FILE_MULTIBLOCK_READ_COUNT = 128", "multiblock read"),
+                ("ALTER SESSION SET \"_db_file_noncontig_mblock_read_count\" = 32", "non-contiguous read"),
+                
+                # Join and hash optimizations
+                ("ALTER SESSION SET \"_hash_join_enabled\" = TRUE", "hash join"),
+                ("ALTER SESSION SET \"_optimizer_use_feedback\" = FALSE", "optimizer feedback off"),
+                ("ALTER SESSION SET \"_px_max_message_pool_pct\" = 80", "PX message pool"),
+                ("ALTER SESSION SET \"_px_pwmr_enabled\" = FALSE", "PX PWMR off"),
+                ("ALTER SESSION SET \"_parallel_broadcast_enabled\" = TRUE", "parallel broadcast"),
+                ("ALTER SESSION SET \"_optimizer_batch_table_access_by_rowid\" = TRUE", "batch ROWID access"),
+                
+                # Timeout settings
+                ("ALTER SESSION SET MAX_IDLE_TIME = 0", "no idle timeout"),
+                ("ALTER SESSION SET MAX_IDLE_BLOCKER_TIME = 0", "no blocker timeout"),
+            ]
+            
+            # Network compression (separate block for error handling)
+            if self.use_network_compression:
+                compression_statements = [
+                    ("ALTER SESSION SET SQLNET.COMPRESSION = 'ON'", "SQL*Net compression"),
+                    ("ALTER SESSION SET SQLNET.COMPRESSION_LEVELS = '(HIGH)'", "compression level"),
+                    ("ALTER SESSION SET COMPRESSION_LEVEL = 'HIGH'", "general compression"),
+                ]
+                optimization_statements.extend(compression_statements)
+            
+            # Apply optimizations
+            successful_opts = []
+            failed_opts = []
+            
+            for statement, description in optimization_statements:
+                try:
+                    cursor.execute(statement)
+                    successful_opts.append(description)
+                except oracledb.DatabaseError as e:
+                    error_code = e.args[0].code if hasattr(e.args[0], 'code') else 0
+                    # Only log debug for expected failures (feature not available)
+                    if error_code in [2248, 1031, 15000, 2097, 3113]:
+                        logger.debug(f"Optional feature not available: {description}")
+                    else:
+                        failed_opts.append(f"{description} (ORA-{error_code:05d})")
+            
+            # NLS settings for consistency
+            nls_statements = [
+                "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS'",
+                "ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF'",
+                "ALTER SESSION SET NLS_NUMERIC_CHARACTERS = '.,'",
+                "ALTER SESSION SET TIME_ZONE = 'UTC'"
+            ]
+            
+            for statement in nls_statements:
+                try:
+                    cursor.execute(statement)
+                except:
+                    pass
+            
+            cursor.close()
+            
+            # Log results
+            if successful_opts:
+                logger.info(f"Applied {len(successful_opts)} session optimizations")
+                logger.debug(f"Successful: {', '.join(successful_opts)}")
+            
+            if failed_opts:
+                logger.debug(f"Failed optimizations: {', '.join(failed_opts)}")
+            
+        except Exception as e:
+            logger.warning(f"Error configuring session optimizations: {str(e)}")
+    
+    def enable_parallel_session_enhanced(self, connection):
+        """Enable parallel execution with enhanced settings and monitoring"""
+        try:
+            cursor = connection.cursor()
+            
+            # Core parallel settings
+            parallel_statements = [
+                # Enable parallel operations
+                "ALTER SESSION ENABLE PARALLEL DML",
+                "ALTER SESSION ENABLE PARALLEL DDL",
+                f"ALTER SESSION FORCE PARALLEL QUERY PARALLEL {self.parallel_degree}",
+                f"ALTER SESSION FORCE PARALLEL DML PARALLEL {self.parallel_degree}",
+                
+                # Parallel execution parameters
+                "ALTER SESSION SET parallel_degree_policy = 'MANUAL'",
+                "ALTER SESSION SET parallel_adaptive_multi_user = FALSE",
+                "ALTER SESSION SET parallel_threads_per_cpu = 4",
+                
+                # Parallel optimization hints
+                "ALTER SESSION SET \"_parallel_broadcast_enabled\" = TRUE",
+                "ALTER SESSION SET \"_px_broadcast_fudge_factor\" = 100",
+                "ALTER SESSION SET \"_px_chunk_size\" = 1000000",
+                "ALTER SESSION SET \"_px_min_granules_per_slave\" = 4",
+                "ALTER SESSION SET \"_px_max_granules_per_slave\" = 1000",
+                "ALTER SESSION SET \"_px_chunklist_count_ratio\" = 1",
+                
+                # Memory management for parallel execution
+                "ALTER SESSION SET \"_smm_px_max_size\" = 524288",  # 512MB per slave
+                "ALTER SESSION SET \"_px_use_large_pool\" = TRUE",
+                
+                # Parallel join optimizations
+                "ALTER SESSION SET \"_px_partial_rollup_pushdown\" = ADAPTIVE",
+                "ALTER SESSION SET \"_px_filter_parallelized\" = TRUE",
+                "ALTER SESSION SET \"_px_filter_skew_handling\" = TRUE",
+                
+                # Adaptive features for parallel
+                "ALTER SESSION SET \"_optimizer_adaptive_plans\" = TRUE",
+                "ALTER SESSION SET \"_optimizer_adaptive_statistics\" = TRUE",
+                "ALTER SESSION SET \"_px_adaptive_dist_method\" = CHOOSE",
+            ]
+            
+            # Execute parallel configuration
+            for statement in parallel_statements:
+                try:
+                    cursor.execute(statement)
+                except oracledb.DatabaseError as e:
+                    error_code = e.args[0].code if hasattr(e.args[0], 'code') else 0
+                    if error_code not in [2248, 1031, 15000]:  # Ignore "no such parameter" errors
+                        logger.debug(f"Could not set parallel option: {statement} - ORA-{error_code:05d}")
+            
+            # Verify parallel configuration
+            cursor.execute("""
+                SELECT name, value 
+                FROM v$parameter 
+                WHERE name LIKE '%parallel%' 
+                AND ismodified = 'MODIFIED'
+            """)
+            
+            modified_params = cursor.fetchall()
+            if modified_params:
+                logger.info(f"Modified {len(modified_params)} parallel parameters")
+                for name, value in modified_params[:5]:  # Log first 5
+                    logger.debug(f"  {name} = {value}")
+            
+            # Enable network compression for parallel operations
+            self.enable_network_compression(connection)
+            
+            cursor.close()
+            logger.info(f"Enabled enhanced parallel execution with degree {self.parallel_degree}")
+            
+        except Exception as e:
+            logger.warning(f"Could not fully enable parallel execution: {str(e)}")
+    
+    def enable_network_compression(self, connection):
+        """Enable Oracle network compression for reduced transfer size"""
+        if not self.use_network_compression:
+            return
+            
+        try:
+            cursor = connection.cursor()
+            
+            compression_statements = [
+                # SQL*Net compression
+                "ALTER SESSION SET SQLNET.COMPRESSION = 'ON'",
+                "ALTER SESSION SET SQLNET.COMPRESSION_LEVELS = '(HIGH)'",
+                "ALTER SESSION SET SQLNET.COMPRESSION_THRESHOLD = 1024",
+                
+                # Advanced compression for 12c+
+                "ALTER SESSION SET COMPRESSION_LEVEL = 'HIGH'",
+                
+                # Table compression hints
+                "ALTER SESSION SET \"_table_compress_blocks\" = 50",
+                "ALTER SESSION SET \"_compression_compatibility\" = '12.2.0'",
+            ]
+            
+            applied = 0
+            for statement in compression_statements:
+                try:
+                    cursor.execute(statement)
+                    applied += 1
+                except:
+                    pass
+            
+            cursor.close()
+            
+            if applied > 0:
+                logger.info(f"Enabled Oracle network compression ({applied} settings applied)")
+            
+        except Exception as e:
+            logger.debug(f"Could not enable all compression features: {str(e)}")
+    
+    def monitor_connection_pool(self):
+        """Monitor connection pool health and performance"""
+        try:
+            stats = {
+                'opened': self.pool.opened,
+                'busy': self.pool.busy,
+                'timeout': self.pool.timeout,
+                'max': self.pool.max,
+                'min': self.pool.min,
+                'increment': self.pool.increment,
+                'homogeneous': self.pool.homogeneous,
+                'ping_interval': self.pool.ping_interval,
+                'getmode': self.pool.getmode,
+                'stmtcachesize': self.pool.stmtcachesize
+            }
+            
+            # Calculate pool utilization
+            utilization = (self.pool.busy / self.pool.max * 100) if self.pool.max > 0 else 0
+            stats['utilization_percent'] = utilization
+            
+            # Log if high utilization
+            if utilization > 80:
+                logger.warning(
+                    f"High connection pool utilization: {self.pool.busy}/{self.pool.max} "
+                    f"({utilization:.1f}%) connections busy"
+                )
+                
+                # Auto-scale pool if possible
+                if self.pool.max < 20:  # Cap at 20 connections
+                    new_max = min(self.pool.max + 2, 20)
+                    try:
+                        self.pool.reconfigure(max=new_max)
+                        logger.info(f"Auto-scaled connection pool max from {self.pool.max} to {new_max}")
+                    except Exception as e:
+                        logger.error(f"Failed to auto-scale pool: {str(e)}")
+            
+            # Check for connection starvation
+            if self.pool.busy == self.pool.max and self.pool.opened == self.pool.max:
+                logger.error("Connection pool exhausted - all connections in use!")
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error monitoring pool: {str(e)}")
+            return {}
+    
+    def _pool_monitor_loop(self):
+        """Background thread to monitor connection pool health"""
+        monitor_interval = 30  # seconds
+        
+        while not self.shutdown:
+            try:
+                time.sleep(monitor_interval)
+                
+                if not self.shutdown:
+                    stats = self.monitor_connection_pool()
+                    
+                    # Log stats periodically
+                    if stats.get('utilization_percent', 0) > 50:
+                        logger.info(
+                            f"Pool stats: {stats['busy']}/{stats['max']} busy "
+                            f"({stats['utilization_percent']:.1f}% utilization)"
+                        )
+                
+            except Exception as e:
+                logger.error(f"Error in pool monitor thread: {str(e)}")
+    
     def _initialize_categories_from_parquet_optimized(self):
-        """Load categories more efficiently using PyArrow"""
+        """Load categories efficiently using PyArrow"""
         try:
             if not os.path.exists(self.categories_parquet_path):
                 raise FileNotFoundError(f"Categories parquet file not found: {self.categories_parquet_path}")
@@ -277,7 +864,7 @@ class OptimizedOracleJoinETL:
             # Use PyArrow for faster loading
             table = pq.read_table(
                 self.categories_parquet_path,
-                columns=['999_distinct values'],  # Only read needed column
+                columns=['999_distinct values'],
                 use_threads=True
             )
             
@@ -287,11 +874,10 @@ class OptimizedOracleJoinETL:
                 val.as_py() for val in category_array if val.is_valid
             ) - self.excluded_categories
             
-            logger.info(f"Loaded {len(self.valid_categories)} valid categories efficiently")
+            logger.info(f"Loaded {len(self.valid_categories)} valid categories")
             
-            # Log sample for verification
-            sample_categories = list(self.valid_categories)[:5]
-            logger.info(f"Sample categories: {sample_categories}")
+            # Create optimized category list for Oracle
+            self.oracle_category_list = list(self.valid_categories)
             
         except Exception as e:
             logger.error(f"Error loading categories from parquet file: {str(e)}")
@@ -306,11 +892,13 @@ class OptimizedOracleJoinETL:
         gc.set_threshold(700000, 20, 20)
         logger.info("Set GC threshold to (700000, 20, 20) for better performance")
         
+        # Initial collection
         collected = gc.collect()
         logger.info(f"Initial GC collected {collected} objects")
         
-        gc.freeze()
-        logger.info("Froze initial objects to reduce GC overhead")
+        # Disable GC during critical sections
+        gc.disable()
+        logger.info("Disabled automatic GC - will handle manually")
     
     def _setup_gc_monitoring(self):
         """Set up GC monitoring callbacks"""
@@ -321,6 +909,9 @@ class OptimizedOracleJoinETL:
             'total_time': 0.0,
             'collection_count': 0
         }
+        
+        # Re-enable GC for monitoring
+        gc.enable()
         
         def gc_callback(phase, info):
             if phase == "start":
@@ -350,55 +941,128 @@ class OptimizedOracleJoinETL:
         gc.callbacks.append(gc_callback)
         logger.info("GC monitoring enabled")
     
+    def _monitor_network_latency(self):
+        """Monitor network round-trip time to Oracle"""
+        try:
+            connection = self.pool.acquire()
+            cursor = connection.cursor()
+            
+            # Measure round-trip time
+            latencies = []
+            for _ in range(5):
+                start = time.time()
+                cursor.execute("SELECT 1 FROM DUAL")
+                cursor.fetchone()
+                latency = (time.time() - start) * 1000
+                latencies.append(latency)
+            
+            avg_latency = sum(latencies) / len(latencies)
+            self.parallel_stats['network_latency_ms'] = avg_latency
+            
+            cursor.close()
+            self.pool.release(connection)
+            
+            logger.info(f"Network latency: {avg_latency:.2f}ms")
+            
+            # Adjust fetch size based on latency
+            if avg_latency > 10:  # High latency
+                self.oracle_fetch_size = min(self.oracle_fetch_size * 2, 100000)
+                logger.info(f"High latency detected, increased fetch size to {self.oracle_fetch_size:,}")
+                
+        except Exception as e:
+            logger.warning(f"Could not measure network latency: {str(e)}")
+    
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully"""
         logger.info("Shutdown signal received, finishing current batches...")
         self.shutdown = True
     
-    def enable_parallel_session_enhanced(self, connection):
-        """Enable parallel execution with enhanced settings"""
+    def get_rowid_ranges(self, connection, num_splits: int) -> List[Tuple[str, str]]:
+        """Split table by ROWID for true parallel processing"""
+        cursor = connection.cursor()
+        ranges = []
+        
         try:
-            cursor = connection.cursor()
+            # Build base query for ROWID range detection
+            base_where = "1=1"
+            params = {}
             
-            # Enable parallel DML
-            cursor.execute("ALTER SESSION ENABLE PARALLEL DML")
+            if self.date_column and self.start_date and self.end_date:
+                base_where += f" AND {self.date_column} >= :start_date AND {self.date_column} < :end_date"
+                params['start_date'] = datetime.strptime(self.start_date, '%Y-%m-%d')
+                params['end_date'] = datetime.strptime(self.end_date, '%Y-%m-%d')
             
-            # Force parallel execution
-            cursor.execute(f"ALTER SESSION FORCE PARALLEL QUERY PARALLEL {self.parallel_degree}")
+            # Get min/max ROWIDs
+            query = f"""
+            SELECT 
+                MIN(ROWID) as min_rid,
+                MAX(ROWID) as max_rid,
+                COUNT(*) as cnt
+            FROM table_1
+            WHERE {base_where}
+            """
             
-            # Set parallel degree policy
-            cursor.execute("ALTER SESSION SET parallel_degree_policy = 'MANUAL'")
+            cursor.execute(query, params)
+            result = cursor.fetchone()
             
-            # Performance optimizations
-            cursor.execute("ALTER SESSION SET workarea_size_policy = 'AUTO'")
-            cursor.execute("ALTER SESSION SET STATISTICS_LEVEL = ALL")
+            if not result or not result[0]:
+                logger.warning("No data found for ROWID splitting")
+                return [(None, None)]
             
-            # Enable adaptive plans
-            try:
-                cursor.execute("ALTER SESSION SET OPTIMIZER_ADAPTIVE_PLANS = TRUE")
-            except:
-                pass  # Not all versions support this
+            min_rid, max_rid, total_rows = result
+            logger.info(f"ROWID range: {min_rid} to {max_rid}, {total_rows:,} rows")
             
-            # Increase hash area for better join performance
-            try:
-                cursor.execute("ALTER SESSION SET \"_hash_join_enabled\" = TRUE")
-                cursor.execute("ALTER SESSION SET \"_px_max_message_pool_pct\" = 80")
-            except:
-                pass
+            # Get ROWID boundaries using NTILE
+            boundary_query = f"""
+            WITH rowid_sample AS (
+                SELECT ROWID as rid
+                FROM (
+                    SELECT ROWID,
+                           ROW_NUMBER() OVER (ORDER BY ROWID) as rn,
+                           COUNT(*) OVER () as total_cnt
+                    FROM table_1
+                    WHERE {base_where}
+                )
+                WHERE MOD(rn, GREATEST(1, TRUNC(total_cnt / {num_splits * 10}))) = 0
+            )
+            SELECT rid
+            FROM (
+                SELECT rid,
+                       NTILE({num_splits - 1}) OVER (ORDER BY rid) as bucket
+                FROM rowid_sample
+            )
+            WHERE bucket <= {num_splits - 1}
+            GROUP BY bucket
+            HAVING rid = MAX(rid)
+            ORDER BY bucket
+            """
             
-            cursor.close()
-            logger.info(f"Enabled enhanced parallel execution with degree {self.parallel_degree}")
+            cursor.execute(boundary_query, params)
+            boundaries = [row[0] for row in cursor.fetchall()]
+            
+            # Create ranges
+            prev_rid = min_rid
+            for boundary in boundaries:
+                ranges.append((prev_rid, boundary))
+                prev_rid = boundary
+            ranges.append((prev_rid, max_rid))
+            
+            logger.info(f"Created {len(ranges)} ROWID ranges for parallel processing")
             
         except Exception as e:
-            logger.warning(f"Could not set all parallel options: {str(e)}")
+            logger.error(f"Error creating ROWID ranges: {str(e)}")
+            # Fallback to single range
+            ranges = [(None, None)]
+        finally:
+            cursor.close()
+        
+        return ranges
     
     def build_optimized_query(self, date_range: Optional[Tuple[datetime, datetime]] = None,
                             last_id: Optional[int] = None,
                             partition_value: Optional[str] = None,
-                            use_parallel_pipelined: bool = False) -> Tuple[str, Dict]:
-        """
-        Build memory-optimized query with enhanced parallel processing
-        """
+                            rowid_range: Optional[Tuple[str, str]] = None) -> Tuple[str, Dict]:
+        """Build memory-optimized query with enhanced parallel processing"""
         params = {}
         
         # Enhanced hints for parallel processing
@@ -409,15 +1073,26 @@ class OptimizedOracleJoinETL:
             "PQ_DISTRIBUTE(tb2 HASH HASH)",
             "NO_PARALLEL_INDEX(tb1)",
             "NO_PARALLEL_INDEX(tb2)",
-            f"FIRST_ROWS({self.chunk_size})",  # Optimize for streaming
-            "RESULT_CACHE"  # Use result cache if available
+            f"FIRST_ROWS({self.chunk_size})",
+            
+            # Additional performance hints
+            "OPT_PARAM('_parallel_broadcast_enabled' 'true')",
+            "OPT_PARAM('_px_partition_scan_enabled' 'true')",
+            "OPT_PARAM('_px_pwmr_enabled' 'false')",
+            "OPT_PARAM('_optimizer_batch_table_access_by_rowid' 'true')",
+            "MONITOR",
+            "GATHER_PLAN_STATISTICS",
+            "NO_MERGE",
+            "PUSH_PRED",
+            "DYNAMIC_SAMPLING(4)",
+            "OPT_PARAM('_optim_peek_user_binds' 'false')",
+            "OPT_PARAM('_db_file_multiblock_read_count' '128')",
+            "OPT_PARAM('_sort_multiblock_read_count' '128')"
         ]
         
-        # Add partition hints if tables are partitioned
-        if self.date_column and date_range and date_range[0]:
-            date_str = date_range[0].strftime('%Y%m%d')
-            # Uncomment if your tables are partitioned
-            # parallel_hints.append(f"PARTITION(tb1 PARTITION_FOR({date_str}))")
+        # Add result cache for small lookups
+        if len(self.valid_categories) < 100:
+            parallel_hints.append("RESULT_CACHE")
         
         hints = f"/*+ {' '.join(parallel_hints)} */"
         
@@ -428,26 +1103,51 @@ class OptimizedOracleJoinETL:
         
         table2_columns_str = ', '.join(table2_column_list)
         
-        # Standard parallel query
-        query = f"""
-        SELECT {hints}
-            tb1.*,
-            {table2_columns_str}
-        FROM table_1 tb1
-        JOIN table_2 tb2 ON tb1.id = tb2.id
-        WHERE 1=1
-        """
+        # Build query with optimized category filtering
+        if len(self.valid_categories) < 10:
+            # For small category sets, use WITH clause
+            category_values = ','.join([f"'{cat}'" for cat in self.valid_categories])
+            
+            query = f"""
+            WITH valid_cats AS (
+                SELECT /*+ MATERIALIZE */ column_value as cat
+                FROM TABLE(sys.odcivarchar2list({category_values}))
+            )
+            SELECT {hints}
+                tb1.*,
+                {table2_columns_str}
+            FROM table_1 tb1
+            JOIN table_2 tb2 ON tb1.id = tb2.id
+            JOIN valid_cats vc ON tb2."999_categories" = vc.cat
+            WHERE 1=1
+            """
+        else:
+            # Standard query for larger category sets
+            query = f"""
+            SELECT {hints}
+                tb1.*,
+                {table2_columns_str}
+            FROM table_1 tb1
+            JOIN table_2 tb2 ON tb1.id = tb2.id
+            WHERE 1=1
+            """
+            
+            # Category filter
+            if len(self.valid_categories) < 30:
+                query += f' AND tb2."999_categories" IN ({",".join([f":cat_{i}" for i in range(len(self.valid_categories))])})'
+                for i, cat in enumerate(self.valid_categories):
+                    params[f'cat_{i}'] = cat
+            elif self.excluded_categories:
+                placeholders = ','.join([f':cat_{i}' for i in range(len(self.excluded_categories))])
+                query += f' AND tb2."999_categories" NOT IN ({placeholders})'
+                for i, cat in enumerate(self.excluded_categories):
+                    params[f'cat_{i}'] = cat
         
-        # Category filter - use IN for small sets
-        if len(self.valid_categories) < 30:
-            query += f' AND tb2."999_categories" IN ({",".join([f":cat_{i}" for i in range(len(self.valid_categories))])})'
-            for i, cat in enumerate(self.valid_categories):
-                params[f'cat_{i}'] = cat
-        elif self.excluded_categories:
-            placeholders = ','.join([f':cat_{i}' for i in range(len(self.excluded_categories))])
-            query += f' AND tb2."999_categories" NOT IN ({placeholders})'
-            for i, cat in enumerate(self.excluded_categories):
-                params[f'cat_{i}'] = cat
+        # Add ROWID range filter for parallel processing
+        if rowid_range and rowid_range[0] is not None:
+            query += " AND tb1.ROWID > :rowid_start AND tb1.ROWID <= :rowid_end"
+            params['rowid_start'] = rowid_range[0]
+            params['rowid_end'] = rowid_range[1]
         
         # Add date filter
         if date_range and date_range[0] is not None and self.date_column:
@@ -478,75 +1178,157 @@ class OptimizedOracleJoinETL:
         
         return query, params
     
-    def adaptive_fetch_size(self, connection) -> int:
-        """Dynamically adjust fetch size based on available memory"""
+    def configure_array_interface(self, cursor, connection) -> int:
+        """Configure optimal array sizes based on available memory and network latency"""
+        # Get available memory
         mem = psutil.virtual_memory()
         available_mb = mem.available / (1024 * 1024)
         
         # Estimate memory per row
         bytes_per_row = self.config.get('estimated_row_size_bytes', 200)
         
-        # Calculate optimal fetch size (max 20% of available memory)
-        max_rows_in_memory = int((available_mb * 0.20 * 1024 * 1024) / bytes_per_row)
+        # Adjust for network latency
+        latency_factor = 1.0
+        if self.parallel_stats['network_latency_ms'] > 10:
+            latency_factor = min(2.0, self.parallel_stats['network_latency_ms'] / 5)
         
-        # Bound between reasonable limits
-        fetch_size = max(5000, min(max_rows_in_memory, 50000))
+        # Use 20% of available memory for array buffer
+        buffer_memory_mb = available_mb * 0.20
+        buffer_memory_bytes = buffer_memory_mb * 1024 * 1024
         
-        logger.debug(f"Adaptive fetch size: {fetch_size:,} rows (available memory: {available_mb:.0f}MB)")
-        return fetch_size
+        # Calculate array size with latency adjustment
+        optimal_array_size = int(buffer_memory_bytes / (bytes_per_row * 1.2) * latency_factor)
+        
+        # Set bounds
+        optimal_array_size = max(10000, min(optimal_array_size, 200000))
+        
+        # Configure cursor
+        cursor.arraysize = optimal_array_size
+        cursor.prefetchrows = min(optimal_array_size * 2, 400000)
+        
+        # Set input sizes for better memory allocation
+        cursor.setinputsizes(None, 4000)  # For VARCHAR2 columns
+        
+        logger.info(
+            f"Set array size to {optimal_array_size:,} "
+            f"(latency factor: {latency_factor:.1f}x, available memory: {available_mb:.0f}MB)"
+        )
+        
+        return optimal_array_size
     
-    def rows_to_dataframe_optimized(self, rows: List, columns: List) -> pd.DataFrame:
-        """Convert rows to DataFrame with memory optimization"""
+    def rows_to_dataframe_zero_copy(self, rows: List, columns: List) -> pd.DataFrame:
+        """Convert rows to DataFrame with zero-copy optimization"""
         if not rows:
             return pd.DataFrame(columns=columns)
         
-        # Convert to numpy array first (more efficient)
-        arr = np.array(rows, dtype='object')
+        n_rows = len(rows)
+        n_cols = len(columns)
         
-        # Create DataFrame without copying
-        df = pd.DataFrame(arr, columns=columns, copy=False)
+        # Pre-allocate arrays by column type
+        col_arrays = []
         
-        # Apply dtypes efficiently
-        for col in df.columns:
-            if col in ['id', 'tb2_id']:
-                df[col] = pd.to_numeric(df[col], errors='coerce', downcast='integer')
-            elif df[col].dtype == 'object':
-                # Check if numeric
-                try:
-                    sample = df[col].dropna().iloc[0] if len(df[col].dropna()) > 0 else None
-                    if sample is not None and isinstance(sample, (int, float)):
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
-                except:
-                    pass
+        # Analyze first few rows to determine types
+        sample_size = min(10, n_rows)
+        col_types = []
+        
+        for col_idx in range(n_cols):
+            # Sample values to determine type
+            sample_values = [rows[i][col_idx] for i in range(sample_size) if rows[i][col_idx] is not None]
+            
+            if not sample_values:
+                col_types.append('float')  # Default to float for null columns
+            elif all(isinstance(v, (int, np.integer)) for v in sample_values):
+                col_types.append('int')
+            elif all(isinstance(v, (float, np.floating, int, np.integer)) for v in sample_values):
+                col_types.append('float')
+            else:
+                col_types.append('object')
+        
+        # Create arrays with proper types
+        for col_idx, col_type in enumerate(col_types):
+            if col_type == 'int':
+                # Check for nulls
+                has_nulls = any(rows[i][col_idx] is None for i in range(n_rows))
+                
+                if has_nulls:
+                    # Use float64 to handle NaN
+                    arr = self.memory_pool.get_buffer(n_rows, dtype=np.float64)
+                    for i in range(n_rows):
+                        arr[i] = rows[i][col_idx] if rows[i][col_idx] is not None else np.nan
+                    col_arrays.append(pd.array(arr[:n_rows], dtype="Int64"))
+                else:
+                    # Use native int
+                    arr = self.memory_pool.get_buffer(n_rows, dtype=np.int64)
+                    for i in range(n_rows):
+                        arr[i] = rows[i][col_idx]
+                    col_arrays.append(arr[:n_rows])
+                    
+            elif col_type == 'float':
+                arr = self.memory_pool.get_buffer(n_rows, dtype=np.float64)
+                for i in range(n_rows):
+                    val = rows[i][col_idx]
+                    arr[i] = val if val is not None else np.nan
+                col_arrays.append(arr[:n_rows])
+                
+            else:
+                # Object array for strings
+                arr = self.memory_pool.get_buffer(n_rows, dtype=object)
+                for i in range(n_rows):
+                    arr[i] = rows[i][col_idx]
+                col_arrays.append(arr[:n_rows])
+        
+        # Create DataFrame from pre-allocated arrays
+        df_dict = {columns[i]: col_arrays[i] for i in range(n_cols)}
+        df = pd.DataFrame(df_dict, copy=False)
+        
+        # Return buffers to pool
+        for arr in col_arrays:
+            if isinstance(arr, np.ndarray):
+                self.memory_pool.return_buffer(arr)
         
         return df
-    
+        
     def stream_extract_to_parquet_enhanced(self, query: str, params: Dict, 
-                                          output_path: str) -> Tuple[int, int]:
-        """
-        Enhanced streaming with adaptive fetching and async writes
-        """
-        connection = self.pool.acquire()
+                                          output_path: str,
+                                          task_id: str = "") -> Tuple[int, int]:
+        """Enhanced streaming with all optimizations and better error handling"""
+        connection = None
         rows_written = 0
         last_id = None
         schema = None
         
         try:
+            # Acquire connection with retry logic
+            connection = self.acquire_connection_with_retry()
+            
             # Enable enhanced parallel execution
             self.enable_parallel_session_enhanced(connection)
             
             cursor = connection.cursor()
             
-            # Adaptive fetch sizing
-            fetch_size = self.adaptive_fetch_size(connection)
-            cursor.arraysize = fetch_size
-            cursor.prefetchrows = min(fetch_size * 2, self.oracle_prefetch_rows)
+            # Configure optimal array interface
+            array_size = self.configure_array_interface(cursor, connection)
             
-            logger.debug(f"Using fetch size: {cursor.arraysize:,}, prefetch: {cursor.prefetchrows:,}")
+            logger.debug(f"[{task_id}] Using array size: {array_size:,}")
             
-            # Execute query
+            # Execute query with timeout handling
             start_time = time.time()
-            cursor.execute(query, params)
+            
+            try:
+                cursor.execute(query, params)
+            except oracledb.DatabaseError as e:
+                error_code = e.args[0].code if hasattr(e.args[0], 'code') else 0
+                if error_code == 1013:  # ORA-01013: user requested cancel of current operation
+                    logger.warning(f"[{task_id}] Query cancelled by user")
+                    return 0, None
+                elif error_code == 1555:  # ORA-01555: snapshot too old
+                    logger.error(f"[{task_id}] Snapshot too old - consider smaller chunks or UNDO tuning")
+                    raise
+                else:
+                    raise
+            
+            execute_time = time.time() - start_time
+            logger.info(f"[{task_id}] Query executed in {execute_time:.2f}s")
             
             # Monitor parallel execution
             if self.enable_parallel_monitoring:
@@ -556,36 +1338,56 @@ class OptimizedOracleJoinETL:
             # Get column info
             columns = [desc[0] for desc in cursor.description]
             
-            # Batch processing with memory pooling
+            # Batch processing with zero-copy
             batch_rows = []
-            batch_size = min(10000, fetch_size)
+            batch_size = min(20000, array_size)
+            chunk_num = 0
             
-            # Process rows
-            row_count = 0
+            # Track performance metrics
+            fetch_time = 0
+            process_time = 0
+            last_progress_log = time.time()
+            
             while True:
-                # Fetch batch of rows
-                rows = cursor.fetchmany(batch_size)
+                # Check for shutdown
+                if self.shutdown:
+                    logger.info(f"[{task_id}] Shutdown requested, stopping extraction")
+                    break
+                
+                # Fetch batch of rows with timeout protection
+                fetch_start = time.time()
+                
+                try:
+                    rows = cursor.fetchmany(batch_size)
+                except oracledb.DatabaseError as e:
+                    error_code = e.args[0].code if hasattr(e.args[0], 'code') else 0
+                    if error_code in [3113, 3114, 3135]:  # Connection errors
+                        logger.error(f"[{task_id}] Lost connection during fetch: ORA-{error_code:05d}")
+                        raise
+                    else:
+                        raise
+                
+                fetch_time += time.time() - fetch_start
+                
                 if not rows:
                     break
                 
-                if self.shutdown:
-                    break
-                
                 batch_rows.extend(rows)
-                row_count += len(rows)
                 
-                # Update last_id
+                # Update last_id for resume capability
                 if rows:
-                    last_id = rows[-1][0]
+                    last_id = rows[-1][0]  # Assumes first column is ID
                 
-                # Process when batch is full
-                if len(batch_rows) >= batch_size:
-                    # Check memory
-                    if not self.check_memory():
-                        logger.warning("Memory pressure detected, processing partial batch")
+                # Process when batch is full or on last iteration
+                if len(batch_rows) >= batch_size or (len(rows) < batch_size and batch_rows):
+                    process_start = time.time()
                     
-                    # Convert to DataFrame efficiently
-                    df = self.rows_to_dataframe_optimized(batch_rows, columns)
+                    # Check memory before processing
+                    if not self.check_memory():
+                        logger.warning(f"[{task_id}] Memory pressure detected, processing partial batch")
+                    
+                    # Convert to DataFrame with zero-copy
+                    df = self.rows_to_dataframe_zero_copy(batch_rows, columns)
                     
                     # Clean and optimize
                     df = self._clean_numeric_data(df)
@@ -594,29 +1396,36 @@ class OptimizedOracleJoinETL:
                     if schema is None:
                         # Create schema from first batch
                         schema = self._create_consistent_schema(df)
-                        logger.info(f"Created schema with {len(schema)} fields")
+                        logger.info(f"[{task_id}] Created schema with {len(schema)} fields")
                     
                     # Apply schema
                     df = self._apply_consistent_schema(df, schema)
                     
                     # Generate filename for this chunk
-                    chunk_file = f"{output_path}.chunk_{rows_written//batch_size:04d}.tmp"
+                    chunk_file = f"{output_path}.chunk_{chunk_num:06d}.tmp"
                     
                     # Submit to async writer
                     self.async_writer.submit(chunk_file, df, schema)
                     
                     rows_written += len(df)
+                    chunk_num += 1
                     batch_rows = []
                     
-                    # Log progress
-                    if rows_written % 100000 == 0:
+                    process_time += time.time() - process_start
+                    
+                    # Log progress periodically
+                    if time.time() - last_progress_log > 10:  # Every 10 seconds
                         elapsed = time.time() - start_time
-                        rate = rows_written / elapsed
-                        logger.info(f"Streamed {rows_written:,} rows at {rate:,.0f} rows/sec")
+                        rate = rows_written / elapsed if elapsed > 0 else 0
+                        logger.info(
+                            f"[{task_id}] Progress: {rows_written:,} rows at {rate:,.0f} rows/sec "
+                            f"(fetch: {fetch_time:.1f}s, process: {process_time:.1f}s)"
+                        )
+                        last_progress_log = time.time()
             
-            # Process final batch
+            # Process final batch if exists
             if batch_rows and not self.shutdown:
-                df = self.rows_to_dataframe_optimized(batch_rows, columns)
+                df = self.rows_to_dataframe_zero_copy(batch_rows, columns)
                 df = self._clean_numeric_data(df)
                 
                 if schema is None:
@@ -625,31 +1434,45 @@ class OptimizedOracleJoinETL:
                 
                 df = self._apply_consistent_schema(df, schema)
                 
-                chunk_file = f"{output_path}.chunk_{rows_written//batch_size:04d}.tmp"
+                chunk_file = f"{output_path}.chunk_{chunk_num:06d}.tmp"
                 self.async_writer.submit(chunk_file, df, schema)
                 rows_written += len(df)
             
             cursor.close()
             
             # Wait for async writes to complete
-            logger.info("Waiting for async writes to complete...")
-            self.async_writer.write_queue.join()
-            
-            # Merge chunk files into final output
             if rows_written > 0:
+                logger.info(f"[{task_id}] Waiting for async writes to complete...")
+                for queue in self.async_writer.write_queues:
+                    queue.join()
+                
+                # Merge chunk files into final output
                 self._merge_chunk_files(output_path, schema)
                 
                 elapsed = time.time() - start_time
                 rate = rows_written / elapsed if elapsed > 0 else 0
-                logger.info(f"Completed {rows_written:,} rows to {output_path} at {rate:,.0f} rows/sec")
+                logger.info(
+                    f"[{task_id}] Completed {rows_written:,} rows to {output_path} "
+                    f"at {rate:,.0f} rows/sec (total: {elapsed:.1f}s)"
+                )
             
             return rows_written, last_id
             
         except Exception as e:
-            logger.error(f"Error in enhanced stream extraction: {str(e)}")
+            logger.error(f"[{task_id}] Error in stream extraction: {str(e)}")
+            # Log additional diagnostic info
+            if connection:
+                try:
+                    logger.error(f"[{task_id}] Connection state: opened={self.pool.opened}, busy={self.pool.busy}")
+                except:
+                    pass
             raise
         finally:
-            self.pool.release(connection)
+            if connection:
+                try:
+                    self.pool.release(connection)
+                except Exception as e:
+                    logger.error(f"[{task_id}] Error releasing connection: {str(e)}")
     
     def _merge_chunk_files(self, output_path: str, schema: pa.Schema):
         """Merge temporary chunk files into final output"""
@@ -664,25 +1487,31 @@ class OptimizedOracleJoinETL:
         # Create final parquet file
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         
+        compression_args = self._get_parquet_compression_args()
+        
         with pq.ParquetWriter(
             output_path,
             schema,
-            **self._get_parquet_compression_args()
+            **compression_args
         ) as writer:
             for chunk_file in chunk_files:
-                # Read chunk
-                table = pq.read_table(chunk_file)
-                # Write to final file
-                writer.write_table(table, row_group_size=self.parquet_row_group_size)
-                # Remove chunk file
-                os.remove(chunk_file)
+                try:
+                    # Read chunk
+                    table = pq.read_table(chunk_file)
+                    # Write to final file
+                    writer.write_table(table, row_group_size=self.parquet_row_group_size)
+                    # Remove chunk file
+                    os.remove(chunk_file)
+                except Exception as e:
+                    logger.error(f"Error merging chunk {chunk_file}: {str(e)}")
         
-        # Log file size
-        file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        logger.info(f"Final Parquet file size: {file_size_mb:.2f} MB")
+        # Log file size and compression ratio
+        if os.path.exists(output_path):
+            file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            logger.info(f"Final Parquet file size: {file_size_mb:.2f} MB")
     
     def process_partition_parallel(self, task: ExtractionTask) -> Dict[str, Any]:
-        """Process a partition with parallel extraction"""
+        """Process a partition with enhanced parallel extraction"""
         partition_id = task.partition_id
         
         logger.info(f"Processing partition {partition_id} in parallel")
@@ -697,6 +1526,11 @@ class OptimizedOracleJoinETL:
         if task.partition_value is not None:
             partition_path = os.path.join(partition_path, f"{self.partition_column}={task.partition_value}")
         
+        if task.rowid_range and task.rowid_range[0]:
+            # Add ROWID range to path for uniqueness
+            rowid_suffix = f"rowid_{hash(task.rowid_range[0])%1000000:06d}"
+            partition_path = os.path.join(partition_path, rowid_suffix)
+        
         os.makedirs(partition_path, exist_ok=True)
         
         # Process data
@@ -710,9 +1544,12 @@ class OptimizedOracleJoinETL:
         
         while consecutive_empty < max_consecutive_empty and not self.shutdown:
             try:
-                # Build query
+                # Build query with ROWID range if available
                 query, params = self.build_optimized_query(
-                    task.date_range, last_id, task.partition_value
+                    task.date_range, 
+                    last_id, 
+                    task.partition_value,
+                    task.rowid_range
                 )
                 
                 # Generate output filename
@@ -722,12 +1559,12 @@ class OptimizedOracleJoinETL:
                 
                 # Stream extract with enhanced method
                 chunk_rows, new_last_id = self.stream_extract_to_parquet_enhanced(
-                    query, params, file_path
+                    query, params, file_path, task_id=partition_id
                 )
                 
                 if chunk_rows == 0:
                     consecutive_empty += 1
-                    logger.debug(f"Empty result {consecutive_empty}/{max_consecutive_empty}")
+                    logger.debug(f"[{partition_id}] Empty result {consecutive_empty}/{max_consecutive_empty}")
                     continue
                 
                 consecutive_empty = 0
@@ -752,54 +1589,60 @@ class OptimizedOracleJoinETL:
             'path': partition_path
         }
     
-    def get_adaptive_date_ranges(self) -> List[Tuple[datetime, datetime]]:
-        """
-        Split date range adaptively based on estimated data volume
-        """
-        if not self.start_date or not self.end_date:
-            return [(None, None)]
-        
-        start = datetime.strptime(self.start_date, '%Y-%m-%d')
-        end = datetime.strptime(self.end_date, '%Y-%m-%d')
-        
-        date_ranges = []
-        current = start
-        
-        # With enhanced parallel processing, use 24-hour chunks
-        chunk_hours = 24
-        
-        while current <= end:
-            next_date = min(current + timedelta(hours=chunk_hours), end + timedelta(days=1))
-            date_ranges.append((current, next_date))
-            current = next_date
-        
-        return date_ranges
-    
     def run_parallel(self):
-        """Execute ETL with parallel partition processing"""
+        """Execute ETL with enhanced parallel partition processing"""
         start_time = datetime.now()
         extraction_id = self.get_extraction_id()
         
         logger.info("="*60)
-        logger.info(f"Starting Enhanced Parallel JOIN ETL Process")
+        logger.info(f"Starting Enhanced Parallel JOIN ETL Process v2.0")
         logger.info(f"Extraction ID: {extraction_id}")
         logger.info(f"Using {self.max_workers} parallel workers")
         logger.info("="*60)
         
+        # Start profiling if enabled
+        profiler = None
+        if self.config.get('enable_profiling', False):
+            profiler = cProfile.Profile()
+            profiler.enable()
+        
         try:
-            # Get date ranges
-            date_ranges = self.get_adaptive_date_ranges()
-            logger.info(f"Processing {len(date_ranges)} time ranges")
-            
-            # Create extraction tasks
+            # Create extraction tasks based on strategy
             tasks = []
-            for date_range in date_ranges:
-                task = ExtractionTask(
-                    partition_id=f"{date_range[0].strftime('%Y%m%d_%H') if date_range[0] else 'all'}",
-                    date_range=date_range,
-                    partition_value=None
-                )
-                tasks.append(task)
+            
+            if self.use_rowid_splitting:
+                # Get ROWID ranges for parallel processing
+                connection = self.pool.acquire()
+                try:
+                    rowid_ranges = self.get_rowid_ranges(connection, self.max_workers * 2)
+                finally:
+                    self.pool.release(connection)
+                
+                # Create tasks for each ROWID range
+                for i, rowid_range in enumerate(rowid_ranges):
+                    task = ExtractionTask(
+                        partition_id=f"rowid_{i:03d}",
+                        date_range=(
+                            datetime.strptime(self.start_date, '%Y-%m-%d') if self.start_date else None,
+                            datetime.strptime(self.end_date, '%Y-%m-%d') if self.end_date else None
+                        ),
+                        partition_value=None,
+                        rowid_range=rowid_range
+                    )
+                    tasks.append(task)
+            else:
+                # Fall back to date-based splitting
+                date_ranges = self.get_adaptive_date_ranges()
+                
+                for date_range in date_ranges:
+                    task = ExtractionTask(
+                        partition_id=f"{date_range[0].strftime('%Y%m%d_%H') if date_range[0] else 'all'}",
+                        date_range=date_range,
+                        partition_value=None
+                    )
+                    tasks.append(task)
+            
+            logger.info(f"Created {len(tasks)} extraction tasks")
             
             # Process tasks in parallel
             completed_partitions = []
@@ -842,7 +1685,7 @@ class OptimizedOracleJoinETL:
                     except Exception as e:
                         logger.error(f"Failed partition {task.partition_id}: {str(e)}")
                         if "ORA-01555" in str(e):
-                            logger.warning("Snapshot too old error - consider smaller chunks")
+                            logger.warning("Snapshot too old error - consider smaller chunks or ROWID splitting")
                         raise
                 
                 if self.shutdown:
@@ -854,6 +1697,11 @@ class OptimizedOracleJoinETL:
             # Summary
             total_rows = sum(p['rows_processed'] for p in completed_partitions)
             total_files = sum(p['files_written'] for p in completed_partitions)
+            
+            # Stop profiling
+            if profiler:
+                profiler.disable()
+                self._save_profile_stats(profiler, extraction_id)
             
             # Log statistics
             self._log_final_statistics(
@@ -879,10 +1727,51 @@ class OptimizedOracleJoinETL:
         finally:
             self.cleanup()
     
+    def get_adaptive_date_ranges(self) -> List[Tuple[datetime, datetime]]:
+        """Split date range adaptively based on estimated data volume"""
+        if not self.start_date or not self.end_date:
+            return [(None, None)]
+        
+        start = datetime.strptime(self.start_date, '%Y-%m-%d')
+        end = datetime.strptime(self.end_date, '%Y-%m-%d')
+        
+        date_ranges = []
+        current = start
+        
+        # With enhanced parallel processing and ROWID splitting, use larger chunks
+        chunk_hours = 48  # Increased from 24
+        
+        while current <= end:
+            next_date = min(current + timedelta(hours=chunk_hours), end + timedelta(days=1))
+            date_ranges.append((current, next_date))
+            current = next_date
+        
+        return date_ranges
+    
+    def _save_profile_stats(self, profiler, extraction_id: str):
+        """Save profiling statistics"""
+        s = StringIO()
+        ps = pstats.Stats(profiler, stream=s).sort_stats('cumulative')
+        ps.print_stats(100)  # Top 100 functions
+        
+        profile_path = os.path.join(self.checkpoint_dir, f'profile_{extraction_id}.txt')
+        with open(profile_path, 'w') as f:
+            f.write(s.getvalue())
+        
+        logger.info(f"Saved profiling stats to {profile_path}")
+    
     def _log_final_statistics(self, extraction_id: str, total_rows: int, 
                             total_files: int, completed_partitions: List,
                             start_time: datetime):
         """Log final statistics and metadata"""
+        # Memory pool statistics
+        pool_stats = self.memory_pool.get_stats()
+        logger.info(f"Memory pool stats: {pool_stats}")
+        
+        # Async writer statistics
+        writer_stats = self.async_writer.write_stats
+        logger.info(f"Async writer stats: {writer_stats}")
+        
         # Parallel execution statistics
         if self.enable_parallel_monitoring:
             logger.info("="*60)
@@ -893,12 +1782,14 @@ class OptimizedOracleJoinETL:
                 success_rate = self.parallel_stats['parallel_executions'] / self.parallel_stats['queries_executed']
                 logger.info(f"Parallel success rate: {success_rate:.1%}")
             logger.info(f"Maximum parallel degree used: {self.parallel_stats['max_parallel_degree']}")
+            logger.info(f"Network latency: {self.parallel_stats['network_latency_ms']:.2f}ms")
             logger.info("="*60)
         
         # Write metadata
         metadata = {
             'extraction_id': extraction_id,
-            'query_type': 'enhanced_parallel_join',
+            'version': '2.0',
+            'query_type': 'enhanced_parallel_join_v2',
             'categories_source': self.categories_parquet_path,
             'excluded_categories': list(self.excluded_categories),
             'valid_categories_count': len(self.valid_categories),
@@ -915,7 +1806,10 @@ class OptimizedOracleJoinETL:
                 'parallel_degree': self.parallel_degree,
                 'oracle_fetch_size': self.oracle_fetch_size,
                 'oracle_prefetch_rows': self.oracle_prefetch_rows,
-                'connection_pool_size': self.pool.max
+                'connection_pool_size': self.pool.max,
+                'use_rowid_splitting': self.use_rowid_splitting,
+                'use_network_compression': self.use_network_compression,
+                'network_buffer_size': self.network_buffer_size
             },
             'parquet_settings': {
                 'compression': self.parquet_compression,
@@ -923,14 +1817,20 @@ class OptimizedOracleJoinETL:
                 'row_group_size': self.parquet_row_group_size,
                 'dictionary_columns': self.parquet_use_dictionary,
                 'write_statistics': self.parquet_write_statistics,
-                'write_page_index': self.parquet_write_page_index
+                'write_page_index': self.parquet_write_page_index,
+                'use_direct_io': self.use_direct_io,
+                'parallel_writers': self.parallel_parquet_writers
             },
-            'parallel_stats': self.parallel_stats,
-            'gc_stats_summary': {
-                'total_collections': self.gc_stats.get('collection_count', 0),
-                'total_gc_time': self.gc_stats.get('total_time', 0),
-                'total_collected': self.gc_stats.get('total_collected', 0)
-            } if self.monitor_gc and hasattr(self, 'gc_stats') else None,
+            'performance_stats': {
+                'parallel_stats': self.parallel_stats,
+                'memory_pool_stats': pool_stats,
+                'writer_stats': writer_stats,
+                'gc_stats_summary': {
+                    'total_collections': self.gc_stats.get('collection_count', 0),
+                    'total_gc_time': self.gc_stats.get('total_time', 0),
+                    'total_collected': self.gc_stats.get('total_collected', 0)
+                } if self.monitor_gc and hasattr(self, 'gc_stats') else None
+            },
             'partitions': completed_partitions
         }
         
@@ -958,7 +1858,8 @@ class OptimizedOracleJoinETL:
         # Restore GC settings
         if hasattr(self, 'original_gc_thresholds'):
             gc.set_threshold(*self.original_gc_thresholds)
-            logger.info("Restored original GC thresholds")
+            gc.enable()
+            logger.info("Restored original GC settings")
         
         # Log GC statistics
         if self.monitor_gc and hasattr(self, 'gc_stats'):
@@ -990,7 +1891,7 @@ class OptimizedOracleJoinETL:
         
         logger.info("="*60)
     
-    # Include other required methods from original script
+    # Include other required methods
     def monitor_parallel_execution(self, connection):
         """Monitor Oracle parallel execution statistics"""
         if not self.enable_parallel_monitoring:
@@ -1005,7 +1906,8 @@ class OptimizedOracleJoinETL:
                 FROM v$px_process 
                 WHERE status = 'IN USE'
             """)
-            active_servers = cursor.fetchone()[0]
+            result = cursor.fetchone()
+            active_servers = result[0] if result else 0
             
             # Get session parallel info
             cursor.execute("""
@@ -1032,7 +1934,7 @@ class OptimizedOracleJoinETL:
                     if degree and degree > 0:
                         self.parallel_stats['parallel_executions'] += 1
                         self.parallel_stats['max_parallel_degree'] = max(
-                            self.parallel_stats['max_parallel_degree'], degree
+                            self.parallel_stats['max_parallel_degree'], degree or 0
                         )
             
             cursor.close()
@@ -1051,12 +1953,10 @@ class OptimizedOracleJoinETL:
         if current_percent > self.memory_limit_percent:
             logger.warning(f"Memory usage at {current_percent:.1f}%, above limit of {self.memory_limit_percent}%")
             
-            # Get GC stats before collection
+            # Manual GC only when needed
             gc_counts_before = gc.get_count()
-            
-            # Only call gc.collect() when actually needed
             start_time = time.time()
-            collected = gc.collect()  # Full collection
+            collected = gc.collect(2)  # Full collection
             gc_duration = time.time() - start_time
             
             logger.info(
@@ -1065,9 +1965,9 @@ class OptimizedOracleJoinETL:
             )
             
             # Give system time to release memory
-            time.sleep(1)
+            time.sleep(0.5)
             
-            # Check memory again after GC
+            # Check memory again
             mem = psutil.virtual_memory()
             new_percent = mem.percent
             
@@ -1090,9 +1990,11 @@ class OptimizedOracleJoinETL:
             'write_statistics': self.parquet_write_statistics,
         }
         
-        if self.parquet_compression in ['zstd', 'gzip', 'brotli']:
+        # Only add compression level for algorithms that support it
+        if self.parquet_compression in ['zstd', 'gzip', 'brotli'] and self.parquet_compression_level:
             writer_args['compression_level'] = self.parquet_compression_level
         
+        # Add page index support for newer PyArrow versions
         try:
             import pyarrow
             major_version = int(pyarrow.__version__.split('.')[0])
@@ -1106,17 +2008,17 @@ class OptimizedOracleJoinETL:
     def _clean_numeric_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Clean numeric data to prevent PyArrow conversion errors"""
         for col in df.columns:
-            if df[col].dtype in ['float64', 'float32', 'float16', 'int64', 'int32', 'int16', 'int8']:
+            if df[col].dtype in ['float64', 'float32', 'int64', 'int32']:
                 if df[col].dtype.name.startswith('float'):
                     df[col] = df[col].replace([np.inf, -np.inf], np.nan)
             
             elif df[col].dtype == 'object':
+                # Try to convert object columns to numeric if possible
                 sample_val = df[col].dropna().iloc[0] if len(df[col].dropna()) > 0 else None
                 
                 if sample_val is not None:
                     try:
                         float(str(sample_val))
-                        logger.debug(f"Converting object column {col} to numeric")
                         df[col] = pd.to_numeric(df[col], errors='coerce')
                         df[col] = df[col].replace([np.inf, -np.inf], np.nan)
                     except (ValueError, TypeError):
@@ -1141,6 +2043,7 @@ class OptimizedOracleJoinETL:
                         continue
                     
                     if df[col].isnull().any():
+                        # Use nullable integer types
                         c_min = df[col].min()
                         c_max = df[col].max()
                         if pd.isna(c_min) or pd.isna(c_max):
@@ -1153,23 +2056,20 @@ class OptimizedOracleJoinETL:
                         else:
                             df[col] = df[col].astype('Int64')
                     else:
+                        # Use standard integer types
                         c_min = df[col].min()
                         c_max = df[col].max()
                         if c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
                             df[col] = df[col].astype(np.int16)
                         elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
                             df[col] = df[col].astype(np.int32)
-                        else:
-                            df[col] = df[col].astype(np.int64)
                 
                 elif col_type.name.startswith('float'):
+                    # Keep as float64 for compatibility
                     df[col] = df[col].replace([np.inf, -np.inf], np.nan)
                     
-                    if not df[col].notna().any():
-                        continue
-                    
-                    df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
             else:
+                # String columns
                 if df[col].notna().any():
                     df[col] = df[col].astype(str)
                     df[col] = df[col].replace(['nan', 'None', '<NA>'], np.nan)
@@ -1187,11 +2087,8 @@ class OptimizedOracleJoinETL:
             if dtype == 'object' or dtype.name == 'category':
                 schema_fields.append(pa.field(col, pa.string()))
             elif dtype.name.startswith('int') or dtype.name.startswith('Int'):
-                if not has_data:
-                    schema_fields.append(pa.field(col, pa.int32()))
-                elif dtype.name in ['int8', 'Int8']:
-                    schema_fields.append(pa.field(col, pa.int16()))
-                elif dtype.name in ['int16', 'Int16']:
+                # Use appropriate integer type
+                if dtype.name in ['int8', 'Int8', 'int16', 'Int16']:
                     schema_fields.append(pa.field(col, pa.int16()))
                 elif dtype.name in ['int32', 'Int32']:
                     schema_fields.append(pa.field(col, pa.int32()))
@@ -1218,39 +2115,34 @@ class OptimizedOracleJoinETL:
             
             if current_dtype.name == 'category':
                 df[col_name] = df[col_name].astype(str)
-                current_dtype = df[col_name].dtype
             
             if pa.types.is_integer(field.type):
                 df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
                 
                 if df[col_name].isnull().any():
+                    # Use nullable integer types
                     if pa.types.is_int16(field.type):
                         df[col_name] = df[col_name].astype('Int16')
                     elif pa.types.is_int32(field.type):
                         df[col_name] = df[col_name].astype('Int32')
-                    elif pa.types.is_int64(field.type):
-                        df[col_name] = df[col_name].astype('Int64')
                     else:
-                        df[col_name] = df[col_name].astype('Int32')
+                        df[col_name] = df[col_name].astype('Int64')
                 else:
+                    # Use standard integer types
                     if pa.types.is_int16(field.type):
                         df[col_name] = df[col_name].astype(np.int16)
                     elif pa.types.is_int32(field.type):
                         df[col_name] = df[col_name].astype(np.int32)
-                    elif pa.types.is_int64(field.type):
-                        df[col_name] = df[col_name].astype(np.int64)
                     else:
-                        df[col_name] = df[col_name].astype(np.int32)
+                        df[col_name] = df[col_name].astype(np.int64)
                         
             elif pa.types.is_floating(field.type):
                 df[col_name] = df[col_name].replace([np.inf, -np.inf], np.nan)
-                df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
-                df[col_name] = df[col_name].astype(np.float64)
+                df[col_name] = pd.to_numeric(df[col_name], errors='coerce').astype(np.float64)
                         
-            elif pa.types.is_string(field.type) or pa.types.is_large_string(field.type):
+            elif pa.types.is_string(field.type):
                 if current_dtype != 'object':
                     df[col_name] = df[col_name].astype(str)
-                
                 df[col_name] = df[col_name].replace(['nan', 'None', '<NA>', ''], np.nan)
                         
             elif pa.types.is_timestamp(field.type):
@@ -1263,38 +2155,15 @@ class OptimizedOracleJoinETL:
         config_str = f"{self.output_table_name}_{self.start_date}_{self.end_date}_{','.join(sorted(self.excluded_categories))}"
         return hashlib.md5(config_str.encode()).hexdigest()[:8]
     
-    def get_checkpoint_file(self, extraction_id: str) -> str:
-        """Get checkpoint file path"""
-        return os.path.join(self.checkpoint_dir, f"{extraction_id}_checkpoint.json")
-    
-    def load_checkpoint(self, extraction_id: str) -> Optional[Dict]:
-        """Load checkpoint data if exists"""
-        checkpoint_file = self.get_checkpoint_file(extraction_id)
-        if os.path.exists(checkpoint_file):
-            with open(checkpoint_file, 'r') as f:
-                return json.load(f)
-        return None
-    
-    def save_checkpoint(self, extraction_id: str, checkpoint_data: Dict):
-        """Save checkpoint data atomically"""
-        checkpoint_file = self.get_checkpoint_file(extraction_id)
-        temp_file = f"{checkpoint_file}.tmp"
-        with open(temp_file, 'w') as f:
-            json.dump(checkpoint_data, f, indent=2)
-        os.replace(temp_file, checkpoint_file)
-    
     def run(self):
         """Execute the optimized ETL process"""
-        # Use the enhanced parallel execution
         self.run_parallel()
 
-# Import glob for file merging
-import glob
 
 def main():
     """Main execution function with enhanced configuration"""
     
-    # Enhanced configuration for performance
+    # Enhanced configuration for maximum performance
     config = {
         # Oracle connection using SID
         'oracle_user': os.environ.get('ORACLE_USER', 'your_username'),
@@ -1304,7 +2173,7 @@ def main():
         'oracle_sid': os.environ.get('ORACLE_SID', 'ORCL'),
         
         # Output settings
-        'output_table_name': 'joined_table1_table2_enhanced',
+        'output_table_name': 'joined_table1_table2_v2',
         'data_lake_path': '/mnt/data_lake/raw',
         'checkpoint_dir': './etl_checkpoints',
         'temp_dir': '/tmp/etl_temp',
@@ -1342,30 +2211,51 @@ def main():
         ],
         
         # Enhanced performance settings
-        'chunk_size': 100000,              # Increased from 50k
-        'max_workers': 4,                  # Parallel extraction workers
-        'parallel_degree': 8,              # Oracle parallel degree
-        'parallel_degree_range': (4, 16),
-        'memory_limit_percent': 75,        # Increased slightly
+        'chunk_size': 200000,              # Doubled from 100k
+        'max_workers': 6,                  # Increased from 4
+        'parallel_degree': 16,             # Increased from 8
+        'memory_limit_percent': 75,
         'enable_parallel_monitoring': True,
         'monitor_gc': True,
         
         # Network optimization
-        'oracle_fetch_size': 10000,        # Increased fetch size
-        'oracle_prefetch_rows': 20000,     # Increased prefetch
-        'use_connection_multiplexing': True,
+        'oracle_fetch_size': 50000,        # 5x increase
+        'oracle_prefetch_rows': 100000,    # 5x increase
+        'use_network_compression': True,   # Enable compression
+        'network_buffer_size': 1048576,    # 1MB buffers
         
-        # Parquet optimization (matching your row group size)
-        'parquet_compression': 'zstd',
-        'parquet_compression_level': 6,    # Increased for better compression
-        'parquet_row_group_size': 671000,  # From your logs
+        # ROWID splitting for true parallelism
+        'use_rowid_splitting': True,
+        
+        # Parquet optimization
+        'parquet_compression': 'snappy',   # Faster than zstd
+        'parquet_compression_level': None, # Not needed for snappy
+        'parquet_row_group_size': 1000000, # Larger row groups
         'parquet_use_dictionary': ['999_categories'],
         'parquet_write_statistics': True,
         'parquet_write_page_index': True,
         
+        # I/O optimization
+        'use_direct_io': True,             # Linux only
+        'parallel_parquet_writers': 4,     # Parallel writers
+        
         # Row size estimate for adaptive fetching
         'estimated_row_size_bytes': 200,
+        
+        # Enable profiling
+        'enable_profiling': False,  # Set to True to profile
     }
+    
+    # Set environment variables for optimal performance
+    os.environ['PYTHONHASHSEED'] = '0'
+    os.environ['MALLOC_TRIM_THRESHOLD_'] = '128000'
+    
+    # Log startup
+    logger.info("Starting Oracle ETL v2.0 with all optimizations")
+    logger.info(f"Python version: {sys.version}")
+    logger.info(f"Platform: {sys.platform}")
+    logger.info(f"CPU count: {os.cpu_count()}")
+    logger.info(f"Total memory: {psutil.virtual_memory().total / (1024**3):.1f} GB")
     
     # Create and run enhanced ETL
     etl = OptimizedOracleJoinETL(config)
@@ -1373,11 +2263,10 @@ def main():
     try:
         etl.run()
     except KeyboardInterrupt:
-        logger.info("Process interrupted - checkpoints saved")
+        logger.info("Process interrupted by user")
         sys.exit(1)
     except Exception as e:
-        logger.error(f"Process failed: {str(e)}")
-        logger.info("Checkpoints saved for resume")
+        logger.error(f"Process failed: {str(e)}", exc_info=True)
         sys.exit(1)
 
 
