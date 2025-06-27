@@ -55,6 +55,17 @@
             font-size: 12px;
             flex-shrink: 0;
             box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+            padding: 0;
+        }
+        
+        /* Image styling within logo container */
+        .company-logo-icon img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: block;
+            border-radius: 4px; /* Match the container's border radius */
         }
         
         .company-logo-text {
@@ -92,6 +103,13 @@
             height: 36px;
             font-size: 18px;
             border-radius: 6px;
+        }
+        
+        /* Ensure image fills the container on title page too */
+        .title-page .company-logo-icon img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
         }
         
         .title-page .company-logo-text {
@@ -303,6 +321,11 @@
                 width: 20px;
                 height: 20px;
                 font-size: 10px;
+            }
+            
+            .company-logo-icon img {
+                width: 100%;
+                height: 100%;
             }
             
             .company-logo-text {
