@@ -1,0 +1,2503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Data Archival Strategy: MongoDB vs Parquet Files</title>
+    <style>
+        @page {
+            size: letter;
+            margin: 0.75in;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #2c3e50;
+            background: #f8f9fa;
+            print-color-adjust: exact;
+            -webkit-print-color-adjust: exact;
+        }
+        
+        /* Company Logo Styles */
+        .company-logo {
+            position: absolute;
+            top: 20px;
+            left: 30px;
+            z-index: 100;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .company-logo-icon {
+            width: 40px;
+            height: 40px;
+            background: #0052cc;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 20px;
+        }
+        
+        .company-logo-text {
+            font-size: 18px;
+            font-weight: 600;
+            color: #1a202c;
+            letter-spacing: -0.5px;
+        }
+        
+        /* Copyright Styles */
+        .copyright {
+            position: absolute;
+            bottom: 20px;
+            left: 0.75in;
+            right: 0.75in;
+            text-align: center;
+            font-size: 11px;
+            color: #718096;
+            z-index: 100;
+        }
+        
+        /* Adjust title page logo positioning */
+        .title-page .company-logo {
+            top: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            flex-direction: column;
+            gap: 5px;
+        }
+        
+        .title-page .company-logo-icon {
+            width: 60px;
+            height: 60px;
+            font-size: 30px;
+        }
+        
+        .title-page .company-logo-text {
+            font-size: 24px;
+        }
+        
+        /* Ensure logo and copyright don't interfere with content */
+        .page {
+            padding-top: 80px !important;
+            padding-bottom: 60px !important;
+        }
+        
+        .title-page {
+            padding-top: 140px !important;
+        }
+        
+        .section-divider {
+            padding-top: 0 !important;
+        }
+        
+        /* Table of Contents Styles */
+        .toc-container {
+            position: fixed;
+            left: 0;
+            top: 0;
+            width: 280px;
+            height: 100vh;
+            background: white;
+            box-shadow: 2px 0 10px rgba(0,0,0,0.1);
+            overflow-y: auto;
+            z-index: 1000;
+            transition: transform 0.3s ease;
+        }
+        
+        .toc-header {
+            background: #0052cc;
+            color: white;
+            padding: 20px;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+        
+        .toc-header h2 {
+            font-size: 18px;
+            font-weight: 600;
+            margin: 0;
+            color: white;
+        }
+        
+        .toc-content {
+            padding: 20px;
+        }
+        
+        .toc-section {
+            margin-bottom: 20px;
+        }
+        
+        .toc-section-title {
+            font-weight: 700;
+            color: #1a202c;
+            font-size: 14px;
+            margin-bottom: 8px;
+            padding: 8px 12px;
+            background: #f7fafc;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        .toc-section-title:hover {
+            background: #e2e8f0;
+            color: #0052cc;
+        }
+        
+        .toc-section-title.active {
+            background: #0052cc;
+            color: white;
+        }
+        
+        .toc-subsection {
+            margin-left: 20px;
+            margin-top: 4px;
+        }
+        
+        .toc-link {
+            display: block;
+            color: #4a5568;
+            text-decoration: none;
+            padding: 6px 12px;
+            font-size: 13px;
+            border-radius: 4px;
+            transition: all 0.2s ease;
+            cursor: pointer;
+        }
+        
+        .toc-link:hover {
+            background: #edf2f7;
+            color: #0052cc;
+            transform: translateX(4px);
+        }
+        
+        .toc-link.active {
+            background: #e6f2ff;
+            color: #0052cc;
+            font-weight: 600;
+            border-left: 3px solid #0052cc;
+        }
+        
+        /* Toggle button for mobile */
+        .toc-toggle {
+            display: none;
+            position: fixed;
+            left: 20px;
+            top: 20px;
+            z-index: 1001;
+            background: #0052cc;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }
+        
+        .toc-toggle:hover {
+            background: #0747a6;
+        }
+        
+        /* Close button */
+        .toc-close {
+            display: none;
+            position: absolute;
+            right: 20px;
+            top: 20px;
+            background: transparent;
+            border: none;
+            color: white;
+            font-size: 24px;
+            cursor: pointer;
+            width: 30px;
+            height: 30px;
+            text-align: center;
+            line-height: 1;
+        }
+        
+        .toc-close:hover {
+            background: rgba(255,255,255,0.2);
+            border-radius: 4px;
+        }
+        
+        /* Main content adjustment */
+        .main-content {
+            margin-left: 280px;
+            transition: margin-left 0.3s ease;
+        }
+        
+        /* Original styles continue here */
+        .page {
+            width: 8.5in;
+            min-height: 11in;
+            margin: 0 auto;
+            padding: 0.75in;
+            page-break-after: always;
+            background: white;
+            box-shadow: 0 2px 20px rgba(0,0,0,0.08);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        /* Responsive design */
+        @media screen and (max-width: 1200px) {
+            .toc-container {
+                transform: translateX(-100%);
+            }
+            
+            .toc-container.active {
+                transform: translateX(0);
+            }
+            
+            .toc-toggle {
+                display: block;
+            }
+            
+            .toc-close {
+                display: block;
+            }
+            
+            .main-content {
+                margin-left: 0;
+            }
+        }
+        
+        @media print {
+            .toc-container,
+            .toc-toggle {
+                display: none !important;
+            }
+            
+            .main-content {
+                margin-left: 0 !important;
+            }
+            
+            body {
+                background: white;
+            }
+            .page {
+                box-shadow: none;
+                margin: 0;
+                page-break-after: always;
+            }
+            .no-print {
+                display: none;
+            }
+            
+            /* Ensure logo and copyright print properly */
+            .company-logo,
+            .copyright {
+                print-color-adjust: exact;
+                -webkit-print-color-adjust: exact;
+            }
+        }
+        
+        /* Progress Indicator */
+        .progress-indicator {
+            position: absolute;
+            top: 30px;
+            right: 30px;
+            font-size: 13px;
+            color: #718096;
+            background: #f7fafc;
+            padding: 6px 16px;
+            border-radius: 20px;
+            border: 1px solid #e2e8f0;
+            font-weight: 500;
+        }
+        
+        /* Title Page */
+        .title-page {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            height: 9.5in;
+        }
+        
+        .title-page h1 {
+            font-size: 40px;
+            color: #1a202c;
+            margin-bottom: 30px;
+            font-weight: 300;
+            letter-spacing: -0.5px;
+        }
+        
+        .title-page .subtitle {
+            font-size: 22px;
+            color: #4a5568;
+            margin-bottom: 50px;
+            font-weight: 400;
+            line-height: 1.4;
+        }
+        
+        .title-page .date {
+            font-size: 16px;
+            color: #718096;
+            position: absolute;
+            bottom: 100px;
+            line-height: 1.6;
+        }
+        
+        /* Action Titles */
+        .action-title {
+            font-size: 26px;
+            color: #0052cc;
+            margin-bottom: 28px;
+            font-weight: 500;
+            border-bottom: 3px solid #0052cc;
+            padding-bottom: 14px;
+            line-height: 1.35;
+        }
+        
+        /* Section Headers */
+        h2 {
+            font-size: 20px;
+            color: #2d3748;
+            margin-top: 24px;
+            margin-bottom: 14px;
+            font-weight: 600;
+            letter-spacing: -0.3px;
+        }
+        
+        h3 {
+            font-size: 17px;
+            color: #4a5568;
+            margin-top: 18px;
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+        
+        h4 {
+            font-size: 15px;
+            color: #4a5568;
+            margin-top: 14px;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+        
+        /* Body Text */
+        p {
+            font-size: 15px;
+            line-height: 1.7;
+            color: #4a5568;
+        }
+        
+        /* Bold-Bullet Structure */
+        .key-statement {
+            font-weight: 700;
+            color: #1a202c;
+            margin-bottom: 6px;
+            font-size: 16px;
+            margin-top: 20px;
+        }
+        
+        .supporting-points {
+            margin-left: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .supporting-points li {
+            margin-bottom: 8px;
+            font-size: 14px;
+            color: #4a5568;
+            line-height: 1.6;
+        }
+        
+        /* SCQA Box */
+        .scqa-box {
+            background: linear-gradient(135deg, #f0f7ff 0%, #f8fbff 100%);
+            border-left: 5px solid #0052cc;
+            padding: 24px;
+            margin: 28px 0;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,82,204,0.08);
+        }
+        
+        .scqa-box h3 {
+            color: #0052cc;
+            margin-top: 0;
+            margin-bottom: 8px;
+            font-size: 15px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .scqa-box p {
+            margin-bottom: 14px;
+            font-size: 14px;
+            line-height: 1.7;
+        }
+        
+        .scqa-box p:last-child {
+            margin-bottom: 0;
+        }
+        
+        /* Transition Box */
+        .transition-box {
+            background: #f7fafc;
+            border-top: 2px solid #e2e8f0;
+            margin-top: 36px;
+            padding: 14px 20px;
+            font-style: italic;
+            color: #4a5568;
+            font-size: 14px;
+            position: absolute;
+            bottom: 60px;
+            left: 0.75in;
+            right: 0.75in;
+            border-radius: 6px;
+        }
+        
+        /* Key Finding Box */
+        .key-finding {
+            background: linear-gradient(135deg, #e6fffa 0%, #f0fffe 100%);
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+            border-left: 4px solid #38b2ac;
+            box-shadow: 0 2px 8px rgba(56,178,172,0.08);
+        }
+        
+        .key-finding .finding-title {
+            font-weight: 700;
+            color: #234e52;
+            font-size: 17px;
+            margin-bottom: 10px;
+        }
+        
+        /* Warning Box */
+        .warning-box {
+            background: linear-gradient(135deg, #fffaf0 0%, #fffdf8 100%);
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+            border-left: 4px solid #ed8936;
+            box-shadow: 0 2px 8px rgba(237,137,54,0.08);
+        }
+        
+        .warning-box .warning-title {
+            font-weight: 700;
+            color: #c05621;
+            font-size: 17px;
+            margin-bottom: 10px;
+        }
+        
+        /* Cost Comparison - Responsive */
+        .cost-comparison {
+            display: flex;
+            justify-content: space-between;
+            margin: 28px 0;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+        
+        .cost-item {
+            flex: 1;
+            min-width: 140px;
+            padding: 22px 16px;
+            text-align: center;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+            transition: transform 0.2s ease;
+        }
+        
+        .cost-item:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 16px rgba(0,0,0,0.12);
+        }
+        
+        .cost-mongodb {
+            background: linear-gradient(135deg, #fff5e6 0%, #fffaf0 100%);
+            border-top: 4px solid #ed8936;
+        }
+        
+        .cost-mongodb-compressed {
+            background: linear-gradient(135deg, #fffbeb 0%, #fffef5 100%);
+            border-top: 4px solid #f6ad55;
+        }
+        
+        .cost-parquet {
+            background: linear-gradient(135deg, #e6fffa 0%, #f0fffe 100%);
+            border-top: 4px solid #38b2ac;
+        }
+        
+        .cost-value {
+            font-size: 28px;
+            font-weight: 700;
+            margin: 8px 0;
+            color: #1a202c;
+        }
+        
+        .cost-label {
+            font-size: 14px;
+            color: #4a5568;
+            line-height: 1.4;
+        }
+        
+        /* Decision Matrix */
+        .decision-matrix {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-size: 14px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        
+        .decision-matrix th {
+            background: #0052cc;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            font-weight: 500;
+            font-size: 13px;
+            letter-spacing: 0.3px;
+        }
+        
+        .decision-matrix td {
+            padding: 11px 12px;
+            border-bottom: 1px solid #e2e8f0;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+        
+        .decision-matrix tr:nth-child(even) {
+            background: #f7fafc;
+        }
+        
+        .decision-matrix tr:hover {
+            background: #edf2f7;
+        }
+        
+        /* Category rows */
+        .decision-matrix td[colspan] {
+            background: #e6f2ff !important;
+            font-weight: 700;
+            color: #0052cc;
+            letter-spacing: 0.3px;
+        }
+        
+        /* Recommendation Box */
+        .final-recommendation {
+            background: linear-gradient(135deg, #0052cc 0%, #0747a6 100%);
+            color: white;
+            padding: 28px;
+            margin: 28px 0;
+            border-radius: 12px;
+            text-align: center;
+            box-shadow: 0 4px 16px rgba(0,82,204,0.2);
+        }
+        
+        .final-recommendation h2 {
+            color: white;
+            margin-top: 0;
+            font-size: 22px;
+            font-weight: 500;
+            letter-spacing: -0.3px;
+        }
+        
+        .final-recommendation p {
+            font-size: 17px;
+            line-height: 1.6;
+            color: white;
+            margin-top: 12px;
+        }
+        
+        /* Next Steps */
+        .next-steps {
+            background: #f7fafc;
+            padding: 24px;
+            border-radius: 10px;
+            margin: 20px 0;
+            border: 1px solid #e2e8f0;
+        }
+        
+        .next-steps h3 {
+            color: #0052cc;
+            margin-bottom: 16px;
+            font-size: 18px;
+        }
+        
+        .timeline-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 14px;
+        }
+        
+        .timeline-marker {
+            background: #0052cc;
+            color: white;
+            padding: 5px 14px;
+            border-radius: 20px;
+            margin-right: 14px;
+            font-weight: 600;
+            font-size: 13px;
+            white-space: nowrap;
+        }
+        
+        /* Section Dividers */
+        .section-divider {
+            height: 9.5in;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+        }
+        
+        .section-number {
+            font-size: 64px;
+            color: #e2e8f0;
+            font-weight: 300;
+            margin-bottom: 20px;
+        }
+        
+        .section-title {
+            font-size: 32px;
+            color: #2d3748;
+            font-weight: 400;
+            margin-bottom: 20px;
+            letter-spacing: -0.5px;
+        }
+        
+        .section-preview {
+            font-size: 17px;
+            color: #4a5568;
+            max-width: 500px;
+            line-height: 1.6;
+        }
+        
+        /* Cost Breakdown Table */
+        .cost-breakdown {
+            background: #f7fafc;
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+            border: 1px solid #e2e8f0;
+        }
+        
+        .cost-breakdown table {
+            width: 100%;
+            font-size: 13px;
+        }
+        
+        .cost-breakdown td {
+            padding: 6px 0;
+            color: #4a5568;
+        }
+        
+        .cost-breakdown .total {
+            font-weight: 700;
+            font-size: 15px;
+            border-top: 2px solid #cbd5e0;
+            padding-top: 10px;
+            color: #1a202c;
+        }
+        
+        /* Compression Process Box */
+        .compression-process {
+            background: linear-gradient(135deg, #e3f2fd 0%, #f3f8fe 100%);
+            padding: 24px;
+            border-radius: 10px;
+            margin: 20px 0;
+            border-left: 5px solid #2196f3;
+            box-shadow: 0 2px 8px rgba(33,150,243,0.08);
+        }
+        
+        .compression-process h3 {
+            color: #1976d2;
+            margin-top: 0;
+            margin-bottom: 14px;
+            font-size: 18px;
+        }
+        
+        /* Cluster Sizing Highlight */
+        .cluster-highlight {
+            background: #fffde7;
+        }
+        
+        .cluster-insufficient {
+            background: #ffebee;
+        }
+        
+        /* Code Blocks - Responsive */
+        pre {
+            font-family: 'Monaco', 'Consolas', 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.5;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            max-width: 100%;
+        }
+        
+        /* Table Responsive Handling */
+        .table-wrapper {
+            overflow-x: auto;
+            margin: 20px 0;
+        }
+        
+        .decision-matrix {
+            min-width: 100%;
+        }
+        
+        /* Small adjustments for better fit */
+        @media screen and (max-width: 8.5in) {
+            .cost-comparison {
+                flex-direction: column;
+            }
+            
+            .cost-item {
+                width: 100%;
+                margin-bottom: 12px;
+            }
+        }
+        
+        /* Print-specific adjustments */
+        @media print {
+            .decision-matrix {
+                font-size: 12px;
+            }
+            
+            .decision-matrix th,
+            .decision-matrix td {
+                padding: 8px;
+            }
+            
+            pre {
+                font-size: 11px;
+            }
+            
+            .cost-value {
+                font-size: 24px;
+            }
+        }
+        
+        /* Professional touches */
+        ::selection {
+            background: #0052cc;
+            color: white;
+        }
+        
+        /* Smooth scroll for digital viewing */
+        html {
+            scroll-behavior: smooth;
+        }
+        
+        /* Scroll offset for fixed header */
+        [id] {
+            scroll-margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <!-- Table of Contents -->
+    <nav class="toc-container no-print" id="toc">
+        <button class="toc-close" onclick="toggleTOC()">×</button>
+        <div class="toc-header">
+            <h2>Table of Contents</h2>
+        </div>
+        <div class="toc-content">
+            <div class="toc-section">
+                <div class="toc-section-title" onclick="scrollToSection('title-page')">Title Page</div>
+            </div>
+            
+            <div class="toc-section">
+                <div class="toc-section-title" onclick="scrollToSection('executive-summary')">Executive Summary</div>
+                <div class="toc-subsection">
+                    <a class="toc-link" onclick="scrollToSection('cost-comparison-section')">Cost Comparison</a>
+                    <a class="toc-link" onclick="scrollToSection('parquet-breakdown')">Parquet Cost Breakdown</a>
+                </div>
+            </div>
+            
+            <div class="toc-section">
+                <div class="toc-section-title" onclick="scrollToSection('section-1')">1. Understanding Cost Drivers</div>
+                <div class="toc-subsection">
+                    <a class="toc-link" onclick="scrollToSection('mongodb-design')">MongoDB's Operational Design</a>
+                    <a class="toc-link" onclick="scrollToSection('compression-impact')">Compression Impact</a>
+                </div>
+            </div>
+            
+            <div class="toc-section">
+                <div class="toc-section-title" onclick="scrollToSection('section-2')">2. MongoDB Cluster Sizing</div>
+                <div class="toc-subsection">
+                    <a class="toc-link" onclick="scrollToSection('wiredtiger-compression')">WiredTiger Compression</a>
+                    <a class="toc-link" onclick="scrollToSection('cluster-sizing-table')">Cluster Sizing Details</a>
+                </div>
+            </div>
+            
+            <div class="toc-section">
+                <div class="toc-section-title" onclick="scrollToSection('section-3')">3. Migration Challenges</div>
+                <div class="toc-subsection">
+                    <a class="toc-link" onclick="scrollToSection('bson-limitation')">BSON Format Lock-in</a>
+                    <a class="toc-link" onclick="scrollToSection('migration-complexity')">Migration Complexity</a>
+                </div>
+            </div>
+            
+            <div class="toc-section">
+                <div class="toc-section-title" onclick="scrollToSection('section-4')">4. Query Performance</div>
+                <div class="toc-subsection">
+                    <a class="toc-link" onclick="scrollToSection('columnar-advantage')">Columnar Storage Benefits</a>
+                    <a class="toc-link" onclick="scrollToSection('performance-comparison')">Performance Analysis</a>
+                </div>
+            </div>
+            
+            <div class="toc-section">
+                <div class="toc-section-title" onclick="scrollToSection('section-5')">5. Financial Analysis</div>
+                <div class="toc-subsection">
+                    <a class="toc-link" onclick="scrollToSection('5-year-tco')">5-Year TCO Comparison</a>
+                    <a class="toc-link" onclick="scrollToSection('break-even-analysis')">Break-even Analysis</a>
+                </div>
+            </div>
+            
+            <div class="toc-section">
+                <div class="toc-section-title" onclick="scrollToSection('section-6')">6. Comprehensive Comparison</div>
+                <div class="toc-subsection">
+                    <a class="toc-link" onclick="scrollToSection('solution-matrix')">Solution Matrix</a>
+                </div>
+            </div>
+            
+            <div class="toc-section">
+                <div class="toc-section-title" onclick="scrollToSection('section-7')">7. Cloud Integration</div>
+                <div class="toc-subsection">
+                    <a class="toc-link" onclick="scrollToSection('platform-comparison')">Platform Integration</a>
+                    <a class="toc-link" onclick="scrollToSection('mongodb-limitations')">MongoDB Limitations</a>
+                </div>
+            </div>
+            
+            <div class="toc-section">
+                <div class="toc-section-title" onclick="scrollToSection('section-8')">8. Risk Analysis</div>
+                <div class="toc-subsection">
+                    <a class="toc-link" onclick="scrollToSection('risk-mitigation')">Risk Mitigation</a>
+                    <a class="toc-link" onclick="scrollToSection('backup-strategy')">Backup Strategy</a>
+                </div>
+            </div>
+            
+            <div class="toc-section">
+                <div class="toc-section-title" onclick="scrollToSection('final-recommendation')">Final Recommendation</div>
+                <div class="toc-subsection">
+                    <a class="toc-link" onclick="scrollToSection('implementation-timeline')">Implementation Timeline</a>
+                    <a class="toc-link" onclick="scrollToSection('success-metrics')">Success Metrics</a>
+                </div>
+            </div>
+            
+            <div class="toc-section">
+                <div class="toc-section-title" onclick="scrollToSection('bonus-section')">Bonus: Technical Deep Dive</div>
+                <div class="toc-subsection">
+                    <a class="toc-link" onclick="scrollToSection('bson-architecture')">BSON Architecture</a>
+                    <a class="toc-link" onclick="scrollToSection('parquet-architecture')">Parquet Architecture</a>
+                    <a class="toc-link" onclick="scrollToSection('technical-comparison')">Technical Comparison</a>
+                </div>
+            </div>
+        </div>
+    </nav>
+    
+    <!-- Toggle button for mobile -->
+    <button class="toc-toggle no-print" onclick="toggleTOC()">☰ Table of Contents</button>
+    
+    <!-- Main Content -->
+    <div class="main-content">
+        <!-- Title Page -->
+        <div class="page" id="title-page">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="title-page">
+                <h1>Data Archival Strategy Analysis</h1>
+                <div class="subtitle">MongoDB Atlas vs. Parquet Files<br>for 345GB Time Series Data</div>
+                <div class="date">Executive Decision Brief<br>June 2025<br><em>Updated with Detailed Cluster Sizing Analysis</em></div>
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- Executive Summary with SCQA -->
+        <div class="page" id="executive-summary">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator">1 of 17</div>
+            <h1 class="action-title">Parquet files deliver 96% cost savings compared to MongoDB for archival storage accessed 1-4 times annually</h1>
+            
+            <div class="scqa-box">
+                <h3>Situation</h3>
+                <p>We need to archive 345GB of time series data from Oracle for 1-2 years before migrating to an undetermined cloud platform.</p>
+                
+                <h3>Complication</h3>
+                <p>MongoDB Atlas requires $86,400 over 5 years (compressed) for data accessed only 1-4 times annually.</p>
+                
+                <h3>Question</h3>
+                <p>Should we invest in a managed database service or use file-based storage for rarely accessed archival data?</p>
+                
+                <h3>Answer</h3>
+                <p><strong>Parquet files on network storage provide the optimal solution at $3,450 total cost with superior migration flexibility.</strong></p>
+            </div>
+
+            <div class="cost-comparison" id="cost-comparison-section">
+                <div class="cost-item cost-mongodb">
+                    <div class="cost-label">MongoDB<br>(Uncompressed)</div>
+                    <div class="cost-value">$320K</div>
+                    <div class="cost-label">5-Year TCO</div>
+                </div>
+                <div class="cost-item cost-mongodb-compressed">
+                    <div class="cost-label">MongoDB<br>(Compressed)</div>
+                    <div class="cost-value">$86K</div>
+                    <div class="cost-label">5-Year TCO</div>
+                </div>
+                <div class="cost-item cost-parquet">
+                    <div class="cost-label">Parquet<br>Files</div>
+                    <div class="cost-value">$3.5K</div>
+                    <div class="cost-label">5-Year TCO</div>
+                </div>
+            </div>
+
+            <div class="cost-breakdown" id="parquet-breakdown">
+                <h4>Parquet Cost Breakdown:</h4>
+                <table>
+                    <tr><td>NAS Hardware (4-bay, 4TB drives):</td><td style="text-align: right;">$1,200</td></tr>
+                    <tr><td>Initial Setup & Configuration:</td><td style="text-align: right;">$400</td></tr>
+                    <tr><td>Cloud Backup (Backblaze B2):</td><td style="text-align: right;">$105 (5 years @ $21/yr)</td></tr>
+                    <tr><td>Power & Maintenance:</td><td style="text-align: right;">$1,745 (5 years @ $349/yr)</td></tr>
+                    <tr class="total"><td>Total 5-Year Cost:</td><td style="text-align: right;">$3,450</td></tr>
+                </table>
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- Section 1: The Cost Driver Analysis -->
+        <div class="page" id="section-1">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="section-divider">
+                <div class="section-number">1</div>
+                <div class="section-title">Understanding the Cost Drivers</div>
+                <div class="section-preview">Why MongoDB costs 25x more than Parquet for archival storage</div>
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <div class="page" id="mongodb-design">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator">2 of 17</div>
+            <h1 class="action-title">MongoDB's operational design creates unnecessary costs for archival workloads</h1>
+
+            <p class="key-statement">MongoDB was designed for active applications, not archival storage</p>
+            <ul class="supporting-points">
+                <li>24/7 cluster availability for data accessed 4 times yearly</li>
+                <li>Real-time performance capabilities unused in archival scenarios</li>
+                <li>High availability features unnecessary for batch queries</li>
+            </ul>
+
+            <p class="key-statement" id="compression-impact">Compression reduces but doesn't eliminate the fundamental mismatch</p>
+            <ul class="supporting-points">
+                <li>Zstd compression: 345GB → 140-170GB (2-2.5x reduction)</li>
+                <li>Enables smaller M50 cluster at $1,440/month vs. M80 at $5,329/month</li>
+                <li>Still paying $17,280 annually for inactive infrastructure</li>
+            </ul>
+
+            <div class="key-finding">
+                <div class="finding-title">Key Insight</div>
+                You're paying for a Ferrari to sit in a garage—the capability exists but goes unused.
+            </div>
+
+            <div class="table-wrapper">
+                <table class="decision-matrix">
+                    <tr>
+                        <th>Storage Aspect</th>
+                        <th>Your Requirement</th>
+                        <th>MongoDB Provides</th>
+                        <th>Cost Impact</th>
+                    </tr>
+                    <tr>
+                        <td>Access Frequency</td>
+                        <td>1-4 times/year</td>
+                        <td>Millisecond access 24/7</td>
+                        <td>$$$</td>
+                    </tr>
+                    <tr>
+                        <td>Query Pattern</td>
+                        <td>Batch analytics</td>
+                        <td>Real-time CRUD</td>
+                        <td>$$$</td>
+                    </tr>
+                    <tr>
+                        <td>Data Modification</td>
+                        <td>Read-only archive</td>
+                        <td>Full update capability</td>
+                        <td>$$</td>
+                    </tr>
+                    <tr>
+                        <td>Availability</td>
+                        <td>Business hours</td>
+                        <td>99.995% uptime SLA</td>
+                        <td>$$$</td>
+                    </tr>
+                </table>
+            </div>
+
+            <div class="transition-box">
+                This operational overhead explains the cost, but let's examine exactly how MongoDB's compression works and what cluster sizes you'll need...
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- MongoDB Cluster Sizing and Compression Details -->
+        <div class="page" id="section-2">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="section-divider">
+                <div class="section-number">2</div>
+                <div class="section-title">MongoDB Cluster Sizing & Compression</div>
+                <div class="section-preview">Understanding WiredTiger compression and cluster requirements</div>
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <div class="page" id="wiredtiger-compression">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator">3 of 17</div>
+            <h1 class="action-title">MongoDB's WiredTiger storage engine provides automatic compression but cluster sizing depends on compressed data volume</h1>
+
+            <div class="compression-process">
+                <h3>🔧 How MongoDB Compression Works</h3>
+                <p><strong>Storage Engine:</strong> WiredTiger (MongoDB's default storage engine since v3.2)</p>
+                <p><strong>Compression Timing:</strong> Automatic during data insertion - no manual intervention required</p>
+                <p><strong>Compression Algorithms Available:</strong></p>
+                <ul style="margin-left: 20px;">
+                    <li><strong>Snappy (default):</strong> 1.5-2x compression, minimal CPU overhead (~5%)</li>
+                    <li><strong>Zstd (recommended for archival):</strong> 2-2.5x compression, moderate CPU overhead (5-15%)</li>
+                    <li><strong>Zlib:</strong> 2-2.8x compression, higher CPU overhead (10-20%)</li>
+                </ul>
+                <p style="margin-top: 15px;"><strong>Configuration:</strong> Set at collection level during creation or migration</p>
+                <pre style="background: white; padding: 10px; border-radius: 5px; font-size: 12px; margin-top: 10px;">
+db.createCollection("timeseries", {
+    storageEngine: {
+        wiredTiger: {
+            configString: "block_compressor=zstd"
+        }
+    }
+})</pre>
+            </div>
+
+            <h2 id="cluster-sizing-table">Detailed Cluster Sizing Based on Data Volume</h2>
+            
+            <div class="table-wrapper">
+                <table class="decision-matrix">
+                    <tr>
+                        <th>Tier</th>
+                        <th>RAM</th>
+                        <th>Storage</th>
+                        <th>vCPUs</th>
+                        <th>Monthly</th>
+                        <th>Annual</th>
+                        <th>345GB</th>
+                        <th>140-170GB</th>
+                    </tr>
+                    <tr>
+                        <td>M10</td>
+                        <td>2 GB</td>
+                        <td>10 GB</td>
+                        <td>2</td>
+                        <td>$58</td>
+                        <td>$696</td>
+                        <td class="cluster-insufficient">❌</td>
+                        <td class="cluster-insufficient">❌</td>
+                    </tr>
+                    <tr>
+                        <td>M20</td>
+                        <td>4 GB</td>
+                        <td>20 GB</td>
+                        <td>2</td>
+                        <td>$196</td>
+                        <td>$2,352</td>
+                        <td class="cluster-insufficient">❌</td>
+                        <td class="cluster-insufficient">❌</td>
+                    </tr>
+                    <tr>
+                        <td>M30</td>
+                        <td>8 GB</td>
+                        <td>40 GB</td>
+                        <td>2</td>
+                        <td>$390</td>
+                        <td>$4,680</td>
+                        <td class="cluster-insufficient">❌</td>
+                        <td class="cluster-insufficient">❌</td>
+                    </tr>
+                    <tr>
+                        <td>M40</td>
+                        <td>16 GB</td>
+                        <td>80 GB</td>
+                        <td>4</td>
+                        <td>$749</td>
+                        <td>$8,988</td>
+                        <td class="cluster-insufficient">❌</td>
+                        <td class="cluster-insufficient">❌</td>
+                    </tr>
+                    <tr class="cluster-highlight">
+                        <td><strong>M50</strong></td>
+                        <td><strong>32 GB</strong></td>
+                        <td><strong>160 GB</strong></td>
+                        <td><strong>8</strong></td>
+                        <td><strong>$1,440</strong></td>
+                        <td><strong>$17,280</strong></td>
+                        <td class="cluster-insufficient">❌</td>
+                        <td style="background: #c8e6c9;"><strong>✅ Min</strong></td>
+                    </tr>
+                    <tr>
+                        <td>M60</td>
+                        <td>64 GB</td>
+                        <td>320 GB</td>
+                        <td>16</td>
+                        <td>$2,846</td>
+                        <td>$34,152</td>
+                        <td class="cluster-insufficient">❌</td>
+                        <td style="background: #e8f5e9;">✅ Good</td>
+                    </tr>
+                    <tr class="cluster-highlight">
+                        <td><strong>M80</strong></td>
+                        <td><strong>128 GB</strong></td>
+                        <td><strong>750 GB</strong></td>
+                        <td><strong>32</strong></td>
+                        <td><strong>$5,329</strong></td>
+                        <td><strong>$63,948</strong></td>
+                        <td style="background: #c8e6c9;"><strong>✅ Req</strong></td>
+                        <td style="background: #e8f5e9;">✅ Over</td>
+                    </tr>
+                </table>
+            </div>
+
+            <div class="warning-box">
+                <div class="warning-title">Critical Sizing Considerations</div>
+                <ul>
+                    <li><strong>Working Set Memory:</strong> MongoDB stores data uncompressed in RAM for performance</li>
+                    <li><strong>Index Memory:</strong> Indexes must fit in RAM for optimal performance (typically 10-15% of data size)</li>
+                    <li><strong>Buffer Overhead:</strong> Need 20-30% free storage for WiredTiger operations</li>
+                    <li><strong>Compression Variability:</strong> Time series data typically achieves 2-2.5x with Zstd, but results vary</li>
+                </ul>
+            </div>
+
+            <p class="key-statement">Migration Process with Automatic Compression</p>
+            <ul class="supporting-points">
+                <li><strong>Oracle Export:</strong> Extract data using native tools or MongoDB migration tools</li>
+                <li><strong>MongoDB Import:</strong> Data compressed automatically during insertion</li>
+                <li><strong>No Manual Steps:</strong> WiredTiger handles compression transparently</li>
+                <li><strong>Performance Impact:</strong> 5-15% slower ingestion with Zstd vs. uncompressed</li>
+            </ul>
+
+            <div class="key-finding">
+                <div class="finding-title">Compression Reality Check</div>
+                <p>Your options with 345GB of raw data:</p>
+                <ul style="margin-top: 10px;">
+                    <li><strong>Without compression:</strong> M80 cluster required = $63,948/year</li>
+                    <li><strong>With Zstd compression (2.2x):</strong> M50 cluster sufficient = $17,280/year</li>
+                    <li><strong>If compression underperforms (1.5x):</strong> M60 cluster needed = $34,152/year</li>
+                    <li><strong>Risk:</strong> If compression fails to meet expectations, costs double</li>
+                </ul>
+            </div>
+
+            <div class="transition-box">
+                While compression helps reduce costs, there's a deeper technical challenge that affects your future migration plans...
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- Format Lock-in Risk -->
+        <div class="page" id="section-3">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="section-divider">
+                <div class="section-number">3</div>
+                <div class="section-title">The Hidden Migration Challenge</div>
+                <div class="section-preview">How storage format choice impacts your cloud platform migration</div>
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <div class="page" id="bson-limitation">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator">4 of 17</div>
+            <h1 class="action-title">MongoDB's BSON format creates a 24-48 hour migration bottleneck to cloud platforms</h1>
+
+            <div class="warning-box">
+                <div class="warning-title">Critical Limitation</div>
+                MongoDB stores ALL data in BSON format—it cannot store or serve Parquet files as columnar data. Even if you use GridFS to store Parquet files, they are converted to binary chunks and lose all columnar query benefits.
+            </div>
+
+            <p class="key-statement">Every major cloud platform expects Parquet as the standard format</p>
+            <ul class="supporting-points">
+                <li>Snowflake, Databricks, BigQuery: Native Parquet support</li>
+                <li>AWS Athena: Cannot query MongoDB directly</li>
+                <li>Azure Synapse: Requires expensive transformation pipelines</li>
+            </ul>
+
+            <p class="key-statement">MongoDB is NOT an object storage service</p>
+            <ul class="supporting-points">
+                <li>MongoDB is a database that stores documents in BSON format</li>
+                <li>GridFS splits files into 255KB chunks stored as BSON documents</li>
+                <li>Cannot act as S3-compatible storage or serve files in their original format</li>
+                <li>All data must be extracted and transformed for analytical platforms</li>
+            </ul>
+
+            <p class="key-statement" id="migration-complexity">Migration complexity differs dramatically between formats</p>
+            
+            <div style="display: flex; gap: 24px; margin: 28px 0; flex-wrap: wrap;">
+                <div style="flex: 1; min-width: 250px;">
+                    <h3 style="color: #ed8936;">MongoDB Migration Process</h3>
+                    <ol style="background: #fff3e0; padding: 20px; border-radius: 10px; list-style-position: inside;">
+                        <li>Export from MongoDB (12-24 hours)</li>
+                        <li>Transform BSON to Parquet (6-12 hours)</li>
+                        <li>Upload to cloud platform (6-12 hours)</li>
+                        <li style="margin-top: 10px;">Total: <strong>24-48 hours + complexity</strong></li>
+                    </ol>
+                </div>
+                <div style="flex: 1; min-width: 250px;">
+                    <h3 style="color: #38b2ac;">Parquet Migration Process</h3>
+                    <ol style="background: #e6fffa; padding: 20px; border-radius: 10px; list-style-position: inside;">
+                        <li>Upload files to cloud (2-6 hours)</li>
+                        <li>Register in catalog (minutes)</li>
+                        <li>Ready to query</li>
+                        <li style="margin-top: 10px;">Total: <strong>2-6 hours, simple copy</strong></li>
+                    </ol>
+                </div>
+            </div>
+
+            <div class="key-finding">
+                <div class="finding-title">Migration Speed Impact</div>
+                Parquet migrates 8-10x faster with zero transformation risk. This difference compounds with larger datasets.
+            </div>
+
+            <div class="transition-box">
+                Beyond migration complexity, let's examine how these formats affect your day-to-day query performance...
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- Query Performance Analysis -->
+        <div class="page" id="section-4">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="section-divider">
+                <div class="section-number">4</div>
+                <div class="section-title">Analytical Query Performance</div>
+                <div class="section-preview">Why columnar storage delivers 40-50x faster analytics</div>
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <div class="page" id="columnar-advantage">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator">5 of 17</div>
+            <h1 class="action-title">Parquet's columnar format delivers 40-50x faster analytical queries by reading only required data</h1>
+
+            <p class="key-statement" id="performance-comparison">Example query: "Average temperature in January 2024"</p>
+            
+            <div style="display: flex; gap: 20px; margin: 28px 0; flex-wrap: wrap;">
+                <div style="flex: 1; min-width: 250px; background: #fff3e0; padding: 20px; border-radius: 10px; border-top: 4px solid #ed8936;">
+                    <h3 style="color: #ed8936; margin-top: 0;">MongoDB Query Process</h3>
+                    <p><strong>Data Read:</strong> 140-170GB (entire compressed dataset)</p>
+                    <p><strong>Process:</strong></p>
+                    <ol style="margin-left: 20px; font-size: 14px;">
+                        <li>Decompress document blocks</li>
+                        <li>Parse each BSON document</li>
+                        <li>Extract temperature field</li>
+                        <li>Filter by date range</li>
+                        <li>Calculate average</li>
+                    </ol>
+                    <p><strong>Time:</strong> 10-15 minutes</p>
+                </div>
+                <div style="flex: 1; min-width: 250px; background: #e6fffa; padding: 20px; border-radius: 10px; border-top: 4px solid #38b2ac;">
+                    <h3 style="color: #38b2ac; margin-top: 0;">Parquet Query Process</h3>
+                    <p><strong>Data Read:</strong> 3.5GB (only temperature column)</p>
+                    <p><strong>Process:</strong></p>
+                    <ol style="margin-left: 20px; font-size: 14px;">
+                        <li>Read column metadata</li>
+                        <li>Load temperature column only</li>
+                        <li>Apply date predicate pushdown</li>
+                        <li>Calculate average</li>
+                        <li style="text-decoration: line-through; color: #999;">Parse other fields</li>
+                    </ol>
+                    <p><strong>Time:</strong> 15-20 seconds</p>
+                </div>
+            </div>
+
+            <div class="key-finding">
+                <div class="finding-title">Performance Mathematics</div>
+                Reading 3.5GB vs 170GB = 48x less data processed = 40-50x faster queries
+            </div>
+
+            <p class="key-statement">Your team already uses the optimal tools for Parquet</p>
+            <ul class="supporting-points">
+                <li>Pandas with PyArrow: Native columnar processing</li>
+                <li>Zero learning curve: Same DataFrame interface</li>
+                <li>Direct file access: No database connection needed</li>
+            </ul>
+
+            <div style="background: #e3f2fd; padding: 18px; border-radius: 8px; margin: 24px 0; border-left: 4px solid #2196f3;">
+                <p style="margin: 0; font-size: 14px; color: #1565c0;">
+                    <strong>📊 Want the Technical Details?</strong> See the <strong>Bonus Technical Deep Dive</strong> section at the end of this document for detailed architectural comparisons, query execution flows, and performance benchmarks that support these 40-50x performance improvements.
+                </p>
+            </div>
+
+            <div class="transition-box">
+                Given these technical advantages, let's examine the complete financial picture over your 5-year horizon...
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- Total Cost Analysis -->
+        <div class="page" id="section-5">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="section-divider">
+                <div class="section-number">5</div>
+                <div class="section-title">5-Year Financial Analysis</div>
+                <div class="section-preview">Breaking down total cost of ownership</div>
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <div class="page" id="5-year-tco">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator">6 of 17</div>
+            <h1 class="action-title">Parquet saves $82,950 over compressed MongoDB across 5 years with minimal ongoing costs</h1>
+
+            <div class="table-wrapper">
+                <table class="decision-matrix">
+                    <tr>
+                        <th>Cost Component</th>
+                        <th>MongoDB Compressed</th>
+                        <th>Parquet Files</th>
+                        <th>Savings</th>
+                    </tr>
+                    <tr>
+                        <td>Initial Setup</td>
+                        <td>$0</td>
+                        <td>$1,600</td>
+                        <td>-$1,600</td>
+                    </tr>
+                    <tr>
+                        <td>Monthly Infrastructure</td>
+                        <td>$1,440</td>
+                        <td>$0</td>
+                        <td>$1,440</td>
+                    </tr>
+                    <tr>
+                        <td>Annual Backup</td>
+                        <td>Included</td>
+                        <td>$21</td>
+                        <td>-$21</td>
+                    </tr>
+                    <tr>
+                        <td>Power & Maintenance</td>
+                        <td>$0 (cloud)</td>
+                        <td>$349/year</td>
+                        <td>-$349</td>
+                    </tr>
+                    <tr>
+                        <td>5-Year Total</td>
+                        <td><strong>$86,400</strong></td>
+                        <td><strong>$3,450</strong></td>
+                        <td><strong>$82,950</strong></td>
+                    </tr>
+                </table>
+            </div>
+
+            <div class="cost-breakdown">
+                <h4>Detailed Parquet Cost Components:</h4>
+                <table>
+                    <tr><td>4-bay NAS (QNAP TS-453D):</td><td style="text-align: right;">$600</td></tr>
+                    <tr><td>4 × 4TB NAS drives (WD Red):</td><td style="text-align: right;">$600</td></tr>
+                    <tr><td>Professional setup & RAID config:</td><td style="text-align: right;">$400</td></tr>
+                    <tr><td>Backblaze B2 backup (70GB):</td><td style="text-align: right;">$21/year × 5 = $105</td></tr>
+                    <tr><td>Electricity (~50W continuous):</td><td style="text-align: right;">$65/year × 5 = $325</td></tr>
+                    <tr><td>Maintenance & replacement reserve:</td><td style="text-align: right;">$284/year × 5 = $1,420</td></tr>
+                    <tr class="total"><td>Total:</td><td style="text-align: right;">$3,450</td></tr>
+                </table>
+            </div>
+
+            <p class="key-statement" id="break-even-analysis">Break-even analysis reveals the access pattern threshold</p>
+            <ul class="supporting-points">
+                <li>Current usage: 1-4 queries annually</li>
+                <li>MongoDB break-even: 50+ queries annually</li>
+                <li>Gap: 12-50x more usage needed to justify MongoDB</li>
+            </ul>
+
+            <div class="key-finding">
+                <div class="finding-title">Alternative Cloud Storage Options</div>
+                <p>If local storage concerns exist:</p>
+                <ul style="margin-top: 10px;">
+                    <li>AWS S3 Glacier Instant: $720 over 5 years</li>
+                    <li>Azure Cool Storage: $900 over 5 years</li>
+                    <li>Still 99% cheaper than MongoDB</li>
+                </ul>
+            </div>
+
+            <div class="transition-box">
+                With the financial case clear, let's examine a comprehensive comparison of all options...
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- Comprehensive Comparison -->
+        <div class="page" id="section-6">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="section-divider">
+                <div class="section-number">6</div>
+                <div class="section-title">Comprehensive Solution Comparison</div>
+                <div class="section-preview">Side-by-side analysis of all options</div>
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <div class="page" id="solution-matrix">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator">7 of 17</div>
+            <h1 class="action-title">Comprehensive comparison reveals Parquet's superiority across all key decision factors</h1>
+
+            <div class="table-wrapper">
+                <table class="decision-matrix" style="font-size: 13px;">
+                    <tr>
+                        <th style="width: 25%;">Factor</th>
+                        <th style="width: 25%;">MongoDB Uncompressed</th>
+                        <th style="width: 25%;">MongoDB Compressed</th>
+                        <th style="width: 25%;">Parquet Files</th>
+                    </tr>
+                    <tr>
+                        <td colspan="4" style="font-weight: 700; color: #0052cc;">💰 Cost Analysis</td>
+                    </tr>
+                    <tr>
+                        <td>Required Infrastructure</td>
+                        <td>M80 Cluster (128GB RAM)</td>
+                        <td>M50 Cluster (32GB RAM)</td>
+                        <td>4-bay NAS + 16TB storage</td>
+                    </tr>
+                    <tr>
+                        <td>Monthly Cost</td>
+                        <td>$5,329</td>
+                        <td>$1,440</td>
+                        <td>$29 (power/maint)</td>
+                    </tr>
+                    <tr>
+                        <td>5-Year TCO</td>
+                        <td style="color: #d32f2f; font-weight: 700;">$319,740</td>
+                        <td style="color: #f57c00; font-weight: 700;">$86,400</td>
+                        <td style="color: #388e3c; font-weight: 700;">$3,450</td>
+                    </tr>
+                    <tr>
+                        <td colspan="4" style="font-weight: 700; color: #0052cc;">📊 Storage Characteristics</td>
+                    </tr>
+                    <tr>
+                        <td>Storage Size</td>
+                        <td>345GB</td>
+                        <td>140-170GB</td>
+                        <td>35-70GB*</td>
+                    </tr>
+                    <tr>
+                        <td>Compression Ratio</td>
+                        <td>None</td>
+                        <td>2-2.5x (Zstd)</td>
+                        <td>5-10x (Snappy/Gzip)*</td>
+                    </tr>
+                    <tr>
+                        <td>Storage Format</td>
+                        <td>BSON (row-based)</td>
+                        <td>BSON (row-based)</td>
+                        <td>Columnar</td>
+                    </tr>
+                    <tr>
+                        <td colspan="4" style="font-weight: 700; color: #0052cc;">⚡ Performance</td>
+                    </tr>
+                    <tr>
+                        <td>Query Response Time</td>
+                        <td>2-5 seconds</td>
+                        <td>3-8 seconds</td>
+                        <td>15-30 seconds</td>
+                    </tr>
+                    <tr>
+                        <td>Analytical Query Speed</td>
+                        <td>Slow (full scan)</td>
+                        <td>Slow (decompress + scan)</td>
+                        <td>Fast (columnar)</td>
+                    </tr>
+                    <tr>
+                        <td colspan="4" style="font-weight: 700; color: #0052cc;">🔧 Operational</td>
+                    </tr>
+                    <tr>
+                        <td>Maintenance Required</td>
+                        <td>None (managed)</td>
+                        <td>None (managed)</td>
+                        <td>Minimal</td>
+                    </tr>
+                    <tr>
+                        <td>Availability SLA</td>
+                        <td>99.995%</td>
+                        <td>99.995%</td>
+                        <td>99% (RAID 5)</td>
+                    </tr>
+                    <tr>
+                        <td colspan="4" style="font-weight: 700; color: #0052cc;">☁️ Cloud Migration</td>
+                    </tr>
+                    <tr>
+                        <td>Migration Time</td>
+                        <td>24-48 hours</td>
+                        <td>18-36 hours</td>
+                        <td>2-6 hours</td>
+                    </tr>
+                    <tr>
+                        <td>Format Conversion</td>
+                        <td>Required (BSON→Parquet)</td>
+                        <td>Required (BSON→Parquet)</td>
+                        <td>None needed</td>
+                    </tr>
+                    <tr style="background: #e6fffa;">
+                        <td colspan="4" style="font-weight: 700; color: #234e52;">✅ Best For</td>
+                    </tr>
+                    <tr>
+                        <td>Ideal Use Case</td>
+                        <td>Active applications</td>
+                        <td>Active apps with large data</td>
+                        <td style="font-weight: 700;">Archival storage</td>
+                    </tr>
+                </table>
+            </div>
+
+            <p style="font-size: 12px; color: #718096; margin-top: 10px;">
+                *Compression ratios vary based on data characteristics. Time series data with repeated patterns typically achieves 5-10x compression with columnar formats.
+            </p>
+
+            <div class="key-finding">
+                <div class="finding-title">Decision Matrix Summary</div>
+                <p>Parquet excels in every metric that matters for archival storage: cost (96% savings), compression (5-10x), migration speed (8x faster), and analytical performance (40x faster). MongoDB's advantages (real-time access, high availability) are unused in archival scenarios.</p>
+            </div>
+
+            <div class="transition-box">
+                This comparison clearly favors Parquet, but let's examine how each solution integrates with modern data platforms...
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- Data Lake Integration -->
+        <div class="page" id="section-7">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="section-divider">
+                <div class="section-number">7</div>
+                <div class="section-title">Cloud Data Platform Integration</div>
+                <div class="section-preview">How MongoDB and Parquet connect to modern data lakes</div>
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <div class="page" id="platform-comparison">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator">8 of 17</div>
+            <h1 class="action-title">All major data platforms provide native Parquet support while MongoDB requires complex ETL pipelines</h1>
+
+            <p class="key-statement">Data platform integration capabilities comparison</p>
+            
+            <div class="table-wrapper">
+                <table class="decision-matrix">
+                    <tr>
+                        <th>Platform</th>
+                        <th>Parquet Integration</th>
+                        <th>MongoDB Integration</th>
+                        <th>Migration Time</th>
+                    </tr>
+                    <tr>
+                        <td><strong>AWS Data Lake</strong></td>
+                        <td>✅ Direct S3 upload<br>✅ Athena queries instantly<br>✅ Glue auto-cataloging</td>
+                        <td>⚠️ AWS DMS required<br>⚠️ Transform to Parquet<br>⚠️ EMR for processing</td>
+                        <td>Parquet: 2 hrs<br>MongoDB: 24 hrs</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Azure Data Lake</strong></td>
+                        <td>✅ Direct ADLS upload<br>✅ Synapse native support<br>✅ Auto-schema detection</td>
+                        <td>⚠️ Azure Data Factory<br>⚠️ Format conversion<br>⚠️ Databricks required</td>
+                        <td>Parquet: 3 hrs<br>MongoDB: 18 hrs</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Google Cloud</strong></td>
+                        <td>✅ GCS direct upload<br>✅ BigQuery external tables<br>✅ Dataproc ready</td>
+                        <td>⚠️ Dataflow pipeline<br>⚠️ BSON transformation<br>⚠️ Complex scheduling</td>
+                        <td>Parquet: 2 hrs<br>MongoDB: 20 hrs</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Snowflake</strong></td>
+                        <td>✅ COPY INTO command<br>✅ Auto-compression<br>✅ Time travel support</td>
+                        <td>⚠️ Kafka connector<br>⚠️ JSON transformation<br>⚠️ Staging required</td>
+                        <td>Parquet: 1 hr<br>MongoDB: 12 hrs</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Databricks</strong></td>
+                        <td>✅ Delta Lake native<br>✅ Direct file access<br>✅ Auto-optimization</td>
+                        <td>⚠️ Spark connector<br>⚠️ RDD transformation<br>⚠️ Memory intensive</td>
+                        <td>Parquet: 1 hr<br>MongoDB: 8 hrs</td>
+                    </tr>
+                </table>
+            </div>
+
+            <div class="warning-box" id="mongodb-limitations">
+                <div class="warning-title">Critical MongoDB Limitation</div>
+                <p>MongoDB is a database, NOT an object storage service. Key facts:</p>
+                <ul style="margin-top: 10px;">
+                    <li>MongoDB stores all data in BSON format within collections</li>
+                    <li>GridFS splits files into 255KB chunks stored as BSON documents</li>
+                    <li>Parquet files stored in GridFS lose ALL columnar benefits</li>
+                    <li>Cannot serve as S3-compatible storage or maintain original file formats</li>
+                    <li>Every cloud platform requires BSON-to-Parquet transformation</li>
+                </ul>
+            </div>
+
+            <p class="key-statement">Parquet migration is simply copying files</p>
+            
+            <div style="display: flex; gap: 20px; margin: 28px 0; flex-wrap: wrap;">
+                <div style="flex: 1; min-width: 280px; background: #e6fffa; padding: 20px; border-radius: 10px;">
+                    <h3 style="color: #38b2ac; margin-top: 0;">Parquet to Any Platform</h3>
+                    <pre style="background: #f5f5f5; padding: 14px; border-radius: 5px; font-size: 12px;">
+# AWS
+aws s3 cp data/*.parquet s3://bucket/
+
+# Azure  
+azcopy copy 'data/*.parquet' \
+  'https://storage.blob.core.windows.net/container'
+
+# GCP
+gsutil -m cp data/*.parquet gs://bucket/
+
+# Snowflake
+COPY INTO table FROM @stage 
+FILE_FORMAT = (TYPE = PARQUET);
+
+# Databricks
+df = spark.read.parquet("/mnt/data/*.parquet")
+</pre>
+                </div>
+                <div style="flex: 1; min-width: 280px; background: #fff3e0; padding: 20px; border-radius: 10px;">
+                    <h3 style="color: #ed8936; margin-top: 0;">MongoDB to Any Platform</h3>
+                    <pre style="background: #f5f5f5; padding: 14px; border-radius: 5px; font-size: 12px;">
+# Requires multi-step ETL process:
+1. Configure connector/DMS
+2. Set up transformation job
+3. Handle schema mapping
+4. Process nested documents
+5. Convert BSON to columnar
+6. Load to destination
+7. Validate data integrity
+# Total: 12-48 hours + debugging
+</pre>
+                </div>
+            </div>
+
+            <div class="key-finding">
+                <div class="finding-title">Platform-Specific Benefits of Parquet</div>
+                <ul>
+                    <li><strong>AWS:</strong> Athena queries work instantly without any setup</li>
+                    <li><strong>Azure:</strong> Synapse serverless SQL pool reads directly</li>
+                    <li><strong>GCP:</strong> BigQuery charges only for data scanned (columnar advantage)</li>
+                    <li><strong>Snowflake:</strong> Zero-copy cloning and instant time travel</li>
+                    <li><strong>Databricks:</strong> Delta Lake optimization automatic</li>
+                </ul>
+            </div>
+
+            <div class="transition-box">
+                Understanding these integration differences, let's examine the risk factors and mitigation strategies...
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- Risk Mitigation -->
+        <div class="page" id="section-8">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="section-divider">
+                <div class="section-number">8</div>
+                <div class="section-title">Risk Analysis & Mitigation</div>
+                <div class="section-preview">Addressing concerns and mitigation strategies</div>
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <div class="page" id="risk-mitigation">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator">9 of 17</div>
+            <h1 class="action-title">Parquet's primary risk of hardware failure is easily mitigated through standard backup practices</h1>
+
+            <p class="key-statement">MongoDB risks center on cost and flexibility</p>
+            <ul class="supporting-points">
+                <li><strong>Vendor lock-in:</strong> BSON format incompatible with analytics platforms</li>
+                <li><strong>Cost escalation:</strong> Data growth requires cluster upgrades</li>
+                <li><strong>Compression uncertainty:</strong> If 2x compression fails, costs triple</li>
+                <li><strong>Format limitation:</strong> Cannot store or serve data in columnar format</li>
+            </ul>
+
+            <p class="key-statement">Parquet risks focus on operational concerns</p>
+            <ul class="supporting-points">
+                <li><strong>Hardware failure:</strong> Mitigated by RAID 5 + cloud backup</li>
+                <li><strong>IT dependency:</strong> Addressed through documentation and cross-training</li>
+                <li><strong>No 24/7 support:</strong> Acceptable for 1-4 annual queries</li>
+            </ul>
+
+            <div class="key-finding" id="backup-strategy">
+                <div class="finding-title">Recommended 3-2-1 Backup Strategy</div>
+                <ul>
+                    <li><strong>3 copies:</strong> Production + Local backup + Cloud backup</li>
+                    <li><strong>2 media types:</strong> NAS + Cloud storage</li>
+                    <li><strong>1 offsite:</strong> Automated Backblaze B2 sync</li>
+                    <li><strong>Total backup cost:</strong> $21/year</li>
+                </ul>
+            </div>
+
+            <div class="table-wrapper">
+                <table class="decision-matrix">
+                    <tr>
+                        <th>Risk Factor</th>
+                        <th>Impact</th>
+                        <th>Likelihood</th>
+                        <th>Mitigation Cost</th>
+                    </tr>
+                    <tr>
+                        <td>NAS hardware failure</td>
+                        <td>High</td>
+                        <td>Low (RAID 5)</td>
+                        <td>$21/year backup</td>
+                    </tr>
+                    <tr>
+                        <td>MongoDB compression failure</td>
+                        <td>High ($233K)</td>
+                        <td>Low</td>
+                        <td>No mitigation</td>
+                    </tr>
+                    <tr>
+                        <td>Migration complexity</td>
+                        <td>Medium</td>
+                        <td>Certain</td>
+                        <td>$0 for Parquet</td>
+                    </tr>
+                    <tr>
+                        <td>Format incompatibility</td>
+                        <td>High</td>
+                        <td>Certain (MongoDB)</td>
+                        <td>ETL development</td>
+                    </tr>
+                </table>
+            </div>
+
+            <div class="transition-box">
+                Now let's crystallize these findings into clear recommendations and action steps...
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- Final Recommendation -->
+        <div class="page" id="final-recommendation">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator">10 of 17</div>
+            <h1 class="action-title">Parquet files deliver optimal value for archival storage with 96% cost savings and superior flexibility</h1>
+
+            <div class="final-recommendation">
+                <h2>Recommendation</h2>
+                <p>Implement Parquet file storage on network-attached storage for your 345GB archival dataset, saving $82,950 over 5 years while maintaining full analytical capabilities and cloud migration flexibility.</p>
+            </div>
+
+            <p class="key-statement">Decision criteria alignment</p>
+            <ul class="supporting-points">
+                <li><strong>Cost efficiency:</strong> $3,450 vs $86,400 (96% savings)</li>
+                <li><strong>Access pattern match:</strong> Optimized for 1-4 annual queries</li>
+                <li><strong>Migration readiness:</strong> Native format for all cloud platforms</li>
+                <li><strong>Team expertise:</strong> Pandas/PyArrow already in use</li>
+            </ul>
+
+            <p class="key-statement">When to reconsider MongoDB</p>
+            <ul class="supporting-points">
+                <li>Query frequency increases to 50+ times annually</li>
+                <li>Real-time access becomes mandatory</li>
+                <li>Zero IT resources available for any maintenance</li>
+                <li>Regulatory requirements mandate specific database features</li>
+            </ul>
+
+            <div class="next-steps" id="implementation-timeline">
+                <h3>Implementation Timeline</h3>
+                <div class="timeline-item">
+                    <span class="timeline-marker">Week 1-2</span>
+                    <span>Procure NAS hardware and configure RAID 5</span>
+                </div>
+                <div class="timeline-item">
+                    <span class="timeline-marker">Week 3-4</span>
+                    <span>Execute Oracle to Parquet migration</span>
+                </div>
+                <div class="timeline-item">
+                    <span class="timeline-marker">Week 5</span>
+                    <span>Configure automated cloud backups</span>
+                </div>
+                <div class="timeline-item">
+                    <span class="timeline-marker">Week 6</span>
+                    <span>Validate query performance and train team</span>
+                </div>
+            </div>
+
+            <div class="transition-box">
+                Let's conclude with success metrics and governance considerations...
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- Success Metrics & Governance -->
+        <div class="page" id="success-metrics">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator">11 of 17</div>
+            <h1 class="action-title">Success will be measured by cost savings, query performance, and migration readiness</h1>
+
+            <p class="key-statement">Key Performance Indicators</p>
+            <ul class="supporting-points">
+                <li><strong>Cost reduction:</strong> Target 95%+ savings vs database options</li>
+                <li><strong>Query performance:</strong> Sub-minute response for analytical queries</li>
+                <li><strong>Data integrity:</strong> 100% data retention with verified backups</li>
+                <li><strong>Migration readiness:</strong> < 6 hours to cloud platform</li>
+            </ul>
+
+            <p class="key-statement">Governance and Compliance</p>
+            <ul class="supporting-points">
+                <li>Monthly backup verification reports</li>
+                <li>Quarterly access audits (expecting 1 per quarter)</li>
+                <li>Annual disaster recovery testing</li>
+                <li>Documentation of all procedures in team wiki</li>
+            </ul>
+
+            <div class="key-finding">
+                <div class="finding-title">Expected Business Impact</div>
+                <ul>
+                    <li><strong>Budget relief:</strong> $17,280 annual savings for other initiatives</li>
+                    <li><strong>Future flexibility:</strong> Any cloud platform migration in hours, not days</li>
+                    <li><strong>Team efficiency:</strong> Using familiar tools (Pandas) vs learning MongoDB</li>
+                    <li><strong>Risk reduction:</strong> No vendor lock-in or format dependencies</li>
+                </ul>
+            </div>
+
+            <div class="next-steps">
+                <h3>Decision Requirements</h3>
+                <div class="timeline-item">
+                    <span class="timeline-marker">Approval</span>
+                    <span>IT infrastructure budget for $1,600 hardware investment</span>
+                </div>
+                <div class="timeline-item">
+                    <span class="timeline-marker">Resources</span>
+                    <span>2 weeks of data engineer time for migration</span>
+                </div>
+                <div class="timeline-item">
+                    <span class="timeline-marker">Stakeholders</span>
+                    <span>Sign-off from Data, IT, and Finance teams</span>
+                </div>
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- Executive Summary Recap -->
+        <div class="page">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator">12 of 17</div>
+            <h1 class="action-title">Executive Decision Summary: Choose Parquet for 96% cost savings and maximum flexibility</h1>
+
+            <div class="scqa-box">
+                <h3>The Situation</h3>
+                <p>345GB of Oracle time series data needs 1-2 year archival storage before cloud migration.</p>
+                
+                <h3>The Complication</h3>
+                <p>MongoDB's operational overhead costs $86,400 for rarely accessed archival data.</p>
+                
+                <h3>The Question</h3>
+                <p>How can we minimize costs while maintaining data accessibility and migration flexibility?</p>
+                
+                <h3>The Answer</h3>
+                <p><strong>Parquet files provide enterprise-grade archival storage at $3,450 total cost—a 96% savings.</strong></p>
+            </div>
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 28px 0;">
+                <div class="key-finding">
+                    <div class="finding-title">Quantified Benefits</div>
+                    <ul>
+                        <li>$82,950 saved over 5 years</li>
+                        <li>40-50x faster analytical queries</li>
+                        <li>8-10x faster cloud migration</li>
+                        <li>Zero vendor lock-in</li>
+                    </ul>
+                </div>
+                <div class="warning-box">
+                    <div class="warning-title">Key MongoDB Limitations</div>
+                    <ul>
+                        <li>Cannot store columnar data</li>
+                        <li>Not an object storage service</li>
+                        <li>Requires ETL for all platforms</li>
+                        <li>24x higher cost for archival</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="final-recommendation">
+                <h2>The Bottom Line</h2>
+                <p>For archival data accessed 1-4 times annually, Parquet files represent the industry best practice, delivering massive cost savings while preserving all analytical capabilities and ensuring seamless cloud migration when needed.</p>
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- Appendix/Contact -->
+        <div class="page">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator">13 of 17</div>
+            <div class="section-divider">
+                <div class="section-title">Questions & Next Steps</div>
+                <div class="section-preview" style="margin-top: 40px;">
+                    <p><strong>Prepared by:</strong> Data Architecture Team<br>
+                    <strong>Date:</strong> June 2025<br>
+                    <strong>Status:</strong> Awaiting Executive Approval</p>
+                    
+                    <div style="margin-top: 60px;">
+                        <p><strong>For Technical Details:</strong><br>
+                        - Compression analysis methodology<br>
+                        - Detailed migration procedures<br>
+                        - Query performance benchmarks</p>
+                        
+                        <p style="margin-top: 30px;"><strong>For Financial Analysis:</strong><br>
+                        - Detailed 5-year TCO breakdown<br>
+                        - Sensitivity analysis<br>
+                        - Alternative vendor pricing</p>
+                    </div>
+                    
+                    <div style="margin-top: 80px; padding: 30px; background: #f7fafc; border-radius: 10px; border: 1px solid #e2e8f0;">
+                        <p style="text-align: center; font-size: 18px; margin: 0;">
+                            <strong>Decision Required By:</strong> July 15, 2025<br>
+                            <span style="color: #718096; font-size: 16px;">Oracle migration deadline: August 31, 2025</span>
+                        </p>
+                    </div>
+                    
+                    <div class="transition-box" style="position: relative; margin-top: 40px;">
+                        Bonus: Technical deep dive into file format architecture →
+                    </div>
+                </div>
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- BONUS: Technical Deep Dive -->
+        <div class="page" id="bonus-section">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="section-divider">
+                <div class="section-title" style="color: #805ad5;">BONUS: Technical Deep Dive</div>
+                <div class="section-preview">Understanding BSON vs Parquet file architectures</div>
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- How BSON Works -->
+        <div class="page" id="bson-architecture">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator" style="background: #f3e5f5; color: #805ad5;">Bonus 1 of 3</div>
+            <h1 class="action-title">BSON stores data as binary-encoded documents, requiring full document reads for any field access</h1>
+
+            <h2>How BSON (Binary JSON) Storage Works</h2>
+            
+            <div style="background: #fffbeb; padding: 28px; border-radius: 10px; margin: 20px 0;">
+                <h3 style="color: #f57c00; text-align: center; margin-bottom: 24px;">BSON Document Structure</h3>
+                
+                <!-- Visual representation of BSON storage -->
+                <div style="display: flex; gap: 20px; margin-bottom: 28px; flex-wrap: wrap;">
+                    <div style="flex: 1; min-width: 280px;">
+                        <h4 style="color: #e65100; margin-bottom: 14px;">Original JSON Document</h4>
+                        <pre style="background: white; padding: 14px; border: 2px solid #ff9800; border-radius: 5px; font-size: 12px;">
+{
+  "_id": "507f1f77bcf86cd799439011",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "sensor_id": "TEMP_001",
+  "temperature": 72.5,
+  "humidity": 45,
+  "pressure": 1013.25,
+  "location": {
+    "building": "A",
+    "floor": 3,
+    "room": "301"
+  }
+}</pre>
+                    </div>
+                    
+                    <div style="flex: 1; min-width: 280px;">
+                        <h4 style="color: #e65100; margin-bottom: 14px;">BSON Binary Representation</h4>
+                        <div style="background: #263238; color: #4caf50; padding: 14px; border-radius: 5px; font-family: monospace; font-size: 11px;">
+                            <div style="color: #ff9800;">/* Header: Document Size */</div>
+                            <div>00 00 00 87</div>
+                            <div style="margin-top: 10px; color: #ff9800;">/* Field: _id (ObjectId) */</div>
+                            <div>07 5F 69 64 00 50 7F 1F 77...</div>
+                            <div style="margin-top: 10px; color: #ff9800;">/* Field: timestamp (String) */</div>
+                            <div>02 74 69 6D 65 73 74 61 6D...</div>
+                            <div style="margin-top: 10px; color: #ff9800;">/* Field: temperature (Double) */</div>
+                            <div>01 74 65 6D 70 65 72 61 74...</div>
+                            <div style="margin-top: 10px; color: #ff9800;">/* Nested doc: location */</div>
+                            <div>03 6C 6F 63 61 74 69 6F 6E...</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div style="background: white; padding: 20px; border-radius: 8px;">
+                    <h4 style="color: #e65100; margin-bottom: 10px;">Key Characteristics:</h4>
+                    <ul style="margin-left: 20px;">
+                        <li><strong>Sequential Storage:</strong> All fields stored together in each document</li>
+                        <li><strong>Type Information:</strong> Each field includes type markers (01=double, 02=string, etc.)</li>
+                        <li><strong>Self-Contained:</strong> Each document is independent with all its data</li>
+                        <li><strong>Variable Length:</strong> Documents can have different sizes and fields</li>
+                        <li><strong>Read Pattern:</strong> Must read entire document to access any field</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="warning-box">
+                <div class="warning-title">GridFS Storage Clarification</div>
+                <p>Even when storing Parquet files in MongoDB GridFS:</p>
+                <ol style="margin-left: 20px; margin-top: 10px;">
+                    <li>Files are split into 255KB chunks</li>
+                    <li>Each chunk is stored as BSON Binary data</li>
+                    <li>Files must be reassembled before use</li>
+                    <li>Columnar benefits are completely lost</li>
+                    <li>Cannot query data in Parquet format</li>
+                </ol>
+                <p style="margin-top: 14px;"><strong>Result:</strong> GridFS is file storage within MongoDB, NOT object storage like S3</p>
+            </div>
+
+            <div class="transition-box">
+                Now let's see how Parquet's columnar approach solves this inefficiency...
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- How Parquet Works -->
+        <div class="page" id="parquet-architecture">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator" style="background: #f3e5f5; color: #805ad5;">Bonus 2 of 3</div>
+            <h1 class="action-title">Parquet's columnar format stores each field separately, enabling surgical data access and 10x compression</h1>
+
+            <h2>How Parquet Columnar Storage Works</h2>
+            
+            <div style="background: #e6fffa; padding: 28px; border-radius: 10px; margin: 20px 0;">
+                <h3 style="color: #234e52; text-align: center; margin-bottom: 24px;">Parquet File Structure</h3>
+                
+                <!-- Visual representation of Parquet structure -->
+                <div style="background: white; padding: 24px; border-radius: 8px; border: 3px solid #38b2ac;">
+                    
+                    <!-- File Header -->
+                    <div style="background: #1976d2; color: white; padding: 14px; border-radius: 5px; margin-bottom: 20px; text-align: center;">
+                        <strong>Parquet File Header</strong>
+                        <div style="font-size: 13px; margin-top: 5px;">Magic Number: PAR1 | Version: 2.6 | Schema Definition</div>
+                    </div>
+                    
+                    <!-- Row Group -->
+                    <div style="border: 2px solid #38b2ac; border-radius: 8px; padding: 20px; margin-bottom: 20px;">
+                        <h4 style="color: #234e52; text-align: center; margin-bottom: 20px;">Row Group 1 (1M rows)</h4>
+                        
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 14px;">
+                            <!-- Column Chunks -->
+                            <div style="background: #b2dfdb; padding: 14px; border-radius: 5px; text-align: center;">
+                                <h5 style="margin: 0 0 10px 0; font-size: 13px;">Timestamp Column</h5>
+                                <div style="font-size: 11px; color: #00695c;">
+                                    <div style="background: #81c784; padding: 5px; margin: 5px 0; border-radius: 3px;">
+                                        Page 1: 100K values<br>
+                                        Compressed: 2.1MB
+                                    </div>
+                                    <div style="background: #81c784; padding: 5px; margin: 5px 0; border-radius: 3px;">
+                                        Page 2: 100K values<br>
+                                        Compressed: 2.0MB
+                                    </div>
+                                    <div style="font-size: 10px; margin-top: 10px;">
+                                        Min: 2024-01-01<br>
+                                        Max: 2024-01-31<br>
+                                        Nulls: 0
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div style="background: #b2dfdb; padding: 14px; border-radius: 5px; text-align: center;">
+                                <h5 style="margin: 0 0 10px 0; font-size: 13px;">Temperature Column</h5>
+                                <div style="font-size: 11px; color: #00695c;">
+                                    <div style="background: #81c784; padding: 5px; margin: 5px 0; border-radius: 3px;">
+                                        Page 1: 100K values<br>
+                                        Compressed: 0.8MB
+                                    </div>
+                                    <div style="background: #81c784; padding: 5px; margin: 5px 0; border-radius: 3px;">
+                                        Page 2: 100K values<br>
+                                        Compressed: 0.8MB
+                                    </div>
+                                    <div style="font-size: 10px; margin-top: 10px;">
+                                        Min: 65.2°F<br>
+                                        Max: 78.9°F<br>
+                                        Nulls: 142
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div style="background: #b2dfdb; padding: 14px; border-radius: 5px; text-align: center;">
+                                <h5 style="margin: 0 0 10px 0; font-size: 13px;">Humidity Column</h5>
+                                <div style="font-size: 11px; color: #00695c;">
+                                    <div style="background: #81c784; padding: 5px; margin: 5px 0; border-radius: 3px;">
+                                        Page 1: 100K values<br>
+                                        Compressed: 0.5MB
+                                    </div>
+                                    <div style="background: #81c784; padding: 5px; margin: 5px 0; border-radius: 3px;">
+                                        Page 2: 100K values<br>
+                                        Compressed: 0.5MB
+                                    </div>
+                                    <div style="font-size: 10px; margin-top: 10px;">
+                                        Min: 22%<br>
+                                        Max: 87%<br>
+                                        Nulls: 0
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div style="background: #b2dfdb; padding: 14px; border-radius: 5px; text-align: center;">
+                                <h5 style="margin: 0 0 10px 0; font-size: 13px;">Location Column</h5>
+                                <div style="font-size: 11px; color: #00695c;">
+                                    <div style="background: #81c784; padding: 5px; margin: 5px 0; border-radius: 3px;">
+                                        Dictionary: 15 values<br>
+                                        Compressed: 0.1MB
+                                    </div>
+                                    <div style="background: #81c784; padding: 5px; margin: 5px 0; border-radius: 3px;">
+                                        Indices: 200K refs<br>
+                                        Compressed: 0.3MB
+                                    </div>
+                                    <div style="font-size: 10px; margin-top: 10px;">
+                                        Unique: 15<br>
+                                        Most common: "A"<br>
+                                        Dict encoded
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- File Footer -->
+                    <div style="background: #1976d2; color: white; padding: 14px; border-radius: 5px; text-align: center;">
+                        <strong>Parquet File Footer</strong>
+                        <div style="font-size: 13px; margin-top: 5px;">Column Metadata | Row Group Offsets | Schema | Statistics</div>
+                    </div>
+                </div>
+                
+                <div style="background: white; padding: 20px; border-radius: 8px; margin-top: 20px;">
+                    <h4 style="color: #234e52; margin-bottom: 10px;">Advanced Compression Techniques:</h4>
+                    <ul style="margin-left: 20px;">
+                        <li><strong>Dictionary Encoding:</strong> Repeated values stored once (e.g., sensor locations)</li>
+                        <li><strong>Run-Length Encoding:</strong> Sequential identical values compressed</li>
+                        <li><strong>Bit Packing:</strong> Integers use only needed bits</li>
+                        <li><strong>Delta Encoding:</strong> Store differences for timestamps</li>
+                        <li><strong>Page-Level Compression:</strong> Snappy/Gzip on top of encoding</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="key-finding">
+                <div class="finding-title">Query Optimization Features</div>
+                <ul>
+                    <li><strong>Predicate Pushdown:</strong> Skip entire row groups using min/max statistics</li>
+                    <li><strong>Column Pruning:</strong> Read only requested columns, ignore others</li>
+                    <li><strong>Late Materialization:</strong> Filter before reconstructing rows</li>
+                    <li><strong>Vectorized Processing:</strong> Process data in CPU-efficient batches</li>
+                </ul>
+            </div>
+
+            <div class="transition-box">
+                Let's see these formats in action with a real query example...
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+
+        <!-- Technical Comparison -->
+        <div class="page" id="technical-comparison">
+            <div class="company-logo">
+                <div class="company-logo-icon">TC</div>
+                <div class="company-logo-text">TechCorp Analytics</div>
+            </div>
+            <div class="progress-indicator" style="background: #f3e5f5; color: #805ad5;">Bonus 3 of 3</div>
+            <h1 class="action-title">Columnar storage provides 10-50x performance advantage for analytical queries through intelligent data organization</h1>
+
+            <h2>Technical Query Execution Comparison</h2>
+            
+            <p class="key-statement">Example Query: "Average temperature for sensors in Building A during January 2024"</p>
+            
+            <div style="display: flex; gap: 20px; margin: 20px 0; flex-wrap: wrap;">
+                <!-- BSON Query Process -->
+                <div style="flex: 1; min-width: 280px; background: #fff3e0; padding: 20px; border-radius: 10px;">
+                    <h3 style="color: #ed8936; text-align: center; margin-bottom: 20px;">BSON/MongoDB Query Execution</h3>
+                    
+                    <div style="background: white; padding: 14px; border-radius: 5px; margin-bottom: 14px;">
+                        <h4 style="color: #e65100; margin: 0 0 10px 0; font-size: 14px;">Step 1: Full Collection Scan</h4>
+                        <pre style="font-size: 11px; background: #f5f5f5; padding: 10px; border-radius: 3px;">
+// MongoDB must read every document
+db.timeseries.find({
+  timestamp: {
+    $gte: "2024-01-01", 
+    $lt: "2024-02-01"
+  },
+  "location.building": "A"
+}).forEach(doc => 
+  temps.push(doc.temperature)
+)</pre>
+                        <p style="font-size: 12px; color: #718096; margin-top: 10px;">
+                            <strong>Data Read:</strong> 170GB (compressed)<br>
+                            <strong>Documents Scanned:</strong> 4 billion<br>
+                            <strong>Useful Data:</strong> ~1.5GB
+                        </p>
+                    </div>
+                    
+                    <div style="background: white; padding: 14px; border-radius: 5px;">
+                        <h4 style="color: #e65100; margin: 0 0 10px 0; font-size: 14px;">Performance Bottlenecks</h4>
+                        <ul style="font-size: 12px; margin-left: 20px;">
+                            <li>Decompress each document block</li>
+                            <li>Parse BSON structure</li>
+                            <li>Navigate nested location object</li>
+                            <li>97% of data read is discarded</li>
+                            <li>No parallel column processing</li>
+                        </ul>
+                    </div>
+                </div>
+                
+                <!-- Parquet Query Process -->
+                <div style="flex: 1; min-width: 280px; background: #e6fffa; padding: 20px; border-radius: 10px;">
+                    <h3 style="color: #38b2ac; text-align: center; margin-bottom: 20px;">Parquet Query Execution</h3>
+                    
+                    <div style="background: white; padding: 14px; border-radius: 5px; margin-bottom: 14px;">
+                        <h4 style="color: #234e52; margin: 0 0 10px 0; font-size: 14px;">Step 1: Smart Data Access</h4>
+                        <pre style="font-size: 11px; background: #f5f5f5; padding: 10px; border-radius: 3px;">
+# PyArrow reads only needed columns
+df = pq.read_table('data.parquet',
+    columns=['timestamp', 
+             'temperature', 
+             'location'],
+    filters=[
+        ('timestamp', '>=', '2024-01-01'),
+        ('timestamp', '<', '2024-02-01'),
+        ('location', '==', 'A')
+    ])</pre>
+                        <p style="font-size: 12px; color: #718096; margin-top: 10px;">
+                            <strong>Data Read:</strong> 3.5GB<br>
+                            <strong>Row Groups Skipped:</strong> 87%<br>
+                            <strong>Useful Data:</strong> ~1.5GB
+                        </p>
+                    </div>
+                    
+                    <div style="background: white; padding: 14px; border-radius: 5px;">
+                        <h4 style="color: #234e52; margin: 0 0 10px 0; font-size: 14px;">Performance Optimizations</h4>
+                        <ul style="font-size: 12px; margin-left: 20px;">
+                            <li>Row group statistics filter early</li>
+                            <li>Read only 3 columns of 20+</li>
+                            <li>Dictionary encoding for location</li>
+                            <li>Vectorized aggregation</li>
+                            <li>Parallel column decompression</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+
+            <div class="key-finding">
+                <div class="finding-title">Real-World Performance Impact</div>
+                <div class="table-wrapper">
+                    <table class="decision-matrix" style="margin-top: 14px;">
+                        <tr>
+                            <th>Metric</th>
+                            <th>BSON (MongoDB)</th>
+                            <th>Parquet</th>
+                            <th>Advantage</th>
+                        </tr>
+                        <tr>
+                            <td>Data Scanned</td>
+                            <td>170GB</td>
+                            <td>3.5GB</td>
+                            <td>48x less</td>
+                        </tr>
+                        <tr>
+                            <td>Query Time</td>
+                            <td>12-15 minutes</td>
+                            <td>15-20 seconds</td>
+                            <td>45x faster</td>
+                        </tr>
+                        <tr>
+                            <td>Memory Usage</td>
+                            <td>8-12GB</td>
+                            <td>500MB</td>
+                            <td>20x less</td>
+                        </tr>
+                        <tr>
+                            <td>CPU Utilization</td>
+                            <td>100% (single core)</td>
+                            <td>400% (parallel)</td>
+                            <td>4x throughput</td>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+
+            <p class="key-statement">Why these technical differences matter for your use case</p>
+            <ul class="supporting-points">
+                <li><strong>Annual Access Pattern:</strong> Parquet's slower initial read (15 seconds vs 2 seconds) is irrelevant when accessing data quarterly</li>
+                <li><strong>Analytics Focus:</strong> Your queries aggregate across millions of rows—exactly what columnar storage optimizes for</li>
+                <li><strong>Cloud Migration:</strong> Parquet is already in the format every data platform expects</li>
+                <li><strong>Compression Economics:</strong> 10x compression means 10x less storage cost and 10x faster transfers</li>
+            </ul>
+
+            <div style="background: #e3f2fd; padding: 24px; border-radius: 10px; margin-top: 28px; text-align: center;">
+                <h3 style="color: #1976d2; margin: 0 0 14px 0;">The Technical Bottom Line</h3>
+                <p style="font-size: 15px; margin: 0; line-height: 1.6;">
+                    BSON optimizes for "find document ID 12345 quickly"<br>
+                    Parquet optimizes for "analyze temperature trends across millions of readings"<br>
+                    <strong style="color: #1976d2; font-size: 17px;">Your use case is pure analytics—choose the format designed for it.</strong>
+                </p>
+            </div>
+            <div class="copyright">© 2025 TechCorp Analytics. All rights reserved. Confidential and Proprietary.</div>
+        </div>
+    </div>
+
+    <script>
+        // Function to toggle table of contents
+        function toggleTOC() {
+            const toc = document.getElementById('toc');
+            toc.classList.toggle('active');
+        }
+        
+        // Function to scroll to section
+        function scrollToSection(sectionId) {
+            const section = document.getElementById(sectionId);
+            if (section) {
+                section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                
+                // Close TOC on mobile after clicking
+                if (window.innerWidth <= 1200) {
+                    toggleTOC();
+                }
+            }
+        }
+        
+        // Update active section in TOC based on scroll position
+        window.addEventListener('scroll', () => {
+            const sections = document.querySelectorAll('[id]');
+            const scrollPosition = window.scrollY + 100;
+            
+            sections.forEach(section => {
+                const sectionTop = section.offsetTop;
+                const sectionHeight = section.offsetHeight;
+                
+                if (scrollPosition >= sectionTop && scrollPosition < sectionTop + sectionHeight) {
+                    // Remove all active classes
+                    document.querySelectorAll('.toc-link, .toc-section-title').forEach(link => {
+                        link.classList.remove('active');
+                    });
+                    
+                    // Find corresponding TOC link
+                    const tocLinks = document.querySelectorAll('.toc-link, .toc-section-title');
+                    tocLinks.forEach(link => {
+                        if (link.getAttribute('onclick') && link.getAttribute('onclick').includes(section.id)) {
+                            link.classList.add('active');
+                            
+                            // Also highlight parent section if it's a subsection
+                            const parent = link.closest('.toc-section');
+                            if (parent) {
+                                const parentTitle = parent.querySelector('.toc-section-title');
+                                if (parentTitle) {
+                                    parentTitle.classList.add('active');
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        
+        // Close TOC when clicking outside on mobile
+        document.addEventListener('click', (e) => {
+            const toc = document.getElementById('toc');
+            const toggle = document.querySelector('.toc-toggle');
+            
+            if (window.innerWidth <= 1200 && 
+                toc.classList.contains('active') && 
+                !toc.contains(e.target) && 
+                !toggle.contains(e.target)) {
+                toc.classList.remove('active');
+            }
+        });
+    </script>
+</body>
+</html>
