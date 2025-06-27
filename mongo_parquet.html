@@ -28,75 +28,97 @@
         /* Company Logo Styles */
         .company-logo {
             position: absolute;
-            top: 20px;
-            left: 30px;
+            top: 15px;
+            left: 20px;
             z-index: 100;
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 6px;
+            opacity: 0.9;
+            transition: opacity 0.2s ease;
+        }
+        
+        .company-logo:hover {
+            opacity: 1;
         }
         
         .company-logo-icon {
-            width: 40px;
-            height: 40px;
+            width: 24px;
+            height: 24px;
             background: #0052cc;
-            border-radius: 8px;
+            border-radius: 4px;
             display: flex;
             align-items: center;
             justify-content: center;
             color: white;
             font-weight: bold;
-            font-size: 20px;
+            font-size: 12px;
+            flex-shrink: 0;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
         }
         
         .company-logo-text {
-            font-size: 18px;
+            font-size: 13px;
             font-weight: 600;
-            color: #1a202c;
-            letter-spacing: -0.5px;
+            color: #4a5568;
+            letter-spacing: -0.3px;
+            line-height: 1;
         }
         
         /* Copyright Styles */
         .copyright {
             position: absolute;
-            bottom: 20px;
+            bottom: 15px;
             left: 0.75in;
             right: 0.75in;
             text-align: center;
-            font-size: 11px;
-            color: #718096;
+            font-size: 10px;
+            color: #a0aec0;
             z-index: 100;
         }
         
         /* Adjust title page logo positioning */
         .title-page .company-logo {
-            top: 40px;
+            top: 30px;
             left: 50%;
             transform: translateX(-50%);
             flex-direction: column;
-            gap: 5px;
+            gap: 4px;
+            opacity: 1;
         }
         
         .title-page .company-logo-icon {
-            width: 60px;
-            height: 60px;
-            font-size: 30px;
+            width: 36px;
+            height: 36px;
+            font-size: 18px;
+            border-radius: 6px;
         }
         
         .title-page .company-logo-text {
-            font-size: 24px;
+            font-size: 16px;
+            color: #2d3748;
         }
         
         /* Ensure logo and copyright don't interfere with content */
         .page {
-            padding-top: 80px !important;
-            padding-bottom: 60px !important;
+            /* Remove the forced padding adjustments */
+            position: relative;
         }
         
-        .title-page {
-            padding-top: 140px !important;
+        /* Add minimal top margin only where needed */
+        .progress-indicator {
+            top: 20px;
+            right: 20px;
+            font-size: 12px;
+            padding: 4px 12px;
         }
         
+        /* Ensure action titles have enough space */
+        .action-title {
+            margin-top: 10px;
+        }
+        
+        /* Ensure section dividers still center properly */
         .section-divider {
             padding-top: 0 !important;
         }
@@ -265,6 +287,7 @@
             
             .toc-toggle {
                 display: block;
+                top: 50px; /* Adjusted to avoid logo overlap */
             }
             
             .toc-close {
@@ -273,6 +296,17 @@
             
             .main-content {
                 margin-left: 0;
+            }
+            
+            /* Make logo even smaller on mobile */
+            .company-logo-icon {
+                width: 20px;
+                height: 20px;
+                font-size: 10px;
+            }
+            
+            .company-logo-text {
+                font-size: 11px;
             }
         }
         
@@ -303,6 +337,21 @@
             .copyright {
                 print-color-adjust: exact;
                 -webkit-print-color-adjust: exact;
+            }
+            
+            /* Slightly adjust logo size for print */
+            .company-logo-icon {
+                width: 20px;
+                height: 20px;
+                font-size: 11px;
+            }
+            
+            .company-logo-text {
+                font-size: 12px;
+            }
+            
+            .copyright {
+                font-size: 9px;
             }
         }
         
@@ -350,7 +399,7 @@
             font-size: 16px;
             color: #718096;
             position: absolute;
-            bottom: 100px;
+            bottom: 70px; /* Adjusted to avoid copyright overlap */
             line-height: 1.6;
         }
         
@@ -459,7 +508,7 @@
             color: #4a5568;
             font-size: 14px;
             position: absolute;
-            bottom: 60px;
+            bottom: 50px; /* Adjusted to avoid copyright overlap */
             left: 0.75in;
             right: 0.75in;
             border-radius: 6px;
